@@ -1,0 +1,1901 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "ip.h"
+#include "nwip.h"
+#include "nwlar1.h"
+#include "nwcommon.h"
+#include "application.h"
+#include "transport.h"
+#include "java_gui.h"
+
+/* 
+ * Notes:
+ *   Implementation followed the specification of Mobicom 98 paper by
+ *   Ko and Vaidya. Other details followed based on discussions with 
+ *   Mr. Youngbae Ko of Texas A & M.
+ *
+ *   We assume that underlying MAC protocol sends a signal when the packet
+ *   cannot be reached to the next hop (after retransmissions). MAC protocols
+ *   such as IEEE 802.11 and MACAW have these functionality.
+ *   Nodes detect link breaks by receiving a signal from the IEEE 802.11 MAC
+ *   Protocol. If other MAC protocol is used, users need to modify the LAR
+ *   code so that it can detect link breaks (for instance, using passive acks(
+ *
+ * Send questions to Julian Hsu (gandy@cs.ucla.edu) and 
+ *                   S.J. Lee (sjlee@cs.ucla.edu)
+ */
+
+
+//
+// FUNCTION     NetworkLar1Init()
+// PURPOSE      Initialize LAR1 Routing Protocol Dataspace
+// PARAMETERS   lar1            - pointer for dataspace
+//              nodeInput
+//
+
+void NetworkLar1Init(
+   GlomoNode *node,
+   GlomoNetworkLar1** lar1, 
+   const GlomoNodeInput *nodeInput)
+{
+    int i;
+    char buf[80];
+
+    *lar1 = checked_pc_malloc(sizeof(GlomoNetworkLar1));
+
+    (*lar1)->routeCacheHead = NULL;
+    (*lar1)->reqSeenHead = NULL;
+    (*lar1)->reqSentHead = NULL;
+
+    (*lar1)->sendBufHead = (*lar1)->sendBufTail = 0;
+    for (i=0; i<LAR1_SEND_BUFFER_SIZE; i++)
+    {
+        (*lar1)->sendBuf[i] = NULL;
+    }
+
+    (*lar1)->seqNum = 0;
+    (*lar1)->DataPacketsSentAsSource = 0;
+    (*lar1)->DataPacketsRelayed = 0;
+    (*lar1)->RouteRequestsSentAsSource = 0;
+    (*lar1)->RouteRepliesSentAsRecvr = 0;
+    (*lar1)->RouteErrorsSentAsErrorSource = 0;
+    (*lar1)->RouteRequestsRelayed = 0;
+    (*lar1)->RouteRepliesRelayed = 0;
+    (*lar1)->RouteErrorsRelayed = 0;
+
+    i = GLOMO_ReadString(node->nodeAddr, nodeInput,
+                             "APPLICATION-STATISTICS", buf);
+
+    if ((i == FALSE) || (strcmp(buf, "NO") == 0)) 
+        (*lar1)->statsCollected = FALSE;
+    else if (strcmp(buf, "YES") == 0) 
+        (*lar1)->statsCollected = TRUE;
+
+
+    NetworkIpSetRouterFunction(node, &NetworkLar1RouterFunction);
+    NetworkIpSetPacketDropNotificationFunction(node, 
+        &NetworkLar1PacketDropNotificationHandler);
+        
+#ifdef DEBUG
+    printf("#%d: NetworkLar1Init()\n", node->nodeAddr);
+#endif
+}
+
+
+//
+// FUNCTION     NetworkLar1Finalize()
+// PURPOSE      Finalize statistics Collection
+//
+
+void NetworkLar1Finalize(GlomoNode *node)
+{
+#ifdef DEBUG
+    printf("#%d: NetworkLar1Finalize()\n", node->nodeAddr);
+#endif
+
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoNetworkLar1* lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+    char buf[200];
+
+    if (lar1->statsCollected) {
+       sprintf(buf, "Data Packets Sent As Data Source: %d",
+                     lar1->DataPacketsSentAsSource);
+       GLOMO_PrintStat(node, "RoutingLar1", buf);
+       sprintf(buf, "Data Packets Relayed: %d",
+                     lar1->DataPacketsRelayed);
+       GLOMO_PrintStat(node, "RoutingLar1", buf);
+       sprintf(buf, "Route Requests Sent As Data Source: %d",
+                     lar1->RouteRequestsSentAsSource);
+       GLOMO_PrintStat(node, "RoutingLar1", buf);
+       sprintf(buf, "Route Replies Sent as Data Receiver: %d",
+                     lar1->RouteRepliesSentAsRecvr);
+       GLOMO_PrintStat(node, "RoutingLar1", buf);
+       sprintf(buf, "Route Error Packets Sent As Source of Error: %d",
+                     lar1->RouteErrorsSentAsErrorSource);
+       GLOMO_PrintStat(node, "RoutingLar1", buf);
+       sprintf(buf, "Route Requests Relayed as Intermediate Node: %d",
+                     lar1->RouteRequestsRelayed);
+       GLOMO_PrintStat(node, "RoutingLar1", buf);
+       sprintf(buf, "Route Replies Relayed as Intermediate Node: %d",
+                     lar1->RouteRepliesRelayed);
+       GLOMO_PrintStat(node, "RoutingLar1", buf);
+       sprintf(buf, "Route Error Packets Relayed as Intermediate Node: %d",
+                     lar1->RouteErrorsRelayed);
+       GLOMO_PrintStat(node, "RoutingLar1", buf);
+
+
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1HandleProtocolPacket()
+// PURPOSE      Process a LAR1 generated control packet
+// PARAMETERS   msg             - The packet
+//
+
+void NetworkLar1HandleProtocolPacket(GlomoNode* node, Message* msg) 
+{
+    LAR1_PacketType* larHeader = (LAR1_PacketType*)GLOMO_MsgReturnPacket(msg);
+#ifdef DEBUG
+    printf("#%d:         LAR packet.\n",node->nodeAddr);
+#endif
+
+    switch (*larHeader) {
+    case LAR1_ROUTE_REQUEST: {
+#ifdef DEBUG
+        int numEntries;
+
+        /* Calculate the number of node addresses that are included in this
+           packet by taking the full size of the packet, and subtracting the
+           size of the LAR1 Route Reply Header, and then dividing by the
+           size of a node address */
+
+        numEntries = GLOMO_MsgReturnPacketSize(msg);
+        numEntries -= sizeof(LAR1_RouteRequest);
+        numEntries = numEntries / sizeof(NODE_ADDR);
+        printf("            Route Request Packet %d entries.\n",
+               numEntries);
+#endif
+        NetworkLar1HandleRouteRequest(node, msg);
+        GLOMO_MsgFree(node, msg);
+        break;
+    }
+    case LAR1_ROUTE_REPLY: {
+#ifdef DEBUG
+        int numEntries;
+
+        /* Calculate the number of node addresses that are included in this
+           packet by taking the full size of the packet, and subtracting the
+           size of the LAR1 Route Reply Header, and then dividing by the
+           size of a node address */
+
+        numEntries = GLOMO_MsgReturnPacketSize(msg);
+        numEntries -= sizeof(LAR1_RouteReply);
+        numEntries = numEntries / sizeof(NODE_ADDR);
+        printf("            Route Reply Packet %d entries.\n",
+               numEntries);
+#endif
+        NetworkLar1HandleRouteReply(node, msg);
+        break;
+    }
+    case LAR1_ROUTE_ERROR: {
+#ifdef DEBUG
+        int numEntries;
+
+        /* Calculate the number of node addresses that are included in this
+           packet by taking the full size of the packet, and subtracting the
+           size of the LAR1 Route Reply Header, and then dividing by the
+           size of a node address */
+
+        numEntries = GLOMO_MsgReturnPacketSize(msg);
+        numEntries -= sizeof(LAR1_RouteError);
+        numEntries = numEntries / sizeof(NODE_ADDR);
+        printf("            Route Error Packet %d entries.\n",
+               numEntries);
+#endif
+        NetworkLar1HandleRouteErrorPacket(node, msg);
+        break;
+    }
+    default:
+        assert(FALSE);
+    }//switch//
+}
+
+//
+// FUNCTION     NetworkLar1HandleCheckTimeoutAlarm()
+// PURPOSE      Process timeouts sent by LAR1 to itself
+// PARAMETERS   msg             - the timer
+//
+
+void NetworkLar1HandleCheckTimeoutAlarm(GlomoNode* node, Message* msg) {
+
+    NODE_ADDR *info = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+#ifdef DEBUG
+    printf("#%d: Check for route reply for dest %d\n", node->nodeAddr,
+           *info);
+#endif
+
+    /* Check if Route In Cache */
+    if (NetworkLar1RouteExists(lar1->routeCacheHead, *info)) 
+    {
+        /* Already received the anticipated Route Reply packet */
+        GLOMO_MsgFree(node, msg);
+    }
+    else
+    {
+       /* Remove route and related information from route cache */
+       NetworkLar1DeleteRoute(node, *info);
+
+       /* Need to retransmit a Route Request packet */
+       NetworkLar1InitiateRouteRequest(node, *info);
+       GLOMO_MsgFree(node, msg);
+    }
+}
+
+
+
+//
+// FUNCTION     NetworkLar1NodeInZone()
+// PURPOSE      Returns TRUE if node is within the zone coordinates
+// PARAMETERS   zone            - structure containing corner coordinates
+//
+
+BOOL NetworkLar1NodeInZone(GlomoNode *node, LAR1_Zone *zone)
+{
+#ifdef DEBUG
+    printf("        GPS = (%f, %f)\n", GLOMO_MobilityReturnPositionX(node),
+        GLOMO_MobilityReturnPositionY(node));
+#endif
+    if ((GLOMO_MobilityReturnPositionX(node) >= zone->bottomLeft.x) && 
+        (GLOMO_MobilityReturnPositionX(node) <= zone->topRight.x) &&
+        (GLOMO_MobilityReturnPositionY(node) >= zone->bottomLeft.y) &&
+        (GLOMO_MobilityReturnPositionY(node) <= zone->topRight.y))
+    {
+        return TRUE;
+    }
+    else
+        return FALSE;
+}
+
+//
+// FUNCTION     NetworkLar1HandleRouteErrorPacket()
+// PURPOSE      Handle received LAR1 Route Error control packets
+// PARAMETERS   msg             - the control packet
+//
+
+void NetworkLar1HandleRouteErrorPacket(GlomoNode *node, Message *msg)
+{
+    LAR1_RouteError *pkt = (LAR1_RouteError *) GLOMO_MsgReturnPacket(msg);
+    char *pktptr;
+    NODE_ADDR *path;
+    NODE_ADDR fromHop, nextHop;
+    int left,
+        i,
+        numEntries;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+#ifdef DEBUG
+    printf("    HandleRouteErrorPacket()\n");
+#endif
+
+    /* Calculate the number of node addresses that are included in this
+       packet by taking the full size of the packet, and subtracting the
+       size of the LAR1 Route Reply Header, and then dividing by the
+       size of a node address */
+
+    numEntries = GLOMO_MsgReturnPacketSize(msg);
+    numEntries -= sizeof(LAR1_RouteError);
+    numEntries = numEntries / sizeof(NODE_ADDR);
+
+    /* Record the segmentLeft */
+    left = pkt->segmentLeft;
+
+    /* Record the node pair involved in the link break */
+    fromHop = pkt->fromHop;
+    nextHop = pkt->nextHop;
+
+    /* Delete routes in cache that use the broken link */
+    NetworkLar1InvalidateRoutesThroughBrokenLink(node, fromHop,
+                                             nextHop);
+
+    /* Position the path pointer onto the array of node addresses */
+    pktptr = (char *) GLOMO_MsgReturnPacket(msg) + sizeof(LAR1_RouteError);
+    path = (NODE_ADDR *) pktptr;
+#ifdef DEBUG
+    printf("        destAddr = %d, path[left] = %d\n", pkt->destAddr,
+           path[left]);
+#endif
+
+    /* Decrease the segment left */
+    pkt->segmentLeft = pkt->segmentLeft - 1;
+
+    if ((pkt->destAddr == node->nodeAddr) &&
+        (path[left] == node->nodeAddr))
+    { /* This error notification has reached its destination (i.e., the source
+         of the broken route */
+#ifdef DEBUG
+        printf("    I am destination for this route error packet.\n");
+#endif
+        GLOMO_MsgFree(node, msg);
+    }
+    else if (path[left] == node->nodeAddr)
+    { /* This error notification has reached an intermediate node of the broken
+         route */
+        NODE_ADDR nextHop = path[pkt->segmentLeft];
+
+#ifdef DEBUG
+        printf("    I am relay for this route error packet.\n");
+        printf("        Send it on to %d\n", nextHop);
+#endif
+
+        lar1->RouteErrorsRelayed++;
+        /* Propagate this control message towards its destination */
+        NetworkIpSendRawGlomoMessageToMacLayer(
+            node, msg, nextHop, CONTROL, IPPROTO_LAR1, LAR1_MAX_ROUTE_LENGTH,
+            DEFAULT_INTERFACE, nextHop);
+
+    }
+    else
+    {
+        /* This packet should not have reached this node, because it should
+           have been unicasted to the next node in the path towards the
+           data source. */
+        GLOMO_MsgFree(node, msg);
+        assert(FALSE);
+    }
+}
+
+//
+// FUNCTION     NetworkLar1HandleRouteReply()
+// PURPOSE      Handle received LAR1 Route Reply control packets
+// PARAMETERS   msg             - the control packet
+//
+
+void NetworkLar1HandleRouteReply(GlomoNode *node, Message *msg)
+{
+    LAR1_RouteReply *pkt = (LAR1_RouteReply *) GLOMO_MsgReturnPacket(msg);
+    char *pktptr;
+    NODE_ADDR *path;
+    int left;
+    int i;
+    int numEntries;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    /* Calculate the number of node addresses that are included in this
+       packet by taking the full size of the packet, and subtracting the
+       size of the LAR1 Route Reply Header, and then dividing by the 
+       size of a node address */
+
+    numEntries = GLOMO_MsgReturnPacketSize(msg);
+    numEntries -= sizeof(LAR1_RouteReply);
+    numEntries = numEntries / sizeof(NODE_ADDR);
+
+    /* Decrease the segment left */
+    pkt->segmentLeft = pkt->segmentLeft - 1;
+
+    left = pkt->segmentLeft;
+
+    /* Position the path pointer onto the array of node addresses */
+    pktptr = (char *) GLOMO_MsgReturnPacket(msg) + sizeof(LAR1_RouteReply);
+    path = (NODE_ADDR *) pktptr;
+
+#ifdef DEBUG
+    printf("        destAddr = %d, path[left] = %d\n", pkt->destAddr,
+           path[left]);
+#endif
+
+    if ((pkt->destAddr == node->nodeAddr) &&
+        (path[left] == node->nodeAddr) &&
+        (!NetworkLar1RouteExists(lar1->routeCacheHead, pkt->destAddr)))
+    { /* The node originated the route request received the first rotue reply */
+        Message *bufMsg;
+
+        /* Remove this request from the list of outstanding route requests */
+        NetworkLar1RemoveRequestSent(lar1, pkt->sourceAddr);
+#ifdef DEBUG
+        printf("        I have received valid and useful path to %d\n", 
+               pkt->sourceAddr);
+        for (i = 0; i < numEntries; i++)
+        {
+            printf("            path step #%d = %d\n", i, path[i]);
+        }
+#endif
+
+        /* Insert the new route into the route cache */
+        NetworkLar1InsertRoute(lar1, pkt, path, numEntries);
+
+        /* Retrieve and send all packets in the buffer for this destination */
+        bufMsg = NetworkLar1RetrieveSendBuf(lar1, pkt->sourceAddr);
+        while (bufMsg != NULL)
+        {
+#ifdef DEBUG
+            printf("        Send Message to %d size %d\n", 
+                   pkt->sourceAddr, GLOMO_MsgReturnPacketSize(bufMsg));
+#endif
+
+            /* Transmit the data packet */
+            NetworkLar1TransmitData(node, bufMsg);
+            bufMsg = NetworkLar1RetrieveSendBuf(lar1, pkt->sourceAddr);
+        }
+
+        GLOMO_MsgFree(node, msg);
+    }
+    else if (path[left] == node->nodeAddr)
+    { /* This node is an intermediate node for the route reply packet */
+        NODE_ADDR nextHop = path[pkt->segmentLeft-1]; 
+#ifdef DEBUG
+        printf("       I'm the intended intermediate node.\n");
+        printf("       Propagate Route Reply for %d to %d\n",
+               pkt->destAddr, nextHop);
+#endif
+
+        lar1->RouteRepliesRelayed++;
+        /* Propagate this control message towards its destination */
+        NetworkIpSendRawGlomoMessageToMacLayer(
+            node, msg, nextHop, CONTROL, IPPROTO_LAR1, LAR1_MAX_ROUTE_LENGTH,
+            DEFAULT_INTERFACE, nextHop);
+
+    }
+    else
+    {
+        /* This packet should not have reached this node, because it should
+           have been unicasted to the next node in the path towards the
+           data source. */
+        GLOMO_MsgFree(node, msg);
+        assert(FALSE);
+    }
+
+}
+
+//
+// FUNCTION     NetworkLar1TransmitData()
+// PURPOSE      Retrieve route from route cache, transmit data packet
+// PARAMETERS   outMsg          - the packet to be sent
+//
+
+void NetworkLar1TransmitData(GlomoNode *node, Message *outMsg)
+{
+    int numRoutes;
+    NODE_ADDR *routes;
+    struct ip *ipHdr = (struct ip *)GLOMO_MsgReturnPacket(outMsg);
+    NODE_ADDR destAddr = ipHdr->ip_dst;
+    LAR1_RouteCacheEntry *cache_entry;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    /* Retrieve the cache entry for the desired destination */
+    cache_entry = NetworkLar1RetrieveCacheEntry(lar1->routeCacheHead, 
+                                                destAddr);
+    assert(cache_entry);
+
+    /* Extract route information from the cache entry */
+    routes = cache_entry->path;
+    numRoutes = cache_entry->pathLength;
+
+    /* Use route information to send source routed IP datagram */
+    NetworkIpSendPacketToMacLayerWithNewStrictSourceRoute(
+       node, outMsg, routes, numRoutes, FALSE);
+
+    lar1->DataPacketsSentAsSource++;
+}
+
+
+//
+// FUNCTION     NetworkLar1RetrieveSendBuf()
+// PURPOSE      Retrieve next data packet for transmission for specified
+//              destination
+// PARAMETERS   destAddr        - destination node
+//
+
+Message *NetworkLar1RetrieveSendBuf(GlomoNetworkLar1 *lar1, 
+                                    NODE_ADDR destAddr)
+{
+    LAR1_SendBufferEntry *entry;
+    int bufsize;
+    int index;
+    int i;
+
+    bufsize = (lar1->sendBufTail + LAR1_SEND_BUFFER_SIZE) - lar1->sendBufHead;
+    bufsize = bufsize % LAR1_SEND_BUFFER_SIZE;
+
+    if (bufsize == 0)
+        return NULL;
+
+    index = lar1->sendBufHead;
+
+    /* Update Head Pointer */
+    entry = lar1->sendBuf[index];
+    while ((entry == NULL) && 
+           (lar1->sendBufHead != lar1->sendBufTail) &&
+           (bufsize > 0))
+    {
+#ifdef DEBUG
+        printf("                Advance Head Pointer over useless entry.\n");
+#endif
+        lar1->sendBufHead = (lar1->sendBufHead + 1) % LAR1_SEND_BUFFER_SIZE;
+        bufsize -= 1;
+        index = lar1->sendBufHead;
+        entry = lar1->sendBuf[index];
+    }
+
+    /* Return and remove first useful entry, if any */
+    for (i = 0; i < bufsize; i++)
+    {
+        index = (lar1->sendBufHead + i) % LAR1_SEND_BUFFER_SIZE;
+        entry = lar1->sendBuf[index];
+        if (entry != NULL)
+        {
+            if (entry->destAddr == destAddr)
+            {
+                Message *outMsg = entry->msg;
+
+                assert(outMsg);
+                pc_free(entry);
+                lar1->sendBuf[index] = NULL;
+                return outMsg;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+//
+// FUNCTION     NetworkLar1HandleRouteRequest()
+// PURPOSE      Determine course of action for LAR RREQ packet
+// PARAMETERS   msg     - the packet
+//
+
+void NetworkLar1HandleRouteRequest(GlomoNode *node, Message *msg)
+{
+    LAR1_RouteRequest *pkt = (LAR1_RouteRequest *) GLOMO_MsgReturnPacket(msg);
+    char *path;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    /* Increase the hop count */
+    pkt->currentHop = pkt->currentHop + 1;
+
+    /* Process packet only if the node is within the request zone */
+    /* or the packet is purely flooded */
+    if (!(pkt->flooding) && !(NetworkLar1NodeInZone(node, &pkt->requestZone)))
+    {
+#ifdef DEBUG
+        printf("            Not in Zone, Not Flooding Pkt. Discard.\n");
+#endif
+        return;
+    }
+
+    if (pkt->currentHop <= LAR1_MAX_ROUTE_LENGTH)
+    {
+        /* if not seen before */
+        NetworkLar1FlushRequestSeenCache(lar1);
+        if (!NetworkLar1LookupRequestSeen(lar1->reqSeenHead, pkt->sourceAddr,
+                                          pkt->seqNum))
+        {
+#ifdef DEBUG
+            printf("            First Time Seeing This Request.\n");
+#endif
+
+            NetworkLar1InsertRequestSeen(lar1, pkt->sourceAddr, pkt->seqNum);
+            path = GLOMO_MsgReturnPacket(msg) + sizeof(LAR1_RouteRequest);
+
+            if (!NetworkLar1NodeInReqPath(node, (NODE_ADDR *) path, 
+                                          pkt->currentHop))
+            {
+                if (pkt->destAddr == node->nodeAddr)
+                {
+#ifdef DEBUG
+                    printf("            I am the destination node.\n");
+#endif
+                    NetworkLar1InitiateRouteReply(node, msg);
+                }
+                else
+                {
+                    /* relay the packet */
+#ifdef DEBUG
+                    printf("            Relay the packet.\n");
+#endif
+                    NetworkLar1PropagateRouteRequest(node, msg);
+                }
+            }
+            else
+            {
+#ifdef DEBUG
+                printf("            This node already in traversed path.\n");
+#endif
+                return;
+            }
+        }
+        else
+        {
+#ifdef DEBUG
+            printf("            Request already seen.  Discard.\n");
+#endif
+            return;
+        }
+    }
+    else
+    {
+#ifdef DEBUG
+        printf("            Over Hop Limit. Discard.\n");
+#endif
+        return;
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1InitiateRouteReply()
+// PURPOSE      Create and transmit LAR Route Reply packet
+// PARAMETERS   oldMsg     - the original LAR Route Request packet
+//
+
+void NetworkLar1InitiateRouteReply(GlomoNode *node, Message *oldMsg)
+{
+    Message *newMsg;
+    LAR1_RouteRequest *pkt;
+    LAR1_RouteReply *reply;
+    NODE_ADDR *n_addr,
+              *old_n_addr;
+    NODE_ADDR nextHop;
+    char *pktptr;
+    int i;
+    int pktSize = sizeof(LAR1_RouteReply);
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    pkt = (LAR1_RouteRequest *) GLOMO_MsgReturnPacket(oldMsg);
+
+    pktSize += (sizeof(NODE_ADDR) * (pkt->currentHop + 1));
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0,
+                            MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktptr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    reply = (LAR1_RouteReply *) pktptr;
+    /* Position the n_addr pointer onto the array of node addresses */
+    pktptr += sizeof(LAR1_RouteReply);
+    n_addr = (NODE_ADDR *) pktptr;
+
+    /* Position the old_n_addr pointer onto the array of node addresses */
+    pktptr = (char *) GLOMO_MsgReturnPacket(oldMsg) +
+             sizeof(LAR1_RouteRequest);
+    old_n_addr = (NODE_ADDR *) pktptr;
+
+    reply->packetType = LAR1_ROUTE_REPLY;
+    reply->sourceAddr = pkt->destAddr;
+    reply->destAddr = pkt->sourceAddr;
+    reply->segmentLeft = pkt->currentHop;
+    reply->destLocation.x = GLOMO_MobilityReturnPositionX(node);
+    reply->destLocation.y = GLOMO_MobilityReturnPositionY(node);
+    reply->locationTimestamp = simclock();
+    reply->destVelocity = GLOMO_MobilityReturnAvgSpd(node);
+
+    memcpy(n_addr, old_n_addr, (sizeof(NODE_ADDR) * pkt->currentHop));
+
+    n_addr[pkt->currentHop] = node->nodeAddr;
+
+#ifdef DEBUG
+    printf("        Transmit Route Reply for %d to %d, i = %d\n", 
+           reply->destAddr, n_addr[pkt->currentHop-1], pkt->currentHop);
+#endif
+    nextHop = n_addr[pkt->currentHop-1];
+    lar1->RouteRepliesSentAsRecvr++;
+    NetworkIpSendRawGlomoMessageToMacLayer(
+        node, newMsg, nextHop, CONTROL, IPPROTO_LAR1, LAR1_MAX_ROUTE_LENGTH,
+        DEFAULT_INTERFACE, nextHop);
+
+}
+
+
+//
+// FUNCTION     NetworkLar1NodeInReqPath()
+// PURPOSE      Return TRUE if node address appears in path array
+// PARAMETERS   path    - array of NODE_ADDR
+//              hopcount- number of entries in path array
+//
+
+BOOL NetworkLar1NodeInReqPath(GlomoNode *node, NODE_ADDR *path, int hopcount)
+{
+    int i;
+
+    for (i = 0; i < hopcount; i++)
+    {
+#ifdef DEBUG
+        printf("                path[%d] = %d\n", i, path[i]);
+#endif
+        if (path[i] == node->nodeAddr)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+
+//
+// FUNCTION     NetworkLar1FlushRequestSeenCache()
+// PURPOSE      Remove Request Seen Cache entries older than
+//              LAR1_REQUEST_SEEN_LIFETIME
+// PARAMETERS   lar1            - LAR1 variable space
+//
+
+void NetworkLar1FlushRequestSeenCache(GlomoNetworkLar1 *lar1)
+{
+    LAR1_RequestSeenEntry *head = lar1->reqSeenHead;
+    LAR1_RequestSeenEntry *parent;
+    BOOL firstEntry = TRUE;
+
+    while ((head != NULL) && firstEntry)
+    {
+        if (head->lifetime < simclock())
+        {
+            lar1->reqSeenHead = head->next;
+            pc_free(head);
+            head = lar1->reqSeenHead;
+        }
+        else
+        {
+            parent = head;
+            head = head->next;
+            firstEntry = FALSE;
+        }
+    }
+
+    while (head != NULL)
+    {
+        if (head->lifetime < simclock())
+        {
+            parent->next = head->next;
+            pc_free(head);
+            head = parent->next;
+        }
+        else
+        {
+            parent = head;
+            head = head->next;
+        }
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1InsertRequestSeen()
+// PURPOSE      Insert Request source address and sequence num into cache
+// PARAMETERS   sourceAddr      - source of LAR Request Packet
+//              seqNum          - sequence number assigned by source
+//
+
+void NetworkLar1InsertRequestSeen(GlomoNetworkLar1 *lar1, 
+                                  NODE_ADDR sourceAddr,
+                                  int seqNum)
+{
+    LAR1_RequestSeenEntry *entry = pc_malloc(sizeof(LAR1_RequestSeenEntry));
+    
+    assert(entry);
+    
+    entry->sourceAddr = sourceAddr;
+    entry->seqNum = seqNum;
+    entry->lifetime = simclock() + LAR1_REQUEST_SEEN_LIFETIME;
+    entry->next = lar1->reqSeenHead;
+
+    lar1->reqSeenHead = entry;
+}
+
+
+//
+// FUNCTION     NetworkLar1InsertRequestSent()
+// PURPOSE      Insert destination address for locally generated 
+//              LAR Request Packet into cache
+// PARAMETERS   destAddr        - destination address
+//
+
+void NetworkLar1InsertRequestSent(GlomoNetworkLar1 *lar1,
+                                  NODE_ADDR destAddr)
+{
+    LAR1_RequestSentEntry *entry = 
+        checked_pc_malloc(sizeof(LAR1_RequestSentEntry));
+
+    entry->destAddr = destAddr;
+    entry->next = lar1->reqSentHead;
+    lar1->reqSentHead = entry;
+}
+
+//
+// FUNCTION     NetworkLar1RemoveRequestSent()
+// PURPOSE      Remove destination address for locally generated
+//              LAR Request Packet from cache (Reply received)
+// PARAMETERS   destAddr        - destination address
+//
+
+void NetworkLar1RemoveRequestSent(GlomoNetworkLar1 *lar1,
+                                  NODE_ADDR destAddr)
+{
+    LAR1_RequestSentEntry *entry = lar1->reqSentHead;
+    LAR1_RequestSentEntry *parent;
+    BOOL firstEntry = TRUE;
+    
+    while ((entry != NULL) && firstEntry)
+    {
+        if (entry->destAddr == destAddr)
+        {
+            lar1->reqSentHead = entry->next;
+            pc_free(entry);
+            entry = lar1->reqSentHead;
+        }
+        else
+        {
+            firstEntry = FALSE;
+            parent = entry;
+            entry = entry->next;
+        }
+    }
+
+    while (entry != NULL)
+    {
+        if (entry->destAddr == destAddr)
+        {
+            parent->next = entry->next;
+            pc_free(entry);
+            entry = parent->next;
+        }
+        else
+        {
+            parent = entry;
+            entry = entry->next;
+        }
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1LookupRequestSeen()
+// PURPOSE      Return TRUE if the (source addr, seq num) appears in cache
+// PARAMETERS   sourceAddr      - source of LAR Request Packet
+//              seqNum          - sequence number of LAR Request Packet
+//
+
+BOOL NetworkLar1LookupRequestSeen(LAR1_RequestSeenEntry *reqSeen,
+                                  NODE_ADDR sourceAddr,
+                                  int seqNum)
+{
+
+    while (reqSeen != NULL)
+    {
+        if ((reqSeen->sourceAddr == sourceAddr) &&
+            (reqSeen->seqNum == seqNum))
+            return TRUE;
+        reqSeen = reqSeen->next;
+    }
+    return FALSE;
+}
+
+
+//
+// FUNCTION     NetworkLar1PropagateRouteRequest()
+// PURPOSE      Propagate a received LAR Route Request Packet
+// PARAMETERS   oldMsg          - the received LAR Route Request Packet
+//
+
+void NetworkLar1PropagateRouteRequest(GlomoNode *node, Message *oldMsg)
+{
+    Message *newMsg;
+    LAR1_RouteRequest *rreq,
+                      *pkt;
+    NODE_ADDR *n_addr,
+              *old_n_addr;
+    char *pktptr;
+    int i;
+    int pktSize = sizeof(LAR1_RouteRequest);
+    clocktype delay;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+
+    delay = pc_erand(node->seed) * LAR1_RREQ_JITTER;
+
+    pkt = (LAR1_RouteRequest *) GLOMO_MsgReturnPacket(oldMsg);
+    pktSize += (sizeof(NODE_ADDR) * (pkt->currentHop + 1));
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0,
+                            MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktptr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rreq = (LAR1_RouteRequest *) pktptr;
+    /* Position the n_addr pointer onto the array of node addresses */
+    pktptr += sizeof(LAR1_RouteRequest);
+    n_addr = (NODE_ADDR *) pktptr;
+
+    /* Position the old_n_addr pointer onto the array of node addresses */
+    pktptr = (char *) GLOMO_MsgReturnPacket(oldMsg) + 
+             sizeof(LAR1_RouteRequest); 
+    old_n_addr = (NODE_ADDR *) pktptr;
+
+    rreq->packetType = LAR1_ROUTE_REQUEST;
+    rreq->sourceAddr = pkt->sourceAddr;
+    rreq->destAddr = pkt->destAddr;
+    rreq->seqNum = pkt->seqNum;
+    rreq->currentHop = pkt->currentHop;
+    rreq->flooding = pkt->flooding;
+    memmove(&(rreq->requestZone), &(pkt->requestZone), sizeof(LAR1_Zone));
+
+    memcpy(n_addr, old_n_addr, sizeof(NODE_ADDR) * pkt->currentHop);
+
+    n_addr[pkt->currentHop] = node->nodeAddr;
+
+    lar1->RouteRequestsRelayed++;
+    /* Transmit Route Request */
+    NetworkIpSendRawGlomoMessageWithDelay(
+       node, newMsg, ANY_DEST, CONTROL, IPPROTO_LAR1, 0, delay);
+}
+
+    
+//
+// FUNCTION     NetworkLar1InitiateRouteRequest()
+// PURPOSE      Initiate a new LAR Route Request Packet
+// PARAMETERS   destAddr        - the destination for which route is needed
+//
+
+void NetworkLar1InitiateRouteRequest(GlomoNode *node, NODE_ADDR destAddr)
+{
+    Message *newMsg;
+    LAR1_RouteRequest *rreq;
+    NODE_ADDR *n_addr;
+    char *pktptr;
+    int pktSize = sizeof(LAR1_RouteRequest) + sizeof(NODE_ADDR);
+    clocktype delay;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    delay = pc_erand(node->seed) * LAR1_RREQ_JITTER;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0,
+                            MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktptr = (char *) GLOMO_MsgReturnPacket(newMsg);   
+    rreq = (LAR1_RouteRequest *) pktptr;
+    /* Position the n_addr pointer onto the array of node addresses */
+    pktptr += sizeof(LAR1_RouteRequest);
+    n_addr = (NODE_ADDR *) pktptr;
+ 
+    rreq->packetType = LAR1_ROUTE_REQUEST;
+    rreq->sourceAddr = node->nodeAddr;
+    rreq->destAddr = destAddr;
+    rreq->currentHop = 0;
+    rreq->seqNum = lar1->seqNum;
+    lar1->seqNum = (lar1->seqNum + 1) % LAR1_MAX_SEQ_NUM;
+
+    /* Calculate Request Zone */
+    if (NetworkLar1CalculateReqZone(node, newMsg, destAddr))
+        rreq->flooding = FALSE;
+    else
+        rreq->flooding = TRUE;
+
+    n_addr[0] = node->nodeAddr;
+
+    lar1->RouteRequestsSentAsSource++;
+    /* Transmit Route Request */
+    NetworkIpSendRawGlomoMessageWithDelay(
+       node, newMsg, ANY_DEST, CONTROL, IPPROTO_LAR1, 0, delay);
+
+    NetworkLar1SetTimer(node, MSG_NETWORK_CheckTimeoutAlarm, destAddr,
+                        LAR1_REQ_TIMEOUT);
+
+    NetworkLar1InsertRequestSent(lar1, destAddr);
+}
+
+
+//
+// FUNCTION     NetworkLar1CalculateReqZone()
+// PURPOSE      Calculate and set the request zone in a LAR Request Packet
+//              for a given destination
+// PARAMETERS   msg             - the LAR Request Packet to be sent
+//              destAddr        - the destination for which route is needed
+//
+
+BOOL NetworkLar1CalculateReqZone(GlomoNode *node, Message *msg,
+                                 NODE_ADDR destAddr)
+{
+    LAR1_Zone zone;
+    double radius;
+    double velocity;
+    long xSource;
+    long ySource;
+    long xDestination;
+    long yDestination;
+    clocktype destinationTime;
+    int i;
+    BOOL found = FALSE;
+    LAR1_RouteCacheEntry *current;
+    LAR1_RouteRequest *rreq;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    rreq = (LAR1_RouteRequest *) GLOMO_MsgReturnPacket(msg);
+    /* Get source location info */
+    xSource = GLOMO_MobilityReturnPositionX(node);
+    ySource = GLOMO_MobilityReturnPositionY(node);
+
+    /* Get destination location info */
+    current = lar1->routeCacheHead;
+    while (current != NULL)
+    {
+        if (current->destAddr == destAddr)
+        {
+            found = TRUE;            
+            velocity = current->destVelocity;
+            destinationTime = current->locationTimestamp;
+            xDestination = current->destLocation.x;
+            yDestination = current->destLocation.y;
+
+            break;
+        }
+        current = current->next;
+    }
+
+    if(!found){
+#ifdef DEBUG
+        printf("                No location data on node %d\n", destAddr);
+#endif
+        memset(&(rreq->requestZone), 0, sizeof(LAR1_Zone));
+        return FALSE;
+    }
+    else {
+#ifdef DEBUG
+        printf("            Location data found for node %d\n", destAddr);
+#endif
+        /* Calculate radius to find the request zone */
+        radius = velocity * (double)((simclock() - destinationTime) / SECOND);
+#ifdef DEBUG
+        printf("            velocity = %f  radius = %f\n",velocity,radius);
+        printf("    Source = (%d,%d), Dest = (%d, %d)\n",
+            xSource, ySource, xDestination, yDestination);
+#endif
+
+        /* Calculate reqest zone if source node is within expected zone */
+        if ((xSource >= (xDestination - radius)) &&
+            (xSource <= (xDestination + radius)) &&
+            (ySource >= (yDestination - radius)) &&
+            (ySource <= (yDestination + radius)))
+        {
+#ifdef DEBUG
+            printf("            Source Node is Within Expected Zone.\n");
+#endif
+            zone.bottomLeft.x = xDestination - radius;
+            zone.bottomLeft.y = yDestination - radius;
+            zone.topLeft.x = xDestination - radius;
+            zone.topLeft.y = yDestination + radius;
+            zone.topRight.x = xDestination + radius;
+            zone.topRight.y = yDestination + radius;
+            zone.bottomRight.x = xDestination + radius;
+            zone.bottomRight.y = yDestination - radius;
+        }
+        /* Calculate request zone if source node is outside expected zone */
+        else
+        {
+#ifdef DEBUG
+            printf("            Source Node is Outside Expected Zone.\n");
+#endif
+            if(xSource < xDestination-radius)
+            {
+                if (ySource < yDestination-radius)
+                {
+                    zone.bottomLeft.x = xSource;
+                    zone.bottomLeft.y = ySource;
+                    zone.topLeft.x = xSource;
+                    zone.topLeft.y = yDestination + radius;
+                    zone.topRight.x = xDestination + radius;
+                    zone.topRight.y = yDestination + radius;
+                    zone.bottomRight.x = xDestination + radius;
+                    zone.bottomRight.y = ySource;
+                }
+                else if (ySource >= yDestination-radius &&
+                         ySource <= yDestination+radius)
+                {
+                    zone.bottomLeft.x = xSource;
+                    zone.bottomLeft.y = yDestination-radius;
+                    zone.topLeft.x = xSource;
+                    zone.topLeft.y = yDestination + radius;
+                    zone.topRight.x = xDestination + radius;
+                    zone.topRight.y = yDestination + radius;
+                    zone.bottomRight.x = xDestination + radius;
+                    zone.bottomRight.y = yDestination - radius;
+                }
+                else if (ySource > yDestination+radius)
+                {
+                    zone.bottomLeft.x = xSource;
+                    zone.bottomLeft.y = yDestination - radius;
+                    zone.topLeft.x = xSource;
+                    zone.topLeft.y = ySource;
+                    zone.topRight.x = xDestination + radius;
+                    zone.topRight.y = ySource;
+                    zone.bottomRight.x = xDestination + radius;
+                    zone.bottomRight.y = yDestination - radius;
+                }
+            }
+            else if (xSource >= xDestination-radius &&
+                     xSource <= xDestination+radius)
+            {
+                if (ySource < yDestination-radius)
+                {
+                    zone.bottomLeft.x = xDestination - radius;
+                    zone.bottomLeft.y = ySource;
+                    zone.topLeft.x = xDestination - radius;
+                    zone.topLeft.y = yDestination + radius;
+                    zone.topRight.x = xDestination + radius;
+                    zone.topRight.y = yDestination + radius;
+                    zone.bottomRight.x = xDestination + radius;
+                    zone.bottomRight.y = ySource;
+                }
+                else if (ySource > yDestination+radius)
+                {
+                    zone.bottomLeft.x = xDestination - radius;
+                    zone.bottomLeft.y = yDestination - radius;
+                    zone.topLeft.x = xDestination - radius;
+                    zone.topLeft.y = ySource;
+                    zone.topRight.x = xDestination + radius;
+                    zone.topRight.y = ySource;
+                    zone.bottomRight.x = xDestination + radius;
+                    zone.bottomRight.y = yDestination - radius;
+                }
+            }
+            else if (xSource > xDestination+radius)
+            {
+                if (ySource < yDestination-radius)
+                {
+                    zone.bottomLeft.x = xDestination - radius;
+                    zone.bottomLeft.y = ySource;
+                    zone.topLeft.x = xDestination - radius;
+                    zone.topLeft.y = yDestination + radius;
+                    zone.topRight.x = xSource;
+                    zone.topRight.y = yDestination + radius;
+                    zone.bottomRight.x = xSource;
+                    zone.bottomRight.y = ySource;
+                }
+                else if (ySource >= yDestination-radius &&
+                         ySource <= yDestination+radius)
+                {
+                    zone.bottomLeft.x = xDestination - radius;
+                    zone.bottomLeft.y = yDestination - radius;
+                    zone.topLeft.x = xDestination - radius;
+                    zone.topLeft.y = yDestination + radius;
+                    zone.topRight.x = xSource;
+                    zone.topRight.y = yDestination + radius;
+                    zone.bottomRight.x = xSource;
+                    zone.bottomRight.y = yDestination - radius;
+                }
+                else if (ySource > yDestination+radius)
+                {
+                    zone.bottomLeft.x = xDestination - radius;
+                    zone.bottomLeft.y = yDestination - radius;
+                    zone.topLeft.x = xDestination - radius;
+                    zone.topLeft.y = ySource;
+                    zone.topRight.x = xSource;
+                    zone.topRight.y = ySource;
+                    zone.bottomRight.x = xSource;
+                    zone.bottomRight.y = yDestination - radius;
+                }
+            }
+        }
+#ifdef DEBUG
+        printf("        zone.bottomLeft = (%d, %d)\n",
+            zone.bottomLeft.x, zone.bottomLeft.y);
+        printf("        zone.topLeft = (%d, %d)\n",
+            zone.topLeft.x, zone.topLeft.y);
+        printf("        zone. topRight = (%d, %d)\n",
+            zone.topRight.x, zone.topRight.y);
+        printf("        zone.bottomRight = (%d, %d)\n",
+            zone.bottomRight.x, zone.bottomRight.y);
+#endif
+        memmove(&(rreq->requestZone), &zone, sizeof(LAR1_Zone));
+        return TRUE;
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1BufferPacket()
+// PURPOSE      Place packet into send buffer, awaiting valid path
+//              and return TRUE if buffering is successful
+// PARAMETERS   msg             - the data packet to be buffered
+//              destAddr        - the destination of this data packet
+//
+
+BOOL NetworkLar1BufferPacket(GlomoNode *node, Message *msg, 
+                             NODE_ADDR destAddr)
+{
+    LAR1_SendBufferEntry *entry;
+    int bufsize;
+    int index;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    bufsize = (lar1->sendBufTail + LAR1_SEND_BUFFER_SIZE) - lar1->sendBufHead;
+    bufsize = bufsize % LAR1_SEND_BUFFER_SIZE;
+
+    if (bufsize >= LAR1_SEND_BUFFER_SIZE)
+        return FALSE;
+
+    index = lar1->sendBufTail;
+
+    if (lar1->sendBuf[index] == NULL)
+    {
+        lar1->sendBuf[index] = pc_malloc(sizeof(LAR1_SendBufferEntry));
+        assert (lar1->sendBuf[index]);
+    }
+    entry = lar1->sendBuf[index];
+
+    entry->destAddr = destAddr;
+    entry->msg = msg;
+    entry->reTx = FALSE;
+    entry->times = simclock();
+
+    lar1->sendBufTail = (lar1->sendBufTail + 1) % LAR1_SEND_BUFFER_SIZE;
+
+    return TRUE;
+}
+
+
+//
+// FUNCTION     NetworkLar1PendingRouteReq()
+// PURPOSE      Return TRUE if this node has sent a LAR Route Request Packet
+//              for the given destination.
+// PARAMETERS   destAddr        - the destination to check
+//
+
+BOOL NetworkLar1PendingRouteReq(GlomoNode *node, 
+                                NODE_ADDR destAddr)
+{
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+    LAR1_RequestSentEntry *entry;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    entry = lar1->reqSentHead;
+    while (entry != NULL)
+    {
+        if (entry->destAddr == destAddr)
+            return TRUE;
+        else
+            entry = entry->next;
+    }
+
+    return FALSE;
+}
+
+
+//
+// FUNCTION     NetworkLar1RouteExists()
+// PURPOSE      Return TRUE if this node has a valid route to the destination
+// PARAMETERS   destAddr        - the destination to check
+//
+
+BOOL NetworkLar1RouteExists(LAR1_RouteCacheEntry *cacheEntry, 
+                            NODE_ADDR destAddr)
+{
+    while (cacheEntry != NULL)
+    {
+        if ((cacheEntry->destAddr == destAddr) &&
+            (cacheEntry->valid))
+            return TRUE;
+        cacheEntry = cacheEntry->next;
+    }
+    return FALSE;
+}
+
+
+//
+// FUNCTION     NetworkLar1RetrieveCacheEntry()
+// PURPOSE      Return the Route Cache Entry for the given destination if
+//              one exists.
+// PARAMETERS   cacheEntry      - the head pointer of the route cache
+//              destAddr        - the destination to check
+//
+
+LAR1_RouteCacheEntry *NetworkLar1RetrieveCacheEntry(
+    LAR1_RouteCacheEntry *cacheEntry,
+    NODE_ADDR destAddr) 
+{
+    while (cacheEntry != NULL)
+    {
+        if ((cacheEntry->destAddr == destAddr) &&
+            (cacheEntry->valid))
+            return cacheEntry;
+        cacheEntry = cacheEntry->next;
+    }
+    return NULL;
+}
+
+
+//
+// FUNCTION     NetworkLar1InsertRoute()
+// PURPOSE      Extract route information from a LAR Route Reply Packet
+//              and insert info into the Route Cache.
+// PARAMETERS   pkt             - the LAR Route Reply packet
+//              path            - the path given in the route reply
+//              numEntries      - the number of entries in the path array
+//
+
+void NetworkLar1InsertRoute(GlomoNetworkLar1 *lar1,
+                            LAR1_RouteReply *pkt,
+                            NODE_ADDR *path,
+                            int numEntries)
+{
+    LAR1_RouteCacheEntry *entry = pc_malloc(sizeof(LAR1_RouteCacheEntry));
+    int i;
+
+    assert(entry);
+    entry->destAddr = pkt->sourceAddr;
+    entry->inUse = TRUE;
+    entry->valid = TRUE;
+    memmove(&(entry->destVelocity), &(pkt->destVelocity), sizeof(double));
+
+    entry->path = pc_malloc(sizeof(NODE_ADDR) * (numEntries-1));
+    assert(entry->path);
+    memcpy(entry->path, &(path[1]), (sizeof(NODE_ADDR) * (numEntries-1)));
+
+    entry->pathLength = numEntries-1;
+    memmove(&(entry->locationTimestamp), &(pkt->locationTimestamp), 
+           sizeof(clocktype));
+    memmove(&(entry->destLocation), &(pkt->destLocation), sizeof(LAR1_Location));
+    entry->next = lar1->routeCacheHead;
+
+    lar1->routeCacheHead = entry;
+
+}
+
+
+//
+// FUNCTION     NetworkLar1SetTimer()
+// PURPOSE      Set a timer to expire just in case a route reply is not 
+//              received in the allotted time.
+// PARAMETERS   eventType       - the event that is triggered by the timer
+//              destAddr        - the destination node that the timer is
+//                                interested in
+//              delay           - the delay between now and timer expiration
+//
+
+void NetworkLar1SetTimer(GlomoNode *node, long eventType, NODE_ADDR destAddr,
+                         clocktype delay)
+{
+    Message *newMsg;
+    NODE_ADDR *info;
+
+    newMsg = GLOMO_MsgAlloc(node,
+                            GLOMO_NETWORK_LAYER,
+                            ROUTING_PROTOCOL_LAR1,
+                            eventType);
+
+    GLOMO_MsgInfoAlloc(node, newMsg, sizeof(NODE_ADDR));
+    info = (NODE_ADDR *) GLOMO_MsgReturnInfo(newMsg);
+    *info = destAddr;
+    GLOMO_MsgSend(node, newMsg, delay);
+}
+
+
+//
+// FUNCTION     NetworkLar1RouterFunction()
+// PURPOSE      Determine the routing action to take for a the given data
+//              packet, and set the PacketWasRouted variable to TRUE if no
+//              further handling of this packet by IP is necessary.
+// PARAMETERS   msg             - the data packet
+//              destAddr        - the destination node of this data packet
+//              PacketWasRouted - variable that indicates to IP that it
+//                                no longer needs to act on this data packet
+//
+
+void NetworkLar1RouterFunction(
+   GlomoNode *node, Message *msg, NODE_ADDR destAddr, BOOL* PacketWasRouted)
+{
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+    IpHeaderType *ipHeader = (IpHeaderType *) GLOMO_MsgReturnPacket(msg);
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    if (destAddr == node->nodeAddr) {
+        *PacketWasRouted = FALSE;
+        return;
+    }
+#ifdef DEBUG
+    printf("#%d:    NetworkLar1HandleDatapacket()\n",node->nodeAddr);
+#endif
+
+    if (ipHeader->ip_src != node->nodeAddr) {
+#ifdef DEBUG
+        printf("        Source Routing this packet.\n");
+#endif
+        lar1->DataPacketsRelayed++;
+        *PacketWasRouted = FALSE;
+        return;
+    }
+
+    /* Check if Route In Cache */
+    if (NetworkLar1RouteExists(lar1->routeCacheHead, destAddr))
+    {
+        *PacketWasRouted = TRUE;
+#ifdef DEBUG
+        printf("        Route In Cache.\n");
+#endif
+        NetworkLar1TransmitData(node, msg);
+    }
+    else /* No Route In Cache */
+    {
+        *PacketWasRouted = TRUE;
+        
+#ifdef DEBUG
+        printf("        No Route in Cache to #%d.\n", destAddr);
+#endif
+        /* Check if there is already a pending route request for this dest */
+        if (NetworkLar1PendingRouteReq(node, destAddr))
+        {
+#ifdef DEBUG
+            printf("            Already pending request.  Buffer pkt.\n");
+#endif
+
+            if (NetworkLar1BufferPacket(node, msg, destAddr))
+            {
+#ifdef DEBUG
+                printf("                Buffered size %d.\n",
+                    GLOMO_MsgReturnPacketSize(msg));
+#endif
+            }
+            else
+            {
+#ifdef DEBUG
+                printf("                Not enough space in buffer.  ",
+                       "Dropped.\n");
+#endif
+                GLOMO_MsgFree(node, msg);
+            }
+        }
+        else
+        {
+#ifdef DEBUG
+            printf("            Initiate route request and buffer pkt.\n");
+#endif
+            if (NetworkLar1BufferPacket(node, msg, destAddr))
+            {
+#ifdef DEBUG
+                printf("                Buffered.  Initiate Route Request.\n");
+                printf("                    size %d\n",
+                    GLOMO_MsgReturnPacketSize(msg));
+#endif
+                NetworkLar1InsertRequestSeen(lar1, 
+                                             node->nodeAddr, lar1->seqNum);
+                NetworkLar1InitiateRouteRequest(node, destAddr);
+            }
+            else
+            {
+#ifdef DEBUG
+                printf("                Not enough space in buffer.  ",
+                       "Dropped.\n");
+#endif
+                GLOMO_MsgFree(node, msg);
+            }
+        }
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1FreeCacheEntry()
+// PURPOSE      Free the memory used by a route rache entry
+// PARAMETERS   cacheEntry      - the entry to free
+//
+
+void NetworkLar1FreeCacheEntry(LAR1_RouteCacheEntry *cacheEntry)
+{
+    pc_free(cacheEntry->path);
+    pc_free(cacheEntry);
+}
+
+
+//
+// FUNCTION     NetworkLar1InvalidateRoutesThroughBrokenLink()
+// PURPOSE      Mark as unusable routes in the cache which contain the
+//              given node pair
+// PARAMETERS   fromHop         - the first node in the node pair
+//              toHop           - the receiving node of the node pair
+//
+
+void NetworkLar1InvalidateRoutesThroughBrokenLink(
+    GlomoNode *node,
+    NODE_ADDR fromHop,
+    NODE_ADDR toHop)
+{
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+    LAR1_RouteCacheEntry *cacheEntry;
+    NODE_ADDR *path;
+    int pathCount;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+    cacheEntry = lar1->routeCacheHead;
+
+    while (cacheEntry != NULL)
+    {
+        path = cacheEntry->path;
+        if ((node->nodeAddr == fromHop) && (path[0] == toHop))
+            cacheEntry->valid = FALSE;
+        else
+        {
+            for (pathCount = 0; pathCount < cacheEntry->pathLength;
+                 pathCount++)
+            {
+                if (path[pathCount] == fromHop)
+                {
+                    if (pathCount < (cacheEntry->pathLength - 1))
+                        if (path[pathCount+1] == toHop)
+                        {
+                            cacheEntry->valid = FALSE;
+                            pathCount = cacheEntry->pathLength;
+                        }
+                }
+            }
+        }
+        cacheEntry = cacheEntry->next;
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1DeleteRoute()
+// PURPOSE      Remove route to the given destination from the route cache
+// PARAMETERS   destAddr        - the given destination
+//
+
+void NetworkLar1DeleteRoute(GlomoNode *node, NODE_ADDR destAddr)
+{
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+    LAR1_RouteCacheEntry *cacheEntry,
+                         *tempCacheEntry;
+    BOOL firstEntry = TRUE;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+    cacheEntry = lar1->routeCacheHead;
+
+#ifdef DEBUG
+    printf("    NetworkLar1DeleteRoute(%d)\n", destAddr);
+#endif
+
+    if (cacheEntry == NULL)
+        return;
+
+    while ((cacheEntry != NULL)  && (firstEntry == TRUE))
+    {
+        if (cacheEntry->destAddr == destAddr)
+        {
+            lar1->routeCacheHead = cacheEntry->next;
+            NetworkLar1FreeCacheEntry(cacheEntry);
+            cacheEntry = lar1->routeCacheHead;
+        }
+        else
+        {
+            firstEntry = FALSE;
+            tempCacheEntry = cacheEntry;
+            if (tempCacheEntry != NULL)
+                cacheEntry = cacheEntry->next;
+            else
+                cacheEntry = NULL;
+        }
+    }
+
+    while (cacheEntry != NULL)
+    {
+        if (cacheEntry->destAddr == destAddr)
+        {
+            tempCacheEntry->next = cacheEntry->next;
+            NetworkLar1FreeCacheEntry(cacheEntry);
+            cacheEntry = tempCacheEntry->next;
+        }
+        else
+        {
+            tempCacheEntry = cacheEntry;
+            cacheEntry = cacheEntry->next;
+        }
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1TransmitErrorPacket()
+// PURPOSE      Given a packet which MAC 802.11 was unable to transmit to 
+//              the neighbor node listed in the source route, this function
+//              will transmit to the data packet's source node, a LAR
+//              Route Error indicating that the route is broken at this link.
+// PARAMETERS   oldMsg          - the data packet
+//              nextHop         - the nextHop to which the data packet should
+//                                have gone
+//
+
+void NetworkLar1TransmitErrorPacket(GlomoNode *node, const Message *oldMsg,
+                                    NODE_ADDR nextHop)
+{
+    Message *newMsg;
+    LAR1_RouteError *error;
+    NODE_ADDR *n_addr,
+              *old_n_addr;
+    NODE_ADDR prevHop;
+    char *pktptr;
+    int i;
+    int numHops;
+    int pktSize = sizeof(LAR1_RouteError);
+    IpHeaderType *ipHeader = (IpHeaderType *)GLOMO_MsgReturnPacket(oldMsg);
+    IpOptionsHeaderType* ipOptions =
+        (IpOptionsHeaderType*) (GLOMO_MsgReturnPacket(oldMsg) 
+        + sizeof(IpHeaderType));
+    int ptr = 4;
+    char* routeRawAddressBytes = (char*)ipOptions + ptr - 1;
+    NODE_ADDR nHop = ANY_DEST;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+/* Determine number of hops back to source node */
+    numHops = 0;
+#ifdef DEBUG
+    printf("        Determine path from source to here\n");
+#endif
+    while ((ptr < ipOptions->len) && (nHop != node->nodeAddr))
+    {
+        memcpy(&nHop, routeRawAddressBytes, sizeof(NODE_ADDR));
+        ptr += 4;
+        routeRawAddressBytes += 4;
+        numHops++;
+    }
+    assert(nHop == node->nodeAddr);
+
+    pktSize += (sizeof(NODE_ADDR) * (numHops+1));
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0,
+                            MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktptr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    error = (LAR1_RouteError *) pktptr;
+    /* Position the n_addr pointer onto the array of node addresses */
+    pktptr += sizeof(LAR1_RouteError);
+    n_addr = (NODE_ADDR *) pktptr;
+    error->packetType = LAR1_ROUTE_ERROR;
+    error->sourceAddr = ipHeader->ip_dst;
+    error->destAddr = ipHeader->ip_src;
+    error->fromHop = node->nodeAddr;
+    error->nextHop = nextHop;
+    error->segmentLeft = numHops-1;
+
+    routeRawAddressBytes = (char*)ipOptions + 4 - 1;
+    memcpy(&(n_addr[1]), routeRawAddressBytes, 
+           (sizeof(NODE_ADDR) * (numHops-1)));
+    nHop = ipHeader->ip_src;
+    memcpy(&(n_addr[0]), &nHop, sizeof(NODE_ADDR)); 
+
+#ifdef DEBUG
+    for (i=0; i<numHops; i++)
+        printf("    --- hop %d = %d\n", i+1, n_addr[i]);
+#endif
+    prevHop = n_addr[error->segmentLeft];
+
+#ifdef DEBUG
+    printf("    Send Route Error packet To Next Hop %d\n", prevHop);
+#endif
+
+    lar1->RouteErrorsSentAsErrorSource++;
+    NetworkIpSendRawGlomoMessageToMacLayer(
+        node, newMsg, prevHop, CONTROL, IPPROTO_LAR1, LAR1_MAX_ROUTE_LENGTH,
+        DEFAULT_INTERFACE, prevHop);
+
+}
+
+
+//
+// FUNCTION     NetworkLar1HandleBrokenLink()
+// PURPOSE      Handle message from MAC 802.11 regarding broken link
+// PARAMETERS   msg             - the packet returned by MAC 802.11
+//
+
+void NetworkLar1HandleBrokenLink(GlomoNode *node, const Message *msg)
+{
+    IpHeaderType* ipHeader = (IpHeaderType *) GLOMO_MsgReturnPacket(msg);
+    IpOptionsHeaderType* ipOptions =
+        (IpOptionsHeaderType*) ((char *)GLOMO_MsgReturnPacket(msg) + 
+        sizeof(IpHeaderType));
+    NODE_ADDR nextHop, destAddr;
+    GlomoNetworkLar1 *lar1;
+    GlomoNetworkIp* ipLayer;
+
+    ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    lar1 = (GlomoNetworkLar1 *) ipLayer->routingProtocol;
+
+    /* Return if the IP packet is not a data packet */
+    if (ipHeader->ip_p  == IPPROTO_LAR1)
+        return;
+
+    if (ipOptions->ptr < (ipOptions->len+4) ) {
+
+       // Extract Next Address
+       // The definition of "ptr" seems to number 1 as the
+       // first byte of the the options field.
+
+       char* routeRawAddressBytes = (char*)ipOptions + ipOptions->ptr - 1;
+
+       routeRawAddressBytes -= 4;
+       memcpy(&nextHop, routeRawAddressBytes, sizeof(NODE_ADDR));
+
+    } 
+    else 
+        assert(FALSE);
+    ipHeader = (IpHeaderType *) GLOMO_MsgReturnPacket(msg);
+
+    destAddr = ipHeader->ip_dst;
+
+#ifdef DEBUG
+    printf("    HandleBrokenLink (%d - %d)\n",node->nodeAddr, nextHop);
+#endif
+
+    /* If Node is the source of broken route */
+    if (node->nodeAddr == ipHeader->ip_src)
+    {
+        Message *bufMsg = GLOMO_MsgCopy(node, msg);
+#ifdef DEBUG
+        printf("    Node is source of dropped packet.\n");
+        printf("            Initiate route request and buffer pkt.\n");
+#endif
+        if (NetworkLar1BufferPacket(node, bufMsg, destAddr))
+        {
+            /* Check if there is already a pending route request 
+               for this dest */
+            if ((!NetworkLar1PendingRouteReq(node, destAddr)) ||
+                (NetworkLar1RouteExists(lar1->routeCacheHead, destAddr)))
+            {
+#ifdef DEBUG
+                printf("                Buffered.  Initiate Route Request.\n");
+#endif
+                NetworkLar1InsertRequestSeen(lar1,
+                                             node->nodeAddr, lar1->seqNum);
+                NetworkLar1InitiateRouteRequest(node, destAddr);
+            }
+#ifdef DEBUG
+            else
+            {
+                printf("                Buffered.  Pending Route Request.\n");
+            }
+#endif
+        }
+        else
+        {
+#ifdef DEBUG
+            printf("                Not enough space in buffer.  ",
+                   "Dropped.\n");
+#endif
+            GLOMO_MsgFree(node, bufMsg);
+        }
+
+        /* Delete Routes that Use the Broken Link */
+        NetworkLar1InvalidateRoutesThroughBrokenLink(node, node->nodeAddr, 
+                                                 nextHop);
+    }
+    else
+    {
+#ifdef DEBUG
+        printf("    Node is intermediate.  Build error packet.\n");
+#endif
+        /* Build Error Packet */
+        NetworkLar1TransmitErrorPacket(node, msg, nextHop);
+    }
+}
+
+
+//
+// FUNCTION     NetworkLar1PacketDropNotificationHandler()
+// PURPOSE      Handle internal messages from MAC Layer
+// PARAMETERS   msg             - the packet returned by MAC
+//
+
+void NetworkLar1PacketDropNotificationHandler(
+    GlomoNode *node, const Message* msg, const NODE_ADDR lastHopAddress)
+{
+#ifdef DEBUG
+    printf("#%d: NetworkLar1MacLayerStatusHandler()\n", node->nodeAddr);
+#endif
+#ifdef DEBUG
+    printf("    PacketDropped.\n");
+#endif
+    NetworkLar1HandleBrokenLink(node, msg);
+}
+
+
+
+

@@ -1,0 +1,404 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "glomo.h"
+#include "splaytree.h"
+
+
+
+#define HEAP_INCREMENT 10
+#define HEAP_PARENT(i) ((i) / 2)
+#define HEAP_LEFT(i) (2 * (i))
+#define HEAP_RIGHT(i) ((2 * (i)) + 1)
+
+
+
+/* Code adapted from Jay's code by Lokesh
+   - Code used for Optimistic Runtime in Parsec */
+
+static void SplayTreeAtNode(SplayTree *splayPtr, SplayNode *nodePtr);
+static void RotateNodeRight(SplayTree *splayPtr, SplayNode *nodePtr);
+static void RotateNodeLeft(SplayTree *splayPtr, SplayNode *nodePtr);
+
+
+static void HeapSplayFixUp(HeapSplayTree *heapSplayTreePtr, int i);
+static void HeapSplayFixDown(HeapSplayTree *heapSplayTreePtr, int i);
+static BOOL NodeGreaterThan(GlomoNode *node1, GlomoNode *node2);
+
+
+void GLOMO_SplayTreeInsert(GlomoNode *node, SplayNode *splayNodePtr)
+{
+    BOOL newLeast = FALSE;
+    SplayTree *splayPtr;
+
+    splayPtr = &(node->splayTree);
+
+    if (splayPtr->rootPtr == 0) {
+        splayPtr->rootPtr = splayNodePtr;
+        splayPtr->leastPtr = splayNodePtr;
+        newLeast = TRUE;
+    }
+    else {
+        BOOL itemInserted = FALSE;
+        SplayNode *currentPtr = splayPtr->rootPtr;
+
+        while (itemInserted == FALSE) {
+            if (splayNodePtr->timeValue < currentPtr->timeValue) {
+                if (currentPtr->leftPtr == NULL) {
+                    itemInserted = TRUE;
+                    currentPtr->leftPtr = splayNodePtr;
+                    if (currentPtr == splayPtr->leastPtr) {
+                        splayPtr->leastPtr = splayNodePtr;
+                        newLeast = TRUE;
+                    }
+                }
+                else {
+                    currentPtr = currentPtr->leftPtr;
+                }
+            }
+            else {
+                if (currentPtr->rightPtr == NULL) {
+                    itemInserted = TRUE;
+                    currentPtr->rightPtr = splayNodePtr;
+                }
+                else {
+                    currentPtr = currentPtr->rightPtr;
+                }
+            }
+        }
+
+        splayNodePtr->parentPtr = currentPtr;
+        SplayTreeAtNode(splayPtr, splayNodePtr);
+    }
+
+    if (newLeast == TRUE) {
+        HeapSplayFixUp(&(node->partitionData->heapSplayTree),
+                       node->splayTree.heapPos);
+    }
+}
+
+
+SplayNode* GLOMO_SplayTreeExtractMin(GlomoNode *node)
+{
+    SplayNode *outPtr;
+    SplayTree *splayPtr;
+
+    splayPtr = &(node->splayTree);
+    outPtr = splayPtr->leastPtr;
+
+    if (outPtr->parentPtr == NULL) {
+        splayPtr->rootPtr = outPtr->rightPtr;
+
+        if (splayPtr->rootPtr == NULL) {
+            splayPtr->leastPtr = NULL;
+        }
+        else {
+            splayPtr->rootPtr->parentPtr = NULL;
+            splayPtr->leastPtr = splayPtr->rootPtr;
+
+            while (splayPtr->leastPtr->leftPtr != NULL) {
+                splayPtr->leastPtr = splayPtr->leastPtr->leftPtr;
+            }
+        }
+    }
+    else {
+        outPtr->parentPtr->leftPtr = outPtr->rightPtr;
+        if (outPtr->rightPtr == 0) {
+            splayPtr->leastPtr = outPtr->parentPtr;
+        }
+        else {
+            outPtr->rightPtr->parentPtr = outPtr->parentPtr;
+            splayPtr->leastPtr= outPtr->rightPtr;
+
+            while(splayPtr->leastPtr->leftPtr != NULL) {
+                splayPtr->leastPtr = splayPtr->leastPtr->leftPtr;
+            }
+        }
+    }
+
+    if ((splayPtr->leastPtr == NULL) || 
+        (outPtr->timeValue != splayPtr->leastPtr->timeValue)) {
+        HeapSplayFixDown(&(node->partitionData->heapSplayTree),
+                         node->splayTree.heapPos);
+    }
+
+    return outPtr;
+}
+
+
+static void SplayTreeAtNode(SplayTree *splayPtr, SplayNode *nodePtr)
+{
+    SplayNode *parentPtr = nodePtr->parentPtr;
+
+    while ((parentPtr != NULL) && (parentPtr->parentPtr != NULL)) {
+        SplayNode *grandParentPtr = parentPtr->parentPtr;
+
+        if (grandParentPtr->leftPtr == parentPtr) {
+            if (parentPtr->leftPtr == nodePtr) {
+                RotateNodeRight(splayPtr, grandParentPtr);
+                RotateNodeRight(splayPtr, parentPtr);
+            }
+            else {
+                RotateNodeLeft(splayPtr, parentPtr);
+                RotateNodeRight(splayPtr, grandParentPtr);
+            }
+        }
+        else {
+            if (parentPtr->rightPtr == nodePtr) {
+                RotateNodeLeft(splayPtr, grandParentPtr);
+                RotateNodeLeft(splayPtr, parentPtr);
+            }
+            else {
+                RotateNodeRight(splayPtr, parentPtr);
+                RotateNodeLeft(splayPtr, grandParentPtr);
+            }
+        }
+
+        parentPtr = nodePtr->parentPtr;
+    }
+
+    if (parentPtr != NULL) {
+        if (parentPtr->leftPtr == nodePtr) {
+            RotateNodeRight(splayPtr, parentPtr);
+        }
+        else {
+            RotateNodeLeft(splayPtr, parentPtr);
+        }
+    }
+
+    splayPtr->rootPtr = nodePtr;
+}
+
+
+static void RotateNodeRight(SplayTree *splayPtr, SplayNode *nodePtr)
+{
+    SplayNode *nodeLeftPtr = nodePtr->leftPtr;
+
+    nodePtr->leftPtr = nodeLeftPtr->rightPtr;
+
+    if (nodeLeftPtr->rightPtr != NULL) {
+        nodeLeftPtr->rightPtr->parentPtr = nodePtr;
+    }
+
+    nodeLeftPtr->rightPtr = nodePtr;
+    nodeLeftPtr->parentPtr = nodePtr->parentPtr;
+
+    if (nodePtr->parentPtr != 0) {
+        if (nodePtr->parentPtr->leftPtr == nodePtr) {
+            nodePtr->parentPtr->leftPtr = nodeLeftPtr;
+        }
+        else {
+            nodePtr->parentPtr->rightPtr = nodeLeftPtr;
+        }
+    }
+
+    nodePtr->parentPtr = nodeLeftPtr;
+}
+
+
+void RotateNodeLeft(SplayTree *splayPtr, SplayNode *nodePtr)
+{
+    SplayNode *nodeRightPtr = nodePtr->rightPtr;
+
+    nodePtr->rightPtr = nodeRightPtr->leftPtr;
+
+    if (nodeRightPtr->leftPtr != NULL) {
+        nodeRightPtr->leftPtr->parentPtr = nodePtr;
+    }
+
+    nodeRightPtr->leftPtr = nodePtr;
+    nodeRightPtr->parentPtr = nodePtr->parentPtr;
+
+    if (nodePtr->parentPtr != NULL) {
+        if (nodePtr->parentPtr->leftPtr == nodePtr) {
+            nodePtr->parentPtr->leftPtr = nodeRightPtr;
+        }
+        else { 
+            nodePtr->parentPtr->rightPtr = nodeRightPtr;
+        }
+    }
+
+    nodePtr->parentPtr = nodeRightPtr;
+}
+
+
+
+
+
+
+
+
+
+static void HeapSplayFixUp(HeapSplayTree *heapSplayTreePtr, int i)
+{
+    GlomoNode **heapNodePtr;
+    GlomoNode *inNode;
+
+    heapNodePtr = heapSplayTreePtr->heapNodePtr;
+    inNode = heapNodePtr[i];
+
+    while ((i > 1) && NodeGreaterThan(heapNodePtr[HEAP_PARENT(i)], inNode)) {
+        heapNodePtr[i] = heapNodePtr[HEAP_PARENT(i)];
+        heapNodePtr[i]->splayTree.heapPos = i;
+        i = HEAP_PARENT(i);
+    }
+
+    heapNodePtr[i] = inNode;
+    inNode->splayTree.heapPos = i;
+}
+
+
+static void HeapSplayFixDown(HeapSplayTree *heapSplayTreePtr, int i)
+{
+    int lval, rval;
+    int small;
+    GlomoNode **heapNodePtr;
+
+    heapNodePtr = heapSplayTreePtr->heapNodePtr;
+    lval = HEAP_LEFT(i);
+    rval = HEAP_RIGHT(i);
+
+    if ((lval <= heapSplayTreePtr->heapSize) &&
+        NodeGreaterThan(heapNodePtr[i], heapNodePtr[lval])) {
+        small = lval;
+    }
+    else {
+        small = i;
+    }
+
+    if ((rval <= heapSplayTreePtr->heapSize) &&
+        NodeGreaterThan(heapNodePtr[small], heapNodePtr[rval])) {
+        small = rval;
+    }
+
+    if (small != i) {
+        GlomoNode *tempNode;
+        tempNode = heapNodePtr[small];
+        heapNodePtr[small] = heapNodePtr[i];
+        heapNodePtr[small]->splayTree.heapPos = small;
+        heapNodePtr[i] = tempNode;
+        heapNodePtr[i]->splayTree.heapPos = i;
+        HeapSplayFixDown(heapSplayTreePtr, small);
+    }
+}
+
+
+void GLOMO_HeapSplayDelete(HeapSplayTree *heapSplayTreePtr, GlomoNode *node)
+{
+    int heapPos;
+    GlomoNode **heapNodePtr;
+
+    heapPos = node->splayTree.heapPos;
+    heapNodePtr = heapSplayTreePtr->heapNodePtr;
+    assert(heapNodePtr[heapPos] = node);
+    node->splayTree.heapPos = 0;
+
+    if (heapPos == heapSplayTreePtr->heapSize) {
+        heapNodePtr[heapPos] = NULL;
+        heapSplayTreePtr->heapSize--;
+    }
+    else {
+        heapNodePtr[heapPos] = heapNodePtr[heapSplayTreePtr->heapSize];
+        heapNodePtr[heapPos]->splayTree.heapPos = heapPos;
+        heapNodePtr[heapSplayTreePtr->heapSize] = NULL;
+        heapSplayTreePtr->heapSize--;
+        HeapSplayFixDown(heapSplayTreePtr, heapPos);
+        HeapSplayFixUp(heapSplayTreePtr, heapPos);
+    }
+}
+
+
+void GLOMO_HeapSplayInsert(HeapSplayTree *heapSplayTreePtr, GlomoNode *node)
+{
+    int i;
+
+    heapSplayTreePtr->heapSize++;
+
+    if (heapSplayTreePtr->heapSize >= heapSplayTreePtr->length) {
+        GlomoNode **tempPtr;
+        heapSplayTreePtr->length += HEAP_INCREMENT;
+
+        tempPtr = (GlomoNode **) pc_malloc(heapSplayTreePtr->length
+                                          * sizeof(GlomoNode *));
+        memset(tempPtr, 0, heapSplayTreePtr->length * sizeof(GlomoNode *));
+        assert(tempPtr != NULL);
+
+        memcpy(tempPtr, heapSplayTreePtr->heapNodePtr, sizeof(GlomoNode *) *
+                                (heapSplayTreePtr->length - HEAP_INCREMENT));
+
+        if (heapSplayTreePtr->heapNodePtr != NULL) {
+            pc_free(heapSplayTreePtr->heapNodePtr);
+        }
+
+        heapSplayTreePtr->heapNodePtr = tempPtr;
+    }
+
+    assert(heapSplayTreePtr->heapSize < heapSplayTreePtr->length);
+
+    heapSplayTreePtr->heapNodePtr[heapSplayTreePtr->heapSize] = node;
+    node->splayTree.heapPos = heapSplayTreePtr->heapSize;
+    HeapSplayFixUp(heapSplayTreePtr, node->splayTree.heapPos);
+}
+
+/* is node1 "greater than" node2 */
+static BOOL NodeGreaterThan(GlomoNode *node1, GlomoNode *node2)
+{
+    if (node2->splayTree.leastPtr == NULL) {
+        return FALSE;
+    }
+
+    if (node1->splayTree.leastPtr == NULL) {
+        return TRUE;
+    }
+
+    if ((node1->splayTree.leastPtr->timeValue >
+         node2->splayTree.leastPtr->timeValue) ||
+        ((node1->splayTree.leastPtr->timeValue ==
+          node2->splayTree.leastPtr->timeValue) &&
+         (node1->id > node2->id))) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+

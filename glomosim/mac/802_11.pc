@@ -1,0 +1,2675 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: 802_11.pc,v 1.68 2001/12/19 22:31:53 jmartin Exp $
+ */
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "mac.h"
+#include "802_11.h"
+#include "radio.h"
+#include "../main/lookahead.h"
+
+/* 
+ * Used to force remote nodes to yield longer for the data exchange.
+ * Also needed since when packets will arrive at the same time a timer
+ * times out.  Add delay to allow packets to be process first before
+ * timers get a chance to expire.  Therefore, this value to be at
+ * least 1.
+ */
+#define EPSILON_DELAY 1
+
+
+
+static //inline//
+clocktype CalcFragmentTransmissionDuration(
+   int bandwidthBytesPerSec,
+   int dataSizeBytes) 
+{
+   return (SYNCHRONIZATION_TIME + 
+      ((dataSizeBytes + sizeof(M802_11FrameHdr)) * SECOND) / 
+       bandwidthBytesPerSec);
+}
+
+
+/*
+ * When using promiscuous mode, DO NOT use fragmentation!  This mode won't
+ * work with it.  The remote stations' mac layer cannot determine when
+ * fragments should be assembled.  Also, the remote nodes WILL
+ * receive packets even if they are not in sequence!  Again, the remote
+ * stations' mac layer cannot determine if a packet is in sequence.
+ */
+
+
+
+
+
+/*
+ * NAME:        Mac802_11WaitForNAV.
+ *
+ * PURPOSE:     See if this node is holding for NAV.
+ *
+ * PARAMETERS:  node, node that is checking to see if holding for NAV.
+ *
+ * RETURN:      TRUE if holding for NAV, FALSE otherwise.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static //inline// 
+BOOL Mac802_11WaitForNAV(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   return (M802->NAV > simclock());
+}
+
+
+
+/*
+ * NAME:        Mac802_11SetState.
+ *
+ * PURPOSE:     Set the state of the node.
+ *
+ * PARAMETERS:  node, node that is setting its state.
+ *              state, the state that is being set to.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11SetState(GlomoNode *node, GlomoMac802_11 *M802, int state)
+{
+
+   M802->prevState = M802->state;
+   M802->state = state;
+}
+
+
+/*
+ * NAME:        Mac802_11StartTimer.
+ *
+ * PURPOSE:     Setting the various timers in 802.11.
+ *
+ * PARAMETERS:  timerValue: duration of the timer being set.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11StartTimer(
+   GlomoNode *node, GlomoMac802_11 *M802, clocktype timerDelay)
+{
+   Message *newMsg;
+
+   M802->timerSequenceNumber++;
+
+   newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, MAC_PROTOCOL_802_11,
+                           MSG_MAC_TimerExpired);
+   GLOMO_MsgSetInstanceId(newMsg, M802->myGlomoMac->interfaceIndex);
+
+   GLOMO_MsgInfoAlloc(node, newMsg, sizeof(M802->timerSequenceNumber));
+   *((int*)(newMsg->info)) = M802->timerSequenceNumber;
+ 
+   GLOMO_MsgSend(node, newMsg, timerDelay);
+   
+   
+}
+
+
+/*
+ * NAME:        Mac802_11CancelTimer.
+ *
+ * PURPOSE:     Cancelling the current timer set in 802.11.
+ *
+ * PARAMETERS:  node, node that is cancelling the timer.
+ *              timerType, type of timer being cancelled.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static //inline//
+void Mac802_11CancelTimer(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   // Has the effect of making the current timer "obsolete".
+   
+   M802->timerSequenceNumber++;
+   
+   
+   
+}
+
+
+
+static //inline//
+void StartTransmittingPacket(
+   GlomoNode* node, 
+   GlomoMac802_11* M802,
+   Message* packet, 
+   clocktype delay) 
+{
+   int radioIndex = M802->myGlomoMac->interfaceIndex;
+   M802_11LongControlFrame* hdr = (M802_11LongControlFrame *)packet->packet;
+   
+   // printf("%d Sending to %d at %I64d %I64d\n", node->id, hdr->destAddr, simclock(), delay);
+   
+   GLOMO_RadioStartTransmittingPacket(node, radioIndex, packet, hdr->destAddr,
+      TRUE, delay);
+}
+
+
+
+static //inline//
+RadioStatusType RadioStatus(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   return GLOMO_RadioGetStatus(node, M802->myGlomoMac->interfaceIndex);
+}
+
+
+static //inline//
+void AttemptToGoIntoWaitForDifsOrEifsState(
+   GlomoNode *node, GlomoMac802_11 *M802) 
+{
+   if (RadioStatus(node, M802) == RADIO_IDLE) {
+      if (Mac802_11WaitForNAV(node, M802)) { 
+         // 
+         // Set timer to wait for NAV (Software Carrier Sense) to finish.
+         //
+         Mac802_11SetState(node, M802, M802_11_S_WFNAV);
+         Mac802_11StartTimer(node, M802, (M802->NAV - simclock()));
+      } else { 
+         Mac802_11SetState(node, M802, M802_11_S_WF_DIFS_OR_EIFS);
+      
+         if (M802->IsInExtendedIfsMode) {
+            Mac802_11StartTimer(node, M802, M802_11_EXTENDED_IFS_DELAY);
+         } else {
+            Mac802_11StartTimer(node, M802, M802_11_TX_DIFS);
+         }//if//
+      }//if//
+   } else {
+      Mac802_11SetState(node, M802, M802_11_S_IDLE);
+      Mac802_11CancelTimer(node, M802);
+   }//if//
+}
+
+
+
+/*
+ * NAME:        Mac802_11IncreaseCW.
+ *
+ * PURPOSE:     Increase control window since node has to retransmit.
+ *
+ * PARAMETERS:  node, node that is increasing its control window.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11IncreaseCW(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   M802->CW = MIN( (((M802->CW+1) * 2) - 1), M802_11_CW_MAX);
+}
+
+
+/*
+ * NAME:        Mac802_11GetSeqNo.
+ *
+ * PURPOSE:     Returns the entry for given destAddr.
+ *
+ * PARAMETERS:  node, address of neighboring node for given entry.
+ *
+ * RETURN:      SeqNoEntry Pointer to Entry for given destAddr.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+SeqNoEntry *Mac802_11GetSeqNo(
+    GlomoNode *node, GlomoMac802_11 *M802, NODE_ADDR destAddr)
+{
+   SeqNoEntry *entry = M802->seqNoHead,
+              *prev = NULL;
+
+   if (!entry)
+   {
+      entry = pc_malloc(sizeof(SeqNoEntry));
+      assert (entry);
+      entry->nodeAddr = destAddr;
+      entry->fromSeqNo = 0;
+      entry->toSeqNo = 0;
+      entry->next = NULL;
+      M802->seqNoHead = entry;
+      return entry;
+   }
+
+   while (entry)
+   {
+      if (entry->nodeAddr == destAddr)
+         return entry;
+      else
+      {
+         prev = entry;
+         entry = entry->next;
+      }
+   }
+
+   entry = pc_malloc(sizeof(SeqNoEntry));
+   assert(entry);
+   entry->nodeAddr = destAddr;
+   entry->fromSeqNo = 0;
+   entry->toSeqNo = 0;
+   entry->next = NULL;
+
+   prev->next = entry;
+
+   return entry;
+}
+
+
+/*
+ * NAME:        Mac802_11SetBackoffIfZero.
+ *
+ * PURPOSE:     Setting the backoff counter for this node.
+ *
+ * PARAMETERS:  node, node that is being backed off.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11SetBackoffIfZero(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   if (M802->BO == 0) {
+      M802->BO = (pc_nrand(node->seed) % M802->CW) * M802_11_SLOT_TIME;
+   }//if//
+}
+
+
+
+
+
+
+/*
+ * NAME:        Mac802_11CheckForOutgoingPacket.
+ *
+ * PURPOSE:     See if there's a packet in the queue that needs to be sent out.
+ *              Should only be called right after the medium was busy,
+ *              So assume 802.11 will backoff.
+ *
+ *
+ * PARAMETERS:  node, node that is checking its queue. 
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11CheckForOutgoingPacket(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   if (!NetworkIpOutputQueueIsEmpty(node, M802->myGlomoMac->interfaceIndex))
+   {
+      Mac802_11SetBackoffIfZero(node, M802);
+      AttemptToGoIntoWaitForDifsOrEifsState(node, M802);
+   }
+   else
+   {
+      assert(M802->BO == 0);
+      Mac802_11SetState(node, M802, M802_11_S_IDLE);
+      Mac802_11CancelTimer(node, M802);
+   }
+}
+
+
+/*
+ * NAME:        Mac802_11InformNetworkOfPktDrop.
+ *
+ * PURPOSE:     Tells Network layer that a packet is dropped because of
+ *              unsuccessful delivery.
+ *
+ * PARAMETERS:  node, node that was unable to deliver the network packet.
+ *              msg, network packet that got dropped.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11InformNetworkOfPktDrop(
+    GlomoNode *node, GlomoMac802_11 *M802, Message *msg, NODE_ADDR nextHop)
+{
+   NetworkIpNotifyOfPacketDrop(node, msg, nextHop);
+}
+
+
+/*
+ * NAME:        Mac802_11DecreaseCW.
+ *
+ * PURPOSE:     Resetting control window since transmission was successful.
+ *
+ * PARAMETERS:  node, node that is resetting its control window.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11DecreaseCW(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   M802->CW = M802_11_CW_MIN;
+}
+
+
+
+
+/*
+ * NAME:        Mac802_11RetransmitFrag.
+ *
+ * PURPOSE:     Retransmitting a fragment that is part of a frame.
+ *
+ * PARAMETERS:  node, node that is retransmitting the fragment of a frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static
+void Mac802_11RetransmitFrag(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   NODE_ADDR destAddr;
+
+   Message* topPacket;
+   NODE_ADDR nextHopAddress;
+   
+   Message *pktToRadio;
+   int macPktLen;
+   int i, remainder;
+   int fragmentSize;
+   int frameSize;
+   int left;
+   int *curval;
+   int limit;
+   M802_11FrameHdr hdr;
+   int payloadSize;
+   SeqNoEntry *entry;
+
+
+   assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+
+    
+//NoFrag    NetworkIpOutputQueueTopPacketForAPriority(
+//NoFrag       node, M802->myGlomoMac->interfaceIndex, M802->currentPriority,
+//NoFrag       &topPacket, &nextHopAddress);
+//NoFrag                    
+//NoFrag    if  (topPacket == NULL)
+//NoFrag    {
+//NoFrag       Mac802_11CheckForOutgoingPacket(node, M802);
+//NoFrag       return;
+//NoFrag    }
+//NoFrag 
+//NoFrag    remainder = topPacket->packetSize -
+//NoFrag                (M802_11_FRAG_THRESH * M802->currentFrag);
+//NoFrag 
+//NoFrag    /* Retransmit fragment which is not the last one. */
+//NoFrag    if (remainder > 0)
+//NoFrag    {
+//NoFrag       fragmentSize = M802_11_FRAG_THRESH;
+//NoFrag    }
+//NoFrag    /* Retransmitting last fragment. */
+//NoFrag    else
+//NoFrag    {
+//NoFrag       fragmentSize = M802_11_FRAG_THRESH * M802->currentFrag -
+//NoFrag                      topPacket->packetSize;
+//NoFrag    }
+//NoFrag 
+//NoFrag    /*
+//NoFrag     * Long retry count only applies to data frames greater
+//NoFrag     * than RTS_THRESH.  RTS uses short retry count.
+//NoFrag     */
+//NoFrag 
+//NoFrag    if (fragmentSize > M802_11_RTS_THRESH)
+//NoFrag    {
+//NoFrag       curval = &(M802->SLRC);
+//NoFrag       limit = M802_11_LONG_RETRY_LIMIT;
+//NoFrag    }
+//NoFrag    else
+//NoFrag    {
+//NoFrag       curval = &(M802->SSRC);
+//NoFrag       limit = M802_11_SHORT_RETRY_LIMIT;
+//NoFrag    }
+//NoFrag 
+//NoFrag    /* If not greater than retry limit, retransmit frame. */
+//NoFrag    if (*curval < limit)
+//NoFrag    {
+//NoFrag       *curval = *curval + 1;
+//NoFrag 
+//NoFrag       pktToRadio = GLOMO_MsgAlloc(node, 0, 0, 0);
+//NoFrag       
+//NoFrag       hdr.frameType = M802_11_FRAGMENT;
+//NoFrag       hdr.sourceAddr = node->nodeAddr,
+//NoFrag       hdr.destAddr = nextHopAddress;
+//NoFrag       M802->waitingForAckOrCtsFromAddress = nextHopAddress;
+//NoFrag       payloadSize = topPacket->packetSize;
+//NoFrag 
+//NoFrag       entry = Mac802_11GetSeqNo(node, M802, nextHopAddress);
+//NoFrag       assert(entry);
+//NoFrag       hdr.seqNo = entry->toSeqNo;
+//NoFrag 
+//NoFrag       /* Update duration to include next FRAG/ACK sequence. */
+//NoFrag       if (remainder > 0)
+//NoFrag       {
+//NoFrag          frameSize = M802_11_FRAG_THRESH + sizeof(M802_11FrameHdr);
+//NoFrag 
+//NoFrag          left = topPacket->packetSize -
+//NoFrag                 (M802->currentFrag * M802_11_FRAG_THRESH);
+//NoFrag 
+//NoFrag          if (left > M802_11_FRAG_THRESH)
+//NoFrag          {
+//NoFrag 
+//NoFrag             hdr.duration =
+//NoFrag                ((sizeof(M802_11ShortControlFrame) +
+//NoFrag                M802_11_FRAG_THRESH + sizeof(M802_11FrameHdr) +
+//NoFrag                M802_11_SHORT_CTRL_FRAME_SIZE) * SECOND) /
+//NoFrag                (M802->bandwidth) +
+//NoFrag                (3 * SYNCHRONIZATION_TIME) +
+//NoFrag                (3 * M802_11_SIFS) + 
+//NoFrag                (3 * M802_11_DELAY_UNTIL_SIGNAL_AIRBORN) + 
+//NoFrag                (3 * M802->propDelay);
+//NoFrag          }
+//NoFrag          else
+//NoFrag          {
+//NoFrag 
+//NoFrag             /* End of next FRAG/ACK period is last FRAG/ACK. */
+//NoFrag             hdr.duration =
+//NoFrag                ((M802_11_SHORT_CTRL_FRAME_SIZE +
+//NoFrag                remainder + sizeof(M802_11FrameHdr) +
+//NoFrag                M802_11_SHORT_CTRL_FRAME_SIZE) * SECOND) /
+//NoFrag                (M802->bandwidth) +
+//NoFrag                (3 * SYNCHRONIZATION_TIME) +
+//NoFrag                (3 * M802_11_SIFS) + 
+//NoFrag                (3 * M802_11_DELAY_UNTIL_SIGNAL_AIRBORN) + 
+//NoFrag                (3 * M802->propDelay);
+//NoFrag          }
+//NoFrag       }
+//NoFrag       /* This is the last fragment. */
+//NoFrag       else
+//NoFrag       {
+//NoFrag 
+//NoFrag          hdr.duration =
+//NoFrag             (M802_11_SHORT_CTRL_FRAME_SIZE * SECOND) /
+//NoFrag             (M802->bandwidth) +
+//NoFrag             SYNCHRONIZATION_TIME +
+//NoFrag             M802_11_SIFS +  
+//NoFrag             M802_11_DELAY_UNTIL_SIGNAL_AIRBORN +
+//NoFrag             M802->extraPropDelay;
+//NoFrag       }
+//NoFrag 
+//NoFrag       GLOMO_MsgPacketAlloc(node, pktToRadio, fragmentSize);
+//NoFrag 
+//NoFrag       memcpy(pktToRadio->packet,
+//NoFrag              (topPacket->packet + (M802_11_FRAG_THRESH * M802->currentFrag)),
+//NoFrag              fragmentSize);
+//NoFrag 
+//NoFrag       GLOMO_MsgAddHeader(node, pktToRadio, sizeof(M802_11FrameHdr) );
+//NoFrag 
+//NoFrag       macPktLen = fragmentSize + sizeof(M802_11FrameHdr) ;
+//NoFrag       hdr.fragId = M802->currentFrag;
+//NoFrag 
+//NoFrag 
+//NoFrag       memcpy(pktToRadio->packet, &(hdr), sizeof(M802_11FrameHdr) );
+//NoFrag 
+//NoFrag       StartTransmittingPacket(
+//NoFrag          node, M802, pktToRadio, M802_11_DELAY_UNTIL_SIGNAL_AIRBORN);
+//NoFrag       
+//NoFrag       Mac802_11SetState(node, M802, M802_11_X_FRAGMENT);
+//NoFrag    }
+//NoFrag    /* Exceeded retry limit, so drop frame. */
+//NoFrag    else
+//NoFrag    {
+//NoFrag       NODE_ADDR NotUsed;
+//NoFrag       Message* pktFromNetwork;
+//NoFrag 
+//NoFrag 
+//NoFrag       M802->fragsDropped++;
+//NoFrag 
+//NoFrag       *curval = 0;
+//NoFrag 
+//NoFrag       /* Drop frame from queue. */
+//NoFrag       
+//NoFrag       
+//NoFrag       NetworkIpOutputQueueDequeuePacketForAPriority(
+//NoFrag          node, M802->myGlomoMac->interfaceIndex, M802->currentPriority,
+//NoFrag          &pktFromNetwork, &NotUsed);
+//NoFrag       
+//NoFrag       M802->currentPriority = INVALID_PRIORITY;
+//NoFrag 
+//NoFrag       Mac802_11InformNetworkOfPktDrop(node, M802, pktFromNetwork);
+//NoFrag 
+//NoFrag       Mac802_11DecreaseCW(node, M802);
+//NoFrag       Mac802_11CheckForOutgoingPacket(node, M802);
+//NoFrag    }
+}
+
+
+/*
+ * NAME:        Mac802_11Retransmit.
+ *
+ * PURPOSE:     Retransmit frame since CTS or ACK was nevered received.
+ *
+ * PARAMETERS:  node, node that is retransmitting.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11Retransmit(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   NODE_ADDR NotUsed;
+   Message* topPacket;
+   int limit;
+   int *curval;
+
+   NetworkIpOutputQueueTopPacketForAPriority(
+      node, M802->myGlomoMac->interfaceIndex, M802->currentPriority,
+      &topPacket, &NotUsed);
+
+   assert(topPacket != NULL);
+   
+   /* Long retry count only applies to data frames greater
+      than RTS_THRESH.  RTS uses short retry count.
+   */
+   
+   if ((topPacket->packetSize > M802_11_RTS_THRESH)
+       && (M802->state != M802_11_S_WFCTS))
+   {
+
+      curval = &(M802->SLRC);
+      limit = M802_11_LONG_RETRY_LIMIT;
+   }
+   else
+   {
+
+      curval = &(M802->SSRC);
+      limit = M802_11_SHORT_RETRY_LIMIT;
+   }
+
+   /* If not greater than maximum retry count allowed, retransmit frame. */
+   if (*curval < limit)
+   {
+      *curval = *curval + 1;
+
+      Mac802_11IncreaseCW(node, M802);
+      Mac802_11SetBackoffIfZero(node, M802);
+      AttemptToGoIntoWaitForDifsOrEifsState(node, M802);
+   }
+   else
+   {
+      /* Exceeded maximum retry count allowed, so drop frame. */
+      
+      NODE_ADDR NotUsed;
+      Message* pktFromNetwork;
+
+
+      M802->pktsDropped++;
+
+      *curval = 0;
+
+      /* Drop frame from queue. */
+      NetworkIpOutputQueueDequeuePacketForAPriority(
+         node, M802->myGlomoMac->interfaceIndex, M802->currentPriority,
+         &pktFromNetwork, &NotUsed);
+         
+      M802->currentPriority = INVALID_PRIORITY;
+
+      Mac802_11InformNetworkOfPktDrop(node, M802, pktFromNetwork, 
+          M802->waitingForAckOrCtsFromAddress);
+
+      Mac802_11DecreaseCW(node, M802);
+      Mac802_11CheckForOutgoingPacket(node, M802);
+   }
+}
+
+
+/*
+ * NAME:        Mac802_11CTSTransmitted.
+ *
+ * PURPOSE:     Hold for reply after sending CTS.
+ *
+ * PARAMETERS:  node, node that just sent the CTS.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+   
+static 
+void Mac802_11CTSTransmitted(GlomoNode *node, GlomoMac802_11 *M802)
+{
+
+   Mac802_11SetState(node, M802, M802_11_S_WFDATA);
+   Mac802_11StartTimer(node, M802, M802->noResponseTimeoutDuration);
+}
+
+
+/*
+ * NAME:        Mac802_11UnicastedTransmitted.
+ *
+ * PURPOSE:     Hold for ACK after data frame is transmitted.
+ *
+ * PARAMETERS:  node, node that just sent the data frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11UnicastTransmitted(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   clocktype holdForAck;
+
+   Mac802_11SetState(node, M802, M802_11_S_WFACK);
+
+   // This is the right time according to the starndard.
+   
+   holdForAck =
+      M802->extraPropDelay +
+      M802_11_SIFS + 
+      M802->ctsOrAckTransmissionDuration + 
+      M802->extraPropDelay +
+      M802_11_SLOT_TIME;
+
+   // This is the time in ns-2
+   //holdForAck =
+   //   M802_11_SIFS + 
+   //   M802->ctsOrAckTransmissionDuration + 
+   //   M802_11_DIFS;
+
+   Mac802_11StartTimer(node, M802, holdForAck);
+}
+
+
+ 
+/*
+ * NAME:        Mac802_11FragTransmitted.
+ *
+ * PURPOSE:     Hold for reply after a fragmented data frame is transmitted.
+ *
+ * PARAMETERS:  node, node that just sent the fragmented data frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11FragTransmitted(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   clocktype holdForFragAck;
+
+   assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+//NoFrag    
+//NoFrag    
+//NoFrag    holdForFragAck = 
+//NoFrag       M802_11_SIFS + (2 * M802_11_DELAY_UNTIL_SIGNAL_AIRBORN) +
+//NoFrag       (2 * M802->extraPropDelay) + (2 * SYNCHRONIZATION_TIME) +
+//NoFrag       ((M802_11_SHORT_CTRL_FRAME_SIZE) * SECOND) /
+//NoFrag       (M802->bandwidth) + EPSILON_DELAY;
+//NoFrag 
+//NoFrag 
+//NoFrag    Mac802_11SetState(node, M802, M802_11_S_WFFRAGACK);
+//NoFrag    Mac802_11StartTimer(node, M802, holdForFragAck);
+}
+
+
+/*
+ * NAME:        Mac802_11AckTransmitted.
+ *
+ * PURPOSE:     Check to see if any more packets that needs to be sent
+ *              out.
+ *
+ * PARAMETERS:  node, node that just sent the ACK.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11AckTransmitted(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   Mac802_11CheckForOutgoingPacket(node, M802);
+}
+
+
+/*
+ * NAME:        Mac802_11FragAckTransmitted.
+ *
+ * PURPOSE:     Hold for reply after ACK is transmitted for a fragmented frame.
+ *
+ * PARAMETERS:  node, node that just sent the ACK for a fragmented frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11FragAckTransmitted(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   clocktype holdForData;
+
+   assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+   
+//NoFrag    Mac802_11SetState(node, M802, M802_11_S_WFDATA);
+//NoFrag 
+//NoFrag    holdForData = M802->noResponseTimeoutDuration + EPSILON_DELAY;
+//NoFrag 
+//NoFrag 
+//NoFrag    Mac802_11StartTimer(node, M802, holdForData);
+}
+
+
+/*
+ * NAME:        Mac802_11RTSTransmitted.
+ *
+ * PURPOSE:     Hold for reply after sending RTS.
+ *
+ * PARAMETERS:  node, node that just sent the RTS.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11RTSTransmitted(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   clocktype holdForCts;
+
+   Mac802_11SetState(node, M802, M802_11_S_WFCTS);
+
+   holdForCts = 
+      M802->extraPropDelay +
+      M802_11_SIFS + 
+      M802->ctsOrAckTransmissionDuration +
+      M802->extraPropDelay +
+      M802_11_SLOT_TIME;
+   
+   Mac802_11StartTimer(node, M802, holdForCts);
+}
+
+
+/*
+ * NAME:        Mac802_11PauseBackoff.
+ *
+ * PURPOSE:     Stop the backoff counter once carrier is sensed.
+ *
+ * PARAMETERS:  node, node that is stopping its own backoff.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11PauseBackoff(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   M802->BO = M802->BO - (simclock() - M802->lastBOTimeStamp);
+   
+   //printf("Node- %d BO = %I64d (%I64d)\n", node->id, M802->BO, M802->CW);
+
+   if (M802->BO < 0)
+   {
+      assert(FALSE); abort();
+      M802->BO = 0;
+   }
+
+}
+
+
+
+
+/*
+ * NAME:        Mac802_11ProcessNotMyFrame.
+ *
+ * PURPOSE:     Handle frames that don't belong to this node.
+ *
+ * PARAMETERS:  node, node that is handling this packet.
+ *              duration, time needed to yield for other nodes.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+
+static 
+void Mac802_11ProcessNotMyFrame(
+   GlomoNode *node, GlomoMac802_11 *M802, 
+   clocktype duration, BOOL isARtsPacket)
+{
+   clocktype currentTime = simclock();
+   
+   clocktype NewNAV = currentTime + duration + EPSILON_DELAY;
+   if (NewNAV > M802->NAV) {
+      M802->NAV = NewNAV;
+
+      assert(M802->state != M802_11_S_WF_DIFS_OR_EIFS);           
+      assert(M802->state != M802_11_S_BO);
+      assert(M802->state != M802_11_S_WFNAV);
+      assert(M802->state != M802_11_S_NAV_RTS_CHECK_MODE);
+      
+      if ((RadioStatus(node, M802) == RADIO_IDLE) &&
+          (!NetworkIpOutputQueueIsEmpty(
+              node, M802->myGlomoMac->interfaceIndex)))
+      {
+         //
+         // This is what we should do.
+         //
+         //if (isARtsPacket) {
+            // If RTS-ing node failed to get a CTS and start sending then
+            // reset the NAV (MAC layer virtual carrier sense) for this
+            // bystander node.
+         //   Mac802_11SetState(node, M802, M802_11_S_NAV_RTS_CHECK_MODE);
+         //   Mac802_11StartTimer(node, M802,
+         //      (M802->extraPropDelay + M802_11_SIFS + M802->ctsOrAckTransmissionDuration +
+         //       M802->extraPropDelay + 2 * M802_11_SLOT_TIME));
+         //} else {
+         //
+         //   Mac802_11SetState(node, M802, M802_11_S_WFNAV);
+         //   Mac802_11StartTimer(node, M802, (M802->NAV - currentTime));
+         //  }//if//
+      
+         // This is for ns-2 comparison.
+         
+         Mac802_11SetState(node, M802, M802_11_S_WFNAV);
+         Mac802_11StartTimer(node, M802, (M802->NAV - currentTime));
+      }//if//
+   }//if//
+}//void Mac802_11ProcessNotMyFrame//
+
+
+
+/*
+ * NAME:        Mac802_11TransmitNextFrag.
+ *
+ * PURPOSE:     Transmitting the next fragment of a frame.
+ *
+ * PARAMETERS:  node, node that is sending the next fragment of a frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11TransmitNextFrag(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   NODE_ADDR destAddr;
+
+   Message *topPacket;
+   NODE_ADDR nextHopAddress;
+   Message *pktToRadio;
+   int macPktLen;
+   int i, remainder;
+   int fragmentSize;
+   int frameSize;
+   int left;
+   int *curval;
+   int limit;
+   M802_11FrameHdr hdr;
+   int payloadSize;
+   SeqNoEntry *entry;
+
+   assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+
+   
+//NoFrag    M802->SSRC = 0;
+//NoFrag 
+//NoFrag    NetworkIpOutputQueueTopPacketForAPriority(
+//NoFrag       node, M802->myGlomoMac->interfaceIndex, M802->currentPriority,
+//NoFrag       &topPacket, &nextHopAddress);
+//NoFrag                  
+//NoFrag    if  (topPacket == NULL) {
+//NoFrag       Mac802_11CheckForOutgoingPacket(node, M802);
+//NoFrag       return;
+//NoFrag    }
+//NoFrag 
+//NoFrag 
+//NoFrag    destAddr = nextHopAddress;
+//NoFrag 
+//NoFrag    remainder = topPacket->packetSize -
+//NoFrag                (M802_11_FRAG_THRESH * (M802->currentFrag+1));
+//NoFrag 
+//NoFrag    /* transmit fragment which is not the last one. */
+//NoFrag    if (remainder > 0)
+//NoFrag    {
+//NoFrag       fragmentSize = M802_11_FRAG_THRESH;
+//NoFrag    }
+//NoFrag    /* transmitting last fragment. */
+//NoFrag    else
+//NoFrag    {
+//NoFrag       fragmentSize = topPacket->packetSize -
+//NoFrag                      (M802_11_FRAG_THRESH * M802->currentFrag);
+//NoFrag    }
+//NoFrag 
+//NoFrag    pktToRadio = GLOMO_MsgAlloc(node, 0, 0, 0);
+//NoFrag 
+//NoFrag    hdr.frameType = M802_11_FRAGMENT;
+//NoFrag    hdr.sourceAddr = node->nodeAddr;
+//NoFrag    hdr.destAddr = destAddr;
+//NoFrag    M802->waitingForAckOrCtsFromAddress = destAddr;
+//NoFrag    payloadSize = topPacket->packetSize;
+//NoFrag 
+//NoFrag    entry = Mac802_11GetSeqNo(node, M802, destAddr);
+//NoFrag    assert(entry);
+//NoFrag    hdr.seqNo = entry->toSeqNo;
+//NoFrag 
+//NoFrag    /* Update duration to include next FRAG/ACK sequence. */
+//NoFrag    if (remainder > 0)
+//NoFrag    {
+//NoFrag       frameSize = M802_11_FRAG_THRESH + sizeof(M802_11FrameHdr);
+//NoFrag 
+//NoFrag       left = payloadSize -
+//NoFrag              (M802->currentFrag * M802_11_FRAG_THRESH);
+//NoFrag 
+//NoFrag       if (left > M802_11_FRAG_THRESH)
+//NoFrag       {
+//NoFrag 
+//NoFrag          hdr.duration =
+//NoFrag             ((M802_11_SHORT_CTRL_FRAME_SIZE +
+//NoFrag             M802_11_FRAG_THRESH + sizeof(M802_11FrameHdr) +
+//NoFrag             M802_11_SHORT_CTRL_FRAME_SIZE) * SECOND) /
+//NoFrag             (M802->bandwidth) + (3 * SYNCHRONIZATION_TIME) +
+//NoFrag             (3 * M802_11_SIFS) + 
+//NoFrag             (3 * M802_11_DELAY_UNTIL_SIGNAL_AIRBORN) +
+//NoFrag             (3 * M802->extraPropDelay);
+//NoFrag       }
+//NoFrag       else
+//NoFrag       {
+//NoFrag 
+//NoFrag          /* End of next FRAG/ACK period is last FRAG/ACK. */
+//NoFrag          hdr.duration =
+//NoFrag             ((M802_11_SHORT_CTRL_FRAME_SIZE +
+//NoFrag             remainder + sizeof(M802_11FrameHdr) +
+//NoFrag             M802_11_SHORT_CTRL_FRAME_SIZE) * SECOND) /
+//NoFrag             (M802->bandwidth) + (3 * M802_11_SIFS) +
+//NoFrag             (3 * SYNCHRONIZATION_TIME) +
+//NoFrag             (3 * M802_11_DELAY_UNTIL_SIGNAL_AIRBORN) +
+//NoFrag             (3 * M802->extraPropDelay);
+//NoFrag       }
+//NoFrag    }
+//NoFrag    /* This is the last fragment. */
+//NoFrag    else
+//NoFrag    {
+//NoFrag 
+//NoFrag       hdr.duration =
+//NoFrag          (M802_11_SHORT_CTRL_FRAME_SIZE * SECOND) /
+//NoFrag          (M802->bandwidth) + M802_11_SIFS + 
+//NoFrag          SYNCHRONIZATION_TIME +
+//NoFrag          M802_11_DELAY_UNTIL_SIGNAL_AIRBORN + 
+//NoFrag          M802->extraPropDelay;
+//NoFrag    }
+//NoFrag 
+//NoFrag    GLOMO_MsgPacketAlloc(node, pktToRadio, fragmentSize);
+//NoFrag 
+//NoFrag    memcpy(pktToRadio->packet,
+//NoFrag           (topPacket->packet + (M802_11_FRAG_THRESH * M802->currentFrag)),
+//NoFrag           fragmentSize);
+//NoFrag 
+//NoFrag    GLOMO_MsgAddHeader(node, pktToRadio, sizeof(M802_11FrameHdr) );
+//NoFrag 
+//NoFrag    macPktLen = fragmentSize+sizeof(M802_11FrameHdr);
+//NoFrag    hdr.fragId = M802->currentFrag+1;
+//NoFrag    M802->currentFrag++;
+//NoFrag 
+//NoFrag 
+//NoFrag    memcpy(pktToRadio->packet, &(hdr), sizeof(M802_11FrameHdr) );
+//NoFrag 
+//NoFrag    Mac802_11SetState(node, M802, M802_11_X_FRAGMENT);
+//NoFrag    
+//NoFrag    StartTransmittingPacket(node, M802, pktToRadio, M802_11_SIFS);
+}
+
+
+/*
+ * NAME:        Mac802_11CorrectSequenceNumber.
+ *
+ * PURPOSE:     See if ACK contains the right sequence number.
+ *
+ * PARAMETERS:  node, node that is checking the sequence number being ACKed
+ *              is correct.
+ *              sourceAddr, the node that sent the ACK.
+ *              seqNo, the sequence number of frame that is being ACKed.
+ *
+ * RETURN:      TRUE if sequence number being ACKed is correct, FALSE otherwise.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+BOOL Mac802_11CorrectSeqenceNumber(
+   GlomoNode *node,
+   GlomoMac802_11 *M802,
+   NODE_ADDR sourceAddr,
+   int seqNo)
+{
+   SeqNoEntry *entry;
+
+   entry = Mac802_11GetSeqNo(node, M802, sourceAddr);
+   assert(entry);
+
+   return (entry->fromSeqNo == seqNo);
+}
+
+
+/*
+ * NAME:        Mac802_11TransmitCTSFrame.
+ *
+ * PURPOSE:     See if ACK contains the right sequence number.
+ *
+ * PARAMETERS:  node, node that is going to transmit CTS frame.
+ *              Rts, RTS frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11TransmitCTSFrame(GlomoNode *node, GlomoMac802_11 *M802,
+                               Message *Rts)
+{
+   NODE_ADDR destAddr;
+   Message *pktToRadio;
+   int macPktLen;
+   M802_11LongControlFrame *hdr = (M802_11LongControlFrame *)Rts->packet;
+   M802_11ShortControlFrame newHdr;
+
+   destAddr = hdr->sourceAddr;
+
+   pktToRadio = GLOMO_MsgAlloc(node, 0, 0, 0);
+   
+   GLOMO_MsgPacketAlloc(node, pktToRadio, M802_11_SHORT_CTRL_FRAME_SIZE);
+
+   newHdr.frameType = M802_11_CTS;
+   newHdr.destAddr = destAddr;
+
+   // Subtract RTS transmit time.
+              
+   newHdr.duration = hdr->duration - M802->extraPropDelay -
+      M802_11_SIFS - M802->ctsOrAckTransmissionDuration;
+      
+   // Subtract off CTS transmit time from the total duration
+   // to get the CTS timeout time. 
+   
+   M802->noResponseTimeoutDuration =  newHdr.duration
+      - M802->extraPropDelay - M802_11_SIFS
+      - M802->ctsOrAckTransmissionDuration
+      - M802->extraPropDelay 
+      + M802_11_SLOT_TIME + EPSILON_DELAY;
+
+   macPktLen = M802_11_SHORT_CTRL_FRAME_SIZE;
+   memcpy(pktToRadio->packet, &(newHdr), M802_11_SHORT_CTRL_FRAME_SIZE );
+
+   Mac802_11SetState(node, M802, M802_11_X_CTS);
+   
+   StartTransmittingPacket(node, M802, pktToRadio, M802_11_SIFS);
+}
+
+
+/*
+ * NAME:        Mac802_11TransmitFragAck.
+ *
+ * PURPOSE:     Transmit ACKs for fragments.
+ *
+ * PARAMETERS:  node, node that is transmitting the ACK for the fragment.
+ *              hdr, header of frame being acknowledged.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11TransmitFragAck(
+    GlomoNode *node, GlomoMac802_11 *M802, M802_11FrameHdr hdr)
+{
+   NODE_ADDR destAddr;
+   Message *pktToRadio;
+   int macPktLen;
+   M802_11ShortControlFrame newHdr;
+
+   assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+   
+//NoFrag    destAddr = hdr.sourceAddr;
+//NoFrag    
+//NoFrag 
+//NoFrag 
+//NoFrag    pktToRadio = GLOMO_MsgAlloc(node, 0, 0, 0);
+//NoFrag    GLOMO_MsgPacketAlloc(node, pktToRadio, M802_11_SHORT_CTRL_FRAME_SIZE);
+//NoFrag 
+//NoFrag    newHdr.frameType = M802_11_ACK;
+//NoFrag    newHdr.destAddr = destAddr;
+//NoFrag 
+//NoFrag    newHdr.duration = hdr.duration -
+//NoFrag       ((M802_11_SHORT_CTRL_FRAME_SIZE * SECOND) /
+//NoFrag       M802->bandwidth) - M802_11_SIFS - 
+//NoFrag       SYNCHRONIZATION_TIME -
+//NoFrag       M802_11_DELAY_UNTIL_SIGNAL_AIRBORN - 
+//NoFrag       M802->extraPropDelay;
+//NoFrag 
+//NoFrag    if (newHdr.duration <= 0)
+//NoFrag    {
+//NoFrag       /* Last fragment to ack, so no need to wait after tx. */
+//NoFrag       M802->noResponseTimeoutDuration = 0;
+//NoFrag    }
+//NoFrag    else
+//NoFrag    {
+//NoFrag       /* Only want waiting period for data.  Don't want to include ACK. */
+//NoFrag       M802->noResponseTimeoutDuration = newHdr.duration -
+//NoFrag          ((M802_11_SHORT_CTRL_FRAME_SIZE * SECOND) /
+//NoFrag          M802->bandwidth) - M802_11_SIFS;
+//NoFrag    }
+//NoFrag 
+//NoFrag 
+//NoFrag    if (M802->noResponseTimeoutDuration < 0)
+//NoFrag    {
+//NoFrag       clocktype txDelay;
+//NoFrag 
+//NoFrag       txDelay = ((clocktype)(M802_11_SHORT_CTRL_FRAME_SIZE * SECOND) / 
+//NoFrag            M802->bandwidth);
+//NoFrag 
+//NoFrag       printf("802.11: Node %ld duration should not be negative (%ld)!\n", 
+//NoFrag              node->nodeAddr, M802->noResponseTimeoutDuration);
+//NoFrag 
+//NoFrag       ctoa(txDelay, clockStr);
+//NoFrag       printf("    tx delay is %s\n", clockStr);
+//NoFrag       printf("    hdr.duration is %ld\n", hdr.duration);
+//NoFrag       printf("    newHdr.duration is %ld\n", newHdr.duration);
+//NoFrag       printf("    source is %ld\n", hdr.sourceAddr);
+//NoFrag       exit(0);
+//NoFrag    }
+//NoFrag 
+//NoFrag    macPktLen = M802_11_SHORT_CTRL_FRAME_SIZE;
+//NoFrag 
+//NoFrag    memcpy(pktToRadio->packet, &(newHdr), M802_11_SHORT_CTRL_FRAME_SIZE);
+//NoFrag 
+//NoFrag    Mac802_11SetState(node, M802, M802_11_X_FRAGACK);
+//NoFrag    
+//NoFrag    StartTransmittingPacket(node, M802, pktToRadio, M802_11_SIFS);
+}
+
+
+/*
+ * NAME:        Mac802_11HandlePromiscuousMode.
+ *
+ * PURPOSE:     Sends remote packet to network layer.
+ *
+ * PARAMETERS:  node, node sending remote packet to network layer.
+ *              frame, frame containing network packet.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+static 
+void Mac802_11HandlePromiscuousMode(GlomoNode *node, GlomoMac802_11 *M802,
+                                    Message *frame)
+{
+   GLOMO_MsgRemoveHeader(node, frame, sizeof(M802_11FrameHdr));
+   NetworkIpSneakPeekAtMacPacket(node, frame);
+   GLOMO_MsgAddHeader(node, frame, sizeof(M802_11FrameHdr));
+}
+
+
+
+
+/*
+ * NAME:        Mac802_11ProcessAck.
+ *
+ * PURPOSE:     Process local ACKs.
+ *
+ * PARAMETERS:  node, node processing local ACKs.
+ *              Ack, ACK frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11ProcessAck(GlomoNode *node,
+                         GlomoMac802_11 *M802, 
+                         Message *Ack)
+{
+   NODE_ADDR sourceAddr;
+   NODE_ADDR NotUsed;
+   Message *tmpPktPtr;
+   M802_11ShortControlFrame *hdr = (M802_11ShortControlFrame *)Ack->packet;
+
+
+   /* Reset retry counts since frame is acknowledged. */
+   M802->SSRC = 0;
+   M802->SLRC = 0;
+   sourceAddr = M802->waitingForAckOrCtsFromAddress;
+   M802->waitingForAckOrCtsFromAddress = INVALID_ADDRESS;
+   
+
+   NetworkIpOutputQueueTopPacketForAPriority(
+      node, M802->myGlomoMac->interfaceIndex, M802->currentPriority, 
+      &tmpPktPtr, &NotUsed);
+
+   if (tmpPktPtr == NULL)
+   {
+      assert(FALSE); abort();
+      Mac802_11CheckForOutgoingPacket(node, M802);
+      return;
+   }
+
+   switch(M802->state) {
+   
+   case M802_11_S_WFACK:
+   {
+      Message *pktFromNetwork;
+      SeqNoEntry *entry;
+
+      /* Remove frame from queue since already acknowledged. */
+      
+      NetworkIpOutputQueueDequeuePacketForAPriority(
+         node, M802->myGlomoMac->interfaceIndex, M802->currentPriority, 
+         &pktFromNetwork, &NotUsed);
+      
+      M802->currentPriority = INVALID_PRIORITY;
+
+      GLOMO_MsgFree(node, pktFromNetwork);
+      M802->pktsSentUnicast++;
+
+      /* Update exchange sequence number. */
+      entry = Mac802_11GetSeqNo(node, M802, sourceAddr);
+      assert(entry);
+      entry->toSeqNo += 1;
+
+      Mac802_11DecreaseCW(node, M802);
+      Mac802_11CheckForOutgoingPacket(node, M802);
+
+      break;
+   }
+   case M802_11_S_WFFRAGACK:
+   {
+      SeqNoEntry *entry;
+
+      /* Update exchange sequence number. */
+      entry = Mac802_11GetSeqNo(node, M802, sourceAddr);
+      assert(entry);
+      entry->toSeqNo += 1;
+
+      if ((M802->currentFrag * M802_11_FRAG_THRESH) >=
+          tmpPktPtr->packetSize)
+      {
+         Message *pktFromNetwork;
+
+         /* Remove frame from queue since already acknowledged. */
+         
+         NetworkIpOutputQueueDequeuePacketForAPriority(
+            node, M802->myGlomoMac->interfaceIndex, 
+            M802->currentPriority, 
+            &pktFromNetwork, &NotUsed);
+         
+         M802->currentPriority = INVALID_PRIORITY;
+
+         GLOMO_MsgFree(node, pktFromNetwork);
+
+         M802->pktsSentUnicast++;
+
+         Mac802_11DecreaseCW(node, M802);
+
+         Mac802_11CheckForOutgoingPacket(node, M802);
+
+      }
+      else
+      {
+         Mac802_11TransmitNextFrag(node, M802);
+      }
+
+      break;
+   }
+
+   default:
+      Mac802_11CheckForOutgoingPacket(node, M802);
+       
+   }/*switch*/
+}
+
+
+/*
+ * NAME:        Mac802_11TransmitAck
+ *
+ * PURPOSE:     Transmit ACK for frames.
+ *
+ * PARAMETERS:  node, node transmitting the ACK.
+ *              frame, frame being acknowledged.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11TransmitAck(GlomoNode *node, GlomoMac802_11 *M802, Message *frame)
+{
+   NODE_ADDR destAddr;
+   Message *pktToRadio;
+   int macPktLen;
+   M802_11FrameHdr *hdr;
+   M802_11ShortControlFrame newHdr;
+
+   hdr = (M802_11FrameHdr *)frame->packet;
+
+   destAddr = hdr->sourceAddr;
+
+   pktToRadio = GLOMO_MsgAlloc(node, 0, 0, 0);
+                               
+   GLOMO_MsgPacketAlloc(node, pktToRadio, M802_11_SHORT_CTRL_FRAME_SIZE);
+
+   newHdr.frameType = M802_11_ACK;
+   newHdr.destAddr = destAddr;
+
+   newHdr.duration = 0;
+
+   memcpy(pktToRadio->packet, &(newHdr), M802_11_SHORT_CTRL_FRAME_SIZE);
+
+   Mac802_11SetState(node, M802, M802_11_X_ACK);
+   StartTransmittingPacket(node, M802, pktToRadio, M802_11_SIFS);
+}
+
+
+/*
+ * NAME:        Mac802_11ProcessFrame.
+ *
+ * PURPOSE:     Process incoming frame.
+ *
+ * PARAMETERS:  node, node processing incoming frame.
+ *              frame, frame being processed.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11ProcessFrame(
+    GlomoNode *node, GlomoMac802_11 *M802, Message *frame)
+{
+   M802_11FrameHdr* hdr = (M802_11FrameHdr *)frame->packet;
+   NODE_ADDR sourceAddr = hdr->sourceAddr;
+
+   if ((M802->state != M802_11_S_WFDATA) &&
+       (Mac802_11IsWaitingForResponseState(M802->state)))
+   {
+      // Waiting for Another Packet Type Ignore This one.
+      
+      
+      
+      GLOMO_MsgFree(node, frame);
+   } else {
+      if (hdr->destAddr == ANY_DEST)
+      {
+         GLOMO_MsgRemoveHeader(node, frame, sizeof(M802_11FrameHdr));
+         NetworkIpReceivePacketFromMacLayer(node, frame, sourceAddr);
+         M802->pktsGotBroadcast++;
+         Mac802_11CheckForOutgoingPacket(node, M802);
+      }
+      else
+      {
+         Mac802_11CancelTimer(node, M802);
+         Mac802_11TransmitAck(node, M802, frame);
+   
+         if (Mac802_11CorrectSeqenceNumber(node, M802, hdr->sourceAddr,
+                                           hdr->seqNo))
+         {
+            SeqNoEntry* entry;
+            
+            GLOMO_MsgRemoveHeader(node, frame, sizeof(M802_11FrameHdr));
+   
+            NetworkIpReceivePacketFromMacLayer(node, frame, sourceAddr);
+   
+            /* Upate sequence number. */
+            entry = Mac802_11GetSeqNo(node, M802, sourceAddr);
+            assert(entry);
+            entry->fromSeqNo += 1;
+   
+            M802->pktsGotUnicast++;
+         } else {
+            // Wrong sequence number, Drop.
+            
+            GLOMO_MsgFree(node, frame);
+         }//if//
+      }//if//
+   }//if//
+}
+
+
+/*
+ * NAME:        Mac802_11ProcessFrag.
+ *
+ * PURPOSE:     Process local fragmented data frames.
+ *
+ * PARAMETERS:  node, node processing local fragmented data frames.
+ *              frame, local fragmented frames.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11ProcessFrag(GlomoNode *node, GlomoMac802_11 *M802, Message *frame)
+{
+   M802_11FrameHdr hdr;
+
+   Message *pktToNetwork;
+
+   
+   assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+   
+//NoFrag    M802->IsInExtendedIfsMode = FALSE;
+//NoFrag    
+//NoFrag    memcpy(&(hdr), frame->packet, sizeof(M802_11FrameHdr));
+//NoFrag 
+//NoFrag    GLOMO_MsgRemoveHeader(node, frame, sizeof(M802_11FrameHdr));
+//NoFrag 
+//NoFrag 
+//NoFrag    if (Mac802_11CorrectSeqenceNumber(node, M802, 
+//NoFrag                                      hdr.sourceAddr,
+//NoFrag                                      hdr.seqNo))
+//NoFrag    {
+//NoFrag       if ((hdr.fragId*M802_11_FRAG_THRESH) >= frame->packetSize)
+//NoFrag       {
+//NoFrag          NODE_ADDR sourceAddr;
+//NoFrag          SeqNoEntry *entry;
+//NoFrag          char *where = (M802->PartialFrame) +
+//NoFrag                        (hdr.fragId * M802_11_FRAG_THRESH);
+//NoFrag 
+//NoFrag          sourceAddr = hdr.sourceAddr;
+//NoFrag          memcpy(where,
+//NoFrag                 frame->packet,
+//NoFrag                 (frame->packetSize - ((hdr.fragId-1)*
+//NoFrag                 M802_11_FRAG_THRESH)));
+//NoFrag 
+//NoFrag          pktToNetwork = GLOMO_MsgAlloc(node, 0, 0, 0);
+//NoFrag 
+//NoFrag          GLOMO_MsgPacketAlloc(node, pktToNetwork, frame->packetSize);
+//NoFrag 
+//NoFrag          memcpy(pktToNetwork->packet,
+//NoFrag                 M802->PartialFrame,
+//NoFrag                 frame->packetSize);
+//NoFrag 
+//NoFrag          NetworkIpReceivePacketFromMacLayer(node, pktToNetwork, sourceAddr);
+//NoFrag 
+//NoFrag          M802->pktsGotUnicast++;
+//NoFrag 
+//NoFrag 
+//NoFrag          entry = Mac802_11GetSeqNo(node, M802, hdr.sourceAddr);
+//NoFrag          assert(entry);
+//NoFrag          entry->fromSeqNo += 1;
+//NoFrag 
+//NoFrag          Mac802_11TransmitAck(node, M802, frame);
+//NoFrag       }
+//NoFrag       else
+//NoFrag       {
+//NoFrag          SeqNoEntry *entry;
+//NoFrag 
+//NoFrag 
+//NoFrag          /* Update sequence number. */
+//NoFrag          entry = Mac802_11GetSeqNo(node, M802, hdr.sourceAddr);
+//NoFrag          assert(entry);
+//NoFrag          entry->fromSeqNo += 1;
+//NoFrag 
+//NoFrag          if (hdr.fragId == 1)
+//NoFrag          {
+//NoFrag             memcpy(M802->PartialFrame,
+//NoFrag                    frame->packet,
+//NoFrag                    M802_11_FRAG_THRESH);
+//NoFrag          }
+//NoFrag          else
+//NoFrag          {
+//NoFrag             char *where = (M802->PartialFrame) +
+//NoFrag                           (hdr.fragId * M802_11_FRAG_THRESH);
+//NoFrag 
+//NoFrag             memcpy(where,
+//NoFrag                    frame->packet,
+//NoFrag                    M802_11_FRAG_THRESH);
+//NoFrag          }
+//NoFrag 
+//NoFrag          Mac802_11TransmitFragAck(node, M802, hdr);
+//NoFrag       }
+//NoFrag    }
+//NoFrag    else
+//NoFrag    {
+//NoFrag 
+//NoFrag       Mac802_11TransmitFragAck(node, M802, hdr);
+//NoFrag    }
+}
+
+/*
+ * NAME:        Mac802_11ContinueBackoff.
+ *
+ * PURPOSE:     Continues decreasing backoff counter in collision avoidance
+ *              (CA) process.
+ *
+ * PARAMETERS:  node, node that is continuing its backoff.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11ContinueBackoff(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   M802->lastBOTimeStamp = simclock();
+
+   if (M802->BO < 0)
+   {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(M802->BO, clockStr);
+      printf("Node %ld continuing backoff to a negative timer: %s\n",
+             node->nodeAddr, clockStr);
+      exit(0);
+   }
+
+}
+
+
+
+
+/*
+ * NAME:        Mac802_11TransmitRTSFrame.
+ *
+ * PURPOSE:     Send RTS to reserve channel for data frame.
+ *
+ * PARAMETERS:  node, node that wants to reserve channel for data frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11TransmitRTSFrame(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   M802_11LongControlFrame* hdr;
+   Message *pktToRadio;
+   Message *tmpPktPtr;
+   NODE_ADDR destAddr;
+
+   NetworkIpOutputQueueTopPacketForAPriority(
+      node, M802->myGlomoMac->interfaceIndex, M802->currentPriority,
+      &tmpPktPtr, &destAddr);
+
+   if  (tmpPktPtr ==NULL)
+   {
+      assert(FALSE); abort();
+      Mac802_11CheckForOutgoingPacket(node, M802);
+      return;
+   }
+
+   pktToRadio = GLOMO_MsgAlloc(node, 0, 0, 0);
+   
+   GLOMO_MsgPacketAlloc(node, pktToRadio, sizeof(M802_11LongControlFrame));
+   hdr = (M802_11LongControlFrame*)pktToRadio->packet;
+
+   hdr->frameType = M802_11_RTS;
+   hdr->sourceAddr = node->nodeAddr,
+   hdr->destAddr = destAddr;
+
+   M802->waitingForAckOrCtsFromAddress = destAddr;
+   
+   if (tmpPktPtr->packetSize <= M802_11_FRAG_THRESH)
+   {
+      clocktype packetTransmissionDuration =
+         CalcFragmentTransmissionDuration(
+            M802->bandwidth, tmpPktPtr->packetSize);
+   
+      hdr->duration =
+         M802->extraPropDelay + M802_11_SIFS + 
+         M802->ctsOrAckTransmissionDuration + 
+         M802->extraPropDelay + M802_11_SIFS + 
+         packetTransmissionDuration + 
+         M802->extraPropDelay + M802_11_SIFS + 
+         M802->ctsOrAckTransmissionDuration +
+         M802->extraPropDelay;
+         
+   } else {
+      assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+      
+//NoFrag      hdr.duration = ((M802_11_SHORT_CTRL_FRAME_SIZE +
+//NoFrag          M802_11_FRAG_THRESH + sizeof(M802_11FrameHdr) +
+//NoFrag          M802_11_SHORT_CTRL_FRAME_SIZE ) * SECOND) /
+//NoFrag          (M802->bandwidth) + (3 * M802_11_SIFS) +
+//NoFrag          (3 * SYNCHRONIZATION_TIME) +
+//NoFrag          (3 * M802_11_DELAY_UNTIL_SIGNAL_AIRBORN) + 
+//NoFrag          (3 * M802->extraPropDelay);
+   }//if//
+
+   Mac802_11SetState(node, M802, M802_11_X_RTS);
+   StartTransmittingPacket(
+      node, M802, pktToRadio, M802_11_DELAY_UNTIL_SIGNAL_AIRBORN);
+}
+
+
+/*
+ * NAME:        Mac802_11TransmitDataFrame.
+ *
+ * PURPOSE:     Transmit the data frame since channel is reserved.
+ *
+ * PARAMETERS:  node, node transmitting the data frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11TransmitDataFrame(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   NODE_ADDR destAddr;
+   Message* topPacket;
+   
+   NetworkIpOutputQueueTopPacketForAPriority(
+      node, M802->myGlomoMac->interfaceIndex, M802->currentPriority,
+      &topPacket, &destAddr);
+   assert(topPacket != NULL);
+   
+   if (destAddr == ANY_DEST) {
+      NODE_ADDR NotUsed;
+      Message* dequeuedPacket;
+      M802_11FrameHdr* hdr;
+   
+      NetworkIpOutputQueueDequeuePacketForAPriority(
+         node, M802->myGlomoMac->interfaceIndex, M802->currentPriority,
+         &dequeuedPacket, &NotUsed);
+   
+      assert(topPacket == dequeuedPacket);
+      
+      M802->currentPriority = INVALID_PRIORITY;
+      M802->pktsSentBroadcast++;
+      
+      GLOMO_MsgAddHeader(node, dequeuedPacket, sizeof(M802_11FrameHdr) );
+      
+      hdr = (M802_11FrameHdr*)dequeuedPacket->packet; 
+      hdr->frameType = M802_11_DATA;
+      hdr->sourceAddr = node->nodeAddr;
+      hdr->destAddr = destAddr;
+      hdr->duration = 0;
+      
+      Mac802_11SetState(node, M802, M802_11_X_BROADCAST);
+      
+      StartTransmittingPacket(
+         node, M802, dequeuedPacket, M802_11_DELAY_UNTIL_SIGNAL_AIRBORN);
+   } else {
+      SeqNoEntry *entry;
+      M802_11FrameHdr hdr;
+      Message* pktToRadio = GLOMO_MsgAlloc(node, 0, 0, 0);
+      
+      hdr.frameType = M802_11_DATA;
+      hdr.sourceAddr = node->nodeAddr;
+      hdr.destAddr = destAddr;
+      M802->waitingForAckOrCtsFromAddress = destAddr;
+   
+      entry = Mac802_11GetSeqNo(node, M802, destAddr);
+      assert(entry);
+      hdr.seqNo = entry->toSeqNo;
+      hdr.duration = 
+         M802->extraPropDelay + M802_11_SIFS + 
+         M802->ctsOrAckTransmissionDuration +
+         M802->extraPropDelay;
+
+      if (topPacket->packetSize > M802_11_FRAG_THRESH) {
+         assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+      
+      //int macPktLen;
+      //int i, remainder;
+      
+//NoFrag       hdr.frameType = M802_11_FRAGMENT;
+//NoFrag       M802->currentFrag = 1;
+//NoFrag       remainder = packet->packetSize - M802_11_FRAG_THRESH;
+//NoFrag 
+//NoFrag       if (remainder > M802_11_FRAG_THRESH)
+//NoFrag       {
+//NoFrag 
+//NoFrag          hdr.duration =
+//NoFrag             (( M802_11_SHORT_CTRL_FRAME_SIZE +
+//NoFrag             M802_11_FRAG_THRESH + sizeof(M802_11FrameHdr) +
+//NoFrag             M802_11_SHORT_CTRL_FRAME_SIZE ) * SECOND) /
+//NoFrag             (M802->bandwidth) +
+//NoFrag             (3 * SYNCHRONIZATION_TIME) +
+//NoFrag             (3 * M802_11_SIFS) + 
+//NoFrag             (3 * M802_11_DELAY_UNTIL_SIGNAL_AIRBORN) +
+//NoFrag             (3 * M802->extraPropDelay);
+//NoFrag       }
+//NoFrag       else
+//NoFrag       {
+//NoFrag 
+//NoFrag          /* End of next FRAG/ACK period is last FRAG/ACK. */
+//NoFrag          hdr.duration =
+//NoFrag             (( M802_11_SHORT_CTRL_FRAME_SIZE +
+//NoFrag             remainder + sizeof(M802_11FrameHdr) +
+//NoFrag             M802_11_SHORT_CTRL_FRAME_SIZE) * SECOND) /
+//NoFrag             (M802->bandwidth) +
+//NoFrag             (3 * SYNCHRONIZATION_TIME) +
+//NoFrag             (3 * M802_11_SIFS) + 
+//NoFrag             (3 * M802_11_DELAY_UNTIL_SIGNAL_AIRBORN) +
+//NoFrag             (3 * M802->extraPropDelay);
+//NoFrag       }
+//NoFrag 
+//NoFrag       GLOMO_MsgPacketAlloc(node, pktToRadio, M802_11_FRAG_THRESH);
+//NoFrag 
+//NoFrag       macPktLen = M802_11_FRAG_THRESH;
+//NoFrag       hdr.fragId = 1;
+//NoFrag 
+//NoFrag 
+//NoFrag       memcpy(pktToRadio->packet, packet->packet, macPktLen);
+//NoFrag       GLOMO_MsgAddHeader(node, pktToRadio, sizeof(M802_11FrameHdr) );
+//NoFrag 
+//NoFrag       memcpy(pktToRadio->packet, &(hdr), sizeof(M802_11FrameHdr));
+//NoFrag 
+//NoFrag       Mac802_11SetState(node, M802, M802_11_X_FRAGMENT);
+//NoFrag       
+//NoFrag       if ((packet->packetSize > M802_11_RTS_THRESH)
+//NoFrag           && (destAddr != ANY_DEST))
+//NoFrag       {
+//NoFrag          /*
+//NoFrag           * Since using RTS-CTS, data packets have to wait
+//NoFrag           * an additional SIFS.
+//NoFrag           */
+//NoFrag          
+//NoFrag          StartTransmittingPacket(node, M802, pktToRadio, M802_11_SIFS);
+//NoFrag       }
+//NoFrag       else
+//NoFrag       {
+//NoFrag          /*
+//NoFrag           * Not using RTS-CTS, so don't need to wait for SIFS since already
+//NoFrag           * waited for DIFS or BO.
+//NoFrag           */
+//NoFrag          
+//NoFrag          StartTransmittingPacket(
+//NoFrag             node, M802, pktToRadio, M802_11_DELAY_UNTIL_SIGNAL_AIRBORN);
+//NoFrag       }
+
+      }
+      else
+      {
+         hdr.fragId = 0;
+         GLOMO_MsgPacketAlloc(node, pktToRadio, topPacket->packetSize);
+         memcpy(pktToRadio->packet, topPacket->packet, topPacket->packetSize);
+         GLOMO_MsgAddHeader(node, pktToRadio, sizeof(M802_11FrameHdr) );
+         memcpy(pktToRadio->packet, &hdr, sizeof(M802_11FrameHdr));
+         
+         Mac802_11SetState(node, M802, M802_11_X_UNICAST);
+         
+   
+         if (topPacket->packetSize > M802_11_RTS_THRESH) {
+            //
+            // Since using RTS-CTS, data packets have to wait
+            // an additional SIFS.
+            //
+            
+            StartTransmittingPacket(node, M802, pktToRadio, M802_11_SIFS);
+         }
+         else
+         {
+            //
+            // Not using RTS-CTS, so don't need to wait for SIFS since already
+            // waited for DIFS or BO.
+            //
+            StartTransmittingPacket(
+               node, M802, pktToRadio, M802_11_DELAY_UNTIL_SIGNAL_AIRBORN);
+         }
+   
+      }
+   }
+}
+
+
+/*
+ * NAME:        Mac802_11TransmitFrame.
+ *
+ * PURPOSE:     In the process of sending a data frame.
+ *
+ * PARAMETERS:  node, node that wants to send a data frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11TransmitFrame(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   Message *tmpPktPtr;
+   Message *pktToRadio;
+   int macPktLen;
+   NODE_ADDR nextHopAddress;
+   NetworkQueueingPriorityType priority;
+
+   assert(RadioStatus(node, M802) == RADIO_IDLE);
+
+   NetworkIpOutputQueueTopPacket(
+      node, M802->myGlomoMac->interfaceIndex,
+      &tmpPktPtr, &nextHopAddress, &priority);
+   
+   if  (tmpPktPtr == NULL)
+   {
+      assert(FALSE); abort();
+      Mac802_11CheckForOutgoingPacket(node, M802);
+      return;
+   }
+
+   M802->currentPriority = priority;
+
+   if ((tmpPktPtr->packetSize > M802_11_RTS_THRESH) && 
+       (nextHopAddress != ANY_DEST))
+   {
+      Mac802_11TransmitRTSFrame(node, M802);
+   }
+   else
+   {
+      Mac802_11TransmitDataFrame(node, M802);
+   }
+}
+
+
+
+
+
+
+
+void TransmissionHasFinished(
+   GlomoNode* node,
+   GlomoMac802_11* M802)
+{
+   switch(M802->state) {
+   case M802_11_X_ACK:
+      Mac802_11AckTransmitted(node, M802);
+      break;
+   
+   case M802_11_X_BROADCAST:
+      Mac802_11CheckForOutgoingPacket(node, M802);
+      break;
+   
+   case M802_11_X_UNICAST:
+      Mac802_11UnicastTransmitted(node, M802);
+      break;
+   
+   case M802_11_X_FRAGMENT:
+      assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+//NoFrag       Mac802_11FragTransmitted(node, M802);
+      break;
+   
+   case M802_11_X_FRAGACK:
+      Mac802_11FragAckTransmitted(node, M802);
+      break;
+   
+   case M802_11_X_RTS:
+      Mac802_11RTSTransmitted(node, M802);
+      break;
+   
+   case M802_11_X_CTS:
+      Mac802_11CTSTransmitted(node, M802);
+      break;
+   
+   default:
+      assert(FALSE); abort();
+      break;
+   }//switch//
+}
+
+
+
+static //inline//
+void CancelSomeTimersBecauseChannelHasBecomeBusy(
+   GlomoNode* node,
+   GlomoMac802_11* M802)
+{
+   switch (M802->state) {
+
+   case M802_11_S_WF_DIFS_OR_EIFS:
+      Mac802_11SetState(node, M802, M802_11_S_IDLE);
+      Mac802_11CancelTimer(node, M802);
+      break;
+
+   case M802_11_S_BO:
+      Mac802_11PauseBackoff(node, M802);
+      Mac802_11SetState(node, M802, M802_11_S_IDLE);
+      Mac802_11CancelTimer(node, M802);
+      break;
+       
+   case M802_11_S_WFNAV:
+      // Timer no longer need timer for NAV (may need to
+      // set the timer if the channel becomes busy again.
+            
+      Mac802_11SetState(node, M802, M802_11_S_IDLE);
+      Mac802_11CancelTimer(node, M802);
+      break;
+   
+   default:
+      // Can't happen or ignore.
+      break;
+   
+   }//switch//
+}//CancelSomeTimersBecauseChannelHasBecomeBusy//
+
+
+
+
+
+static //inline//
+void ExaminePotentialIncomingMessage(
+   GlomoNode* node,
+   GlomoMac802_11* M802,
+   RadioStatusType radioStatus,
+   clocktype receiveDuration,
+   const Message* thePacketIfItGetsThrough)
+{
+   const M802_11ShortControlFrame* hdr = 
+      (M802_11ShortControlFrame*)thePacketIfItGetsThrough->packet;
+
+   
+   assert(radioStatus == RADIO_RECEIVING);
+   
+   M802->IsInExtendedIfsMode = TRUE; 
+   
+   
+   
+   if (M802->state == M802_11_S_NAV_RTS_CHECK_MODE) {
+      // The RTS (Request To Send) is getting a CTS so continue the
+      // NAV wait and cancel the timer that would reset the NAV.
+      
+      Mac802_11SetState(node, M802, M802_11_S_IDLE);
+      Mac802_11CancelTimer(node, M802); 
+   }//if//
+   
+   
+
+}//ExaminePotentialIncomingMessage//      
+
+
+
+
+static //inline//
+void RadioStatusIsNowIdleStartSendTimers(
+   GlomoNode* node,
+   GlomoMac802_11* M802)
+{
+   switch (M802->state) {
+   case M802_11_S_IDLE:
+      if (NetworkIpOutputQueueIsEmpty(
+              node, M802->myGlomoMac->interfaceIndex))
+      {
+         // Nothing to send. Stay Idle.
+      } else {
+         // Start up Sending process again.
+         // Note: uses current Backoff delay.
+         AttemptToGoIntoWaitForDifsOrEifsState(node, M802);
+      }//if//
+      break;
+   
+   
+   // In these states, we don't care about the state of the radio.
+    
+   case M802_11_S_WFCTS:
+   case M802_11_S_WFDATA:
+   case M802_11_S_WFACK:    
+   case M802_11_S_WFFRAGACK:
+   
+      
+      
+   
+      break;
+   
+   // These states can't happen.
+   
+   case M802_11_S_NAV_RTS_CHECK_MODE:   // Currently Disabled.
+   case M802_11_S_WFNAV:
+   case M802_11_S_WF_DIFS_OR_EIFS:
+   case M802_11_S_BO:    
+   default:
+      assert(FALSE); abort();
+      break;
+   }//switch//
+   
+}//RadioStatusIsNowIdleStartSendTimers//
+
+
+
+
+
+
+
+
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------
+//--------------------------------------------------------------------------
+//
+// Inter-Layer Interface Routines
+
+
+
+
+
+//--------------------------------------------------------------------------
+
+// Called when network layer buffers transition from empty.
+    
+
+void Mac802_11NetworkLayerHasPacketToSend(
+   GlomoNode* node, GlomoMac802_11* M802)
+{
+   
+   
+   if (M802->state == M802_11_S_IDLE) {
+      if ((RadioStatus(node, M802) == RADIO_IDLE) &&
+          (!Mac802_11WaitForNAV(node, M802)))
+      {
+         //
+         // Not holding for NAV and radio is idle,
+         // so no backoff.
+         // 
+         assert(M802->BO == 0);
+      } else {
+         // Otherwise set backoff.
+         
+         Mac802_11SetBackoffIfZero(node, M802);
+      }//if//
+      
+      AttemptToGoIntoWaitForDifsOrEifsState(node, M802);
+      
+      
+   }//if//
+   
+}//Mac802_11NetworkLayerHasPacketToSend//
+
+
+//--------------------------------------------------------------------------
+
+
+void Mac802_11ReceivePacketFromRadio(
+   GlomoNode* node, 
+   GlomoMac802_11* M802, 
+   Message* msg)
+{
+   M802_11ShortControlFrame* hdr = (M802_11ShortControlFrame*)msg->packet;
+   
+   M802->IsInExtendedIfsMode = FALSE;
+   
+
+   /*
+   * Since in GloMoSim it's possible to have two events occurring
+   * at the same time, enforce the fact that when a node is
+   * transmitting, a node can't be receiving a frame at the same time.
+   */
+   
+   assert(!Mac802_11IsTransmittingState(M802->state));
+      
+   if (hdr->destAddr == node->nodeAddr)
+   {
+      switch (hdr->frameType) {
+      
+      case M802_11_CTS:
+         assert(M802->state == M802_11_S_WFCTS);
+         Mac802_11CancelTimer(node, M802);
+         
+         // This is not in the standard, but ns-2 does.
+         // Mac802_11DecreaseCW(node, M802);
+         
+         M802->SSRC = 0;
+         Mac802_11TransmitDataFrame(node, M802);
+         GLOMO_MsgFree(node, msg);
+         break;
+      
+      case M802_11_ACK:
+         assert(M802->state == M802_11_S_WFACK);
+         Mac802_11CancelTimer(node, M802);
+         Mac802_11ProcessAck(node, M802, msg);
+         GLOMO_MsgFree(node, msg);
+         break;
+      
+      case M802_11_RTS:
+         if (Mac802_11IsWaitingForResponseState(M802->state)) {
+            
+         } else if ((!Mac802_11WaitForNAV(node, M802)) && 
+                    (RadioStatus(node, M802) == RADIO_IDLE))
+         {
+            // Transmit CTS only if NAV (software carrier sense)
+            // and the radio says the channel is idle.
+            
+            Mac802_11CancelTimer(node, M802);
+            Mac802_11TransmitCTSFrame(node, M802, msg);
+         } else {
+            if (RadioStatus(node, M802) != RADIO_IDLE) {
+               M802->rtsPacketsIgnoredDueToBusyChannel++;
+            } else {
+               assert(Mac802_11WaitForNAV(node, M802));
+               M802->rtsPacketsIgnoredDueToNAV++;
+            }//if//
+         }//if//
+         
+         GLOMO_MsgFree(node, msg);
+         break;
+      
+      case M802_11_DATA:
+         // This is not in the standard, but ns-2 does.
+         // Mac802_11DecreaseCW(node, M802);
+         // This is not in the standard, but ns-2 does.
+         // M802->SSRC = 0;
+         
+         Mac802_11ProcessFrame(node, M802, msg);
+         break;
+      
+      case M802_11_FRAGMENT:
+         assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+         Mac802_11ProcessFrag(node, M802, msg);
+         GLOMO_MsgFree(node, msg);
+         break;
+      
+      default:
+         printf("MAC_802_11: Unknown frame type %d\n",
+                hdr->frameType);
+         assert(FALSE); abort();
+      }/*switch*/
+   }
+   else if (hdr->destAddr == ANY_DEST)
+   {
+      switch (hdr->frameType) {
+      case M802_11_DATA:
+         Mac802_11ProcessFrame(node, M802, msg);
+         break;
+      case M802_11_FRAGMENT:
+         assert(FALSE); abort();  // Fragmentation Needs to be rewritten. (Jay)
+         Mac802_11ProcessFrag(node, M802, msg);
+         GLOMO_MsgFree(node, msg);
+         break;
+      default:
+         printf("MAC_802_11: Unknown frame type %d\n",
+                hdr->frameType);
+         assert(FALSE); abort();
+      }/*switch*/
+   }
+   else /* Does not belong to node */
+   {
+      
+      
+      Mac802_11ProcessNotMyFrame(node, M802, hdr->duration, 
+         (hdr->frameType==M802_11_RTS));
+
+      if ((M802->myGlomoMac->promiscuousMode == TRUE) &&
+          ((hdr->frameType == M802_11_FRAGMENT) ||
+          (hdr->frameType == M802_11_DATA)))
+      {
+         Mac802_11HandlePromiscuousMode(node, M802, msg);
+      }
+
+      GLOMO_MsgFree(node,msg);
+   }//if//
+   
+   if ((M802->state == M802_11_S_IDLE) &&
+      (RadioStatus(node, M802) == RADIO_IDLE))
+   {
+      RadioStatusIsNowIdleStartSendTimers(node, M802);
+   }//if//
+   
+   
+   
+}//Mac802_11ReceivePacketFromRadio//
+
+
+
+
+
+                         
+void Mac802_11ReceiveRadioStatusChangeNotification(
+   GlomoNode* node,
+   GlomoMac802_11* M802,
+   RadioStatusType oldRadioStatus,
+   RadioStatusType newRadioStatus,
+   clocktype receiveDuration,
+   const Message* potentialIncomingPacket)
+{
+   
+   
+   switch (oldRadioStatus) {
+   case RADIO_IDLE: 
+      switch (newRadioStatus) {
+      case RADIO_SENSING:
+         CancelSomeTimersBecauseChannelHasBecomeBusy(node, M802);
+         break;
+         
+      case RADIO_RECEIVING:
+         CancelSomeTimersBecauseChannelHasBecomeBusy(node, M802);
+         ExaminePotentialIncomingMessage(node, M802, newRadioStatus, 
+            receiveDuration, potentialIncomingPacket);
+         break;
+         
+      case RADIO_TRANSMITTING:
+         break;
+      default:
+         assert(FALSE); abort();
+         break;
+      }//switch//
+      
+      break;
+   
+   case RADIO_SENSING: 
+      switch (newRadioStatus) {
+      case RADIO_IDLE:
+         RadioStatusIsNowIdleStartSendTimers(node, M802);
+         break;
+      case RADIO_RECEIVING:
+         ExaminePotentialIncomingMessage(node, M802, newRadioStatus, 
+            receiveDuration, potentialIncomingPacket);
+         break;
+      case RADIO_TRANSMITTING:
+         // 802.11 will transmit ACKs and CTS even when sensing. 
+         break;
+      default:
+         assert(FALSE); abort();
+         break;
+      }//switch//
+      
+      break;
+   
+   case RADIO_RECEIVING: {
+      
+      
+      switch (newRadioStatus) {
+      case RADIO_IDLE:
+         RadioStatusIsNowIdleStartSendTimers(node, M802);
+         break;
+      
+      case RADIO_SENSING:
+         // Receive was canceled and packet dropped.
+         
+         
+              
+         
+         break;
+      
+      case RADIO_RECEIVING:
+         // "Captured" stronger packet.
+         
+         ExaminePotentialIncomingMessage(node, M802, newRadioStatus, 
+            receiveDuration, potentialIncomingPacket);
+         break;
+      
+      default:
+         assert(FALSE); abort();
+         break;
+      }//switch//
+      
+      break;
+   }
+   case RADIO_TRANSMITTING: 
+      switch (newRadioStatus) {
+      case RADIO_IDLE:
+      case RADIO_SENSING:
+      case RADIO_RECEIVING:
+         TransmissionHasFinished(node, M802);
+         break;
+      default:
+         assert(FALSE); abort();
+         break;
+      }//switch//
+   
+      break;
+   
+   default:
+      assert(FALSE); abort();
+      break;
+   }//switch//
+   
+   
+   
+}//Mac802_11ReceiveRadioStatusChangeNotification//   
+
+
+
+//--------------------------------------------------------------------------
+
+
+   
+/*
+ * NAME:        Mac802_11HandleTimeout.
+ *
+ * PURPOSE:     Process the different timers in 802.11 that timed out.
+ *
+ * PARAMETERS:  node, node that timer expired at.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static 
+void Mac802_11HandleTimeout(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   
+   
+   switch (M802->state) {
+   
+   case M802_11_S_WF_DIFS_OR_EIFS:
+      if (M802->BO == 0) {
+         Mac802_11TransmitFrame(node, M802);
+      } else {
+         Mac802_11ContinueBackoff(node, M802);
+         Mac802_11SetState(node, M802, M802_11_S_BO);
+         Mac802_11StartTimer(node, M802, M802->BO);
+      }//if//
+      break;
+
+   case M802_11_S_BO:
+      assert((M802->lastBOTimeStamp + M802->BO) == simclock());
+      M802->BO = 0;
+      Mac802_11TransmitFrame(node, M802);
+      break;
+
+   case M802_11_S_WFACK:
+      M802->retxDueToAck++;
+      Mac802_11Retransmit(node, M802);
+      break;
+
+   case M802_11_S_NAV_RTS_CHECK_MODE:
+   case M802_11_S_WFNAV:
+      M802->NAV = 0;
+      if (!NetworkIpOutputQueueIsEmpty(
+             node, M802->myGlomoMac->interfaceIndex))
+      {
+         AttemptToGoIntoWaitForDifsOrEifsState(node, M802);
+      }
+      else
+      {
+         assert(M802->BO == 0);
+         Mac802_11SetState(node, M802, M802_11_S_IDLE);
+      }
+
+      break;
+
+   case M802_11_S_WFCTS:
+      M802->retxDueToCts++;
+      Mac802_11Retransmit(node, M802);
+      break;
+
+   case M802_11_S_WFDATA:
+      Mac802_11CheckForOutgoingPacket(node, M802);
+      break;
+
+   case M802_11_S_WFFRAGACK:
+      M802->retxDueToFragAck++;
+      Mac802_11RetransmitFrag(node, M802);
+      break;
+   default:
+      printf("MAC_802_11: Node %u got unknown state type %d",
+             node->nodeAddr, M802->state);
+
+      assert(FALSE);  abort();
+   }
+  
+   
+   
+   
+}//Mac802_11HandleTimeout//
+
+
+
+
+/*
+ * NAME:        Mac802_11Layer.
+ *
+ * PURPOSE:     Handles all messages sent to 802.11.
+ *
+ * PARAMETERS:  node, node handling the incoming messages.
+ *              msgHdr, message for node to interpret.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void Mac802_11Layer(GlomoNode *node, int interfaceIndex, Message *msg)
+{
+   GlomoMac802_11* M802 = 
+      (GlomoMac802_11*)node->macData[interfaceIndex]->macVar;
+   int timerSequenceNumber = *(int*)(msg->info);
+
+   assert(msg->eventType == MSG_MAC_TimerExpired);
+   assert(timerSequenceNumber <= M802->timerSequenceNumber);
+   
+   if (timerSequenceNumber == M802->timerSequenceNumber)
+   {
+      Mac802_11HandleTimeout(node, M802);
+   }
+
+   GLOMO_MsgFree(node, msg);
+}
+
+
+/*
+ * NAME:        Mac802_11Init.
+ *
+ * PURPOSE:     Handles initializations of 802.11.
+ *
+ * PARAMETERS:  node, node being initialized.
+ *              nodeInput, needed to read from configuration file.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+
+void Mac802_11Init(
+   GlomoNode *node, int interfaceIndex, const GlomoNodeInput *nodeInput)
+{
+   char buf[GLOMO_MAX_STRING_LENGTH];
+   int retVal;
+
+   GlomoMac802_11 *M802 = 
+      (GlomoMac802_11 *)checked_pc_malloc(sizeof(GlomoMac802_11));
+
+   
+   M802_11_CheckHeaderSizes();
+   
+   memset(M802, 0, sizeof(GlomoMac802_11));
+   
+   M802->myGlomoMac = node->macData[interfaceIndex];                    
+   M802->myGlomoMac->macVar = (void *)M802;
+
+   M802->state = M802_11_S_IDLE;
+   M802->prevState = M802_11_S_IDLE;
+   M802->IsInExtendedIfsMode = FALSE;
+
+   M802->noResponseTimeoutDuration = 0;
+   M802->CW = M802_11_CW_MIN;
+   M802->BO = 0;
+   M802->SSRC = 0;
+   M802->SLRC = 0;
+   M802->waitingForAckOrCtsFromAddress = INVALID_ADDRESS;
+   M802->NAV = 0;
+
+   M802->seqNoHead = NULL;
+
+   M802->timerSequenceNumber = 0;
+
+   M802->extraPropDelay = 
+      M802->myGlomoMac->propDelay - M802_11_PROPAGATION_DELAY;
+   M802->bandwidth = M802->myGlomoMac->bandwidth;
+   M802->ctsOrAckTransmissionDuration = 
+      SYNCHRONIZATION_TIME +
+      ((M802_11_SHORT_CTRL_FRAME_SIZE * SECOND) / M802->bandwidth);
+
+   M802->pktsToSend = 0;
+
+   M802->pktsSentUnicast = 0;
+   M802->pktsSentBroadcast = 0;
+
+   M802->pktsGotUnicast = 0;
+   M802->pktsGotBroadcast = 0;
+
+   M802->retxDueToCts = 0;
+   M802->retxDueToAck = 0;
+   M802->retxDueToFragAck = 0;
+
+   M802->pktsDropped = 0;
+   M802->fragsDropped = 0;
+   M802->currentPriority = INVALID_PRIORITY;
+   
+   M802->rtsPacketsIgnoredDueToBusyChannel = 0;
+   M802->rtsPacketsIgnoredDueToNAV = 0;
+   
+   
+   
+}
+
+
+
+/*
+ * NAME:        Mac802_11PrintStats
+ *
+ * PURPOSE:     Print MAC layer statistics.
+ *
+ * PARAMETERS:  node, node printing the statistics.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+static
+void Mac802_11PrintStats(GlomoNode *node, GlomoMac802_11 *M802)
+{
+   char buf[GLOMO_MAX_STRING_LENGTH];
+
+   sprintf(buf, "pkts from network: %ld",
+           M802->pktsToSend);
+   GLOMO_PrintStat(node, "802.11", buf);
+   sprintf(buf, "UCAST (non-frag) pkts sent "
+           "to chanl: %ld", M802->pktsSentUnicast);
+   GLOMO_PrintStat(node, "802.11", buf);
+   sprintf(buf, "BCAST pkts sent to chanl: "
+           "%ld", M802->pktsSentBroadcast);
+   GLOMO_PrintStat(node, "802.11", buf);
+   sprintf(buf, "UCAST pkts rcvd clearly: %ld",
+           M802->pktsGotUnicast);
+   GLOMO_PrintStat(node, "802.11", buf);
+   sprintf(buf, "BCAST pkts rcvd clearly: %ld",
+           M802->pktsGotBroadcast);
+   GLOMO_PrintStat(node, "802.11", buf);
+   sprintf(buf, "retx pkts due to CTS timeout: %ld",
+           M802->retxDueToCts);
+   GLOMO_PrintStat(node, "802.11", buf);
+   sprintf(buf, "retx pkts due to ACK timeout: %ld",
+           M802->retxDueToAck);
+   GLOMO_PrintStat(node, "802.11", buf);
+   //sprintf(buf, "retx pkts due to FRAG ACK timeout: %ld",
+   //        M802->retxDueToFragAck);
+   //GLOMO_PrintStat(node, "802.11", buf);
+   sprintf(buf, "pkt drops due to retx limit: %ld",
+           M802->pktsDropped);
+   GLOMO_PrintStat(node, "802.11", buf);
+   //sprintf(buf, "frgmnt drops due to retx limit: %ld",
+   //        M802->fragsDropped);
+   //GLOMO_PrintStat(node, "802.11", buf);
+   
+   sprintf(buf, "RTS Packets ignored due to Busy Channel %d",
+           M802->rtsPacketsIgnoredDueToBusyChannel);
+   GLOMO_PrintStat(node, "802.11", buf);
+   sprintf(buf, "RTS Packets ignored due to NAV %d",
+           M802->rtsPacketsIgnoredDueToNAV);
+   GLOMO_PrintStat(node, "802.11", buf);
+}
+
+
+/*
+ * NAME:        Mac802_11Finalize.
+ *
+ * PURPOSE:     Handles finalizations needed by 802.11.
+ *
+ * PARAMETERS:  node, node being finalized.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void Mac802_11Finalize(GlomoNode *node, int interfaceIndex)
+{
+   GlomoMac802_11 *M802 = 
+      (GlomoMac802_11*)node->macData[interfaceIndex]->macVar;
+   
+   if (M802->myGlomoMac->macStats == TRUE)
+   {
+      Mac802_11PrintStats(node, M802);
+   }
+}
+
+

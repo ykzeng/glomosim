@@ -1,0 +1,56 @@
+Node:      0, Layer:    AppCbrServer, (0) Client address: 21
+Node:      0, Layer:    AppCbrServer, (0) First packet received at [s]: 91.410686401
+Node:      0, Layer:    AppCbrServer, (0) Last packet received at [s]: 247.410946401
+Node:      0, Layer:    AppCbrServer, (0) Average end-to-end delay [s]: 0.021366975
+Node:      0, Layer:    AppCbrServer, (0) Session status: Closed
+Node:      0, Layer:    AppCbrServer, (0) Total number of bytes received: 100352
+Node:      0, Layer:    AppCbrServer, (0) Total number of packets received: 196
+Node:      0, Layer:    AppCbrServer, (0) Throughput (bits per second): 5146
+Node:      0, Layer:    AppFtpClient, from 0 to 1 (cid = 1), start = 150023013308, end = 150249638521 ns (closed), bytes sent = 7908 B, bytes recv = 279 B, throughput = 279156 bps
+Node:      1, Layer:    AppFtpServer, from 0 to 1 (cid = 2), start = 150024618917, end = 150252804942 ns (closed) bytes sent = 279 B, bytes recv = 7908 B, throughput = 277247 bps
+Node:      2, Layer: AppTelnetClient, from 2 to 3 (cid = 1), start = 150013892282, end = 160013892282 ns (closed), bytes sent = 16 B, bytes recv = 592 B, throughput = 12 bps
+Node:      3, Layer: AppTelnetServer, from 2 to 3 (cid = 2), start = 150020010923, end = 160024017837 ns (closed), bytes sent = 592 B, bytes recv =  16 B, throughput = 12 bps
+Node:     10, Layer:    AppCbrClient, (0) Server address: 28
+Node:     10, Layer:    AppCbrClient, (0) First packet sent at [s]: 82.490000000
+Node:     10, Layer:    AppCbrClient, (0) Last packet sent at [s]: 197.490000000
+Node:     10, Layer:    AppCbrClient, (0) Session status: Closed
+Node:     10, Layer:    AppCbrClient, (0) Total number of bytes sent: 24064
+Node:     10, Layer:    AppCbrClient, (0) Total number of packets sent: 47
+Node:     10, Layer:    AppCbrClient, (0) Throughput (bits per second): 1674
+Node:     14, Layer:    AppCbrClient, (0) Server address: 17
+Node:     14, Layer:    AppCbrClient, (0) First packet sent at [s]: 107.800000000
+Node:     14, Layer:    AppCbrClient, (0) Last packet sent at [s]: 273.900000000
+Node:     14, Layer:    AppCbrClient, (0) Session status: Closed
+Node:     14, Layer:    AppCbrClient, (0) Total number of bytes sent: 77824
+Node:     14, Layer:    AppCbrClient, (0) Total number of packets sent: 152
+Node:     14, Layer:    AppCbrClient, (0) Throughput (bits per second): 3748
+Node:     16, Layer:    AppCbrServer, (0) Client address: 18
+Node:     16, Layer:    AppCbrServer, (0) First packet received at [s]: 70.024710156
+Node:     16, Layer:    AppCbrServer, (0) Last packet received at [s]: 95.024230156
+Node:     16, Layer:    AppCbrServer, (0) Average end-to-end delay [s]: 0.024660156
+Node:     16, Layer:    AppCbrServer, (0) Session status: Closed
+Node:     16, Layer:    AppCbrServer, (0) Total number of bytes received: 3072
+Node:     16, Layer:    AppCbrServer, (0) Total number of packets received: 6
+Node:     16, Layer:    AppCbrServer, (0) Throughput (bits per second): 983
+Node:     18, Layer:    AppCbrClient, (0) Server address: 16
+Node:     18, Layer:    AppCbrClient, (0) First packet sent at [s]: 70.000000000
+Node:     18, Layer:    AppCbrClient, (0) Last packet sent at [s]: 95.000000000
+Node:     18, Layer:    AppCbrClient, (0) Session status: Closed
+Node:     18, Layer:    AppCbrClient, (0) Total number of bytes sent: 3072
+Node:     18, Layer:    AppCbrClient, (0) Total number of packets sent: 6
+Node:     18, Layer:    AppCbrClient, (0) Throughput (bits per second): 983
+Node:     21, Layer:    AppCbrClient, (0) Server address: 0
+Node:     21, Layer:    AppCbrClient, (0) First packet sent at [s]: 91.390000000
+Node:     21, Layer:    AppCbrClient, (0) Last packet sent at [s]: 247.390000000
+Node:     21, Layer:    AppCbrClient, (0) Session status: Closed
+Node:     21, Layer:    AppCbrClient, (0) Total number of bytes sent: 100352
+Node:     21, Layer:    AppCbrClient, (0) Total number of packets sent: 196
+Node:     21, Layer:    AppCbrClient, (0) Throughput (bits per second): 5146
+Node:     28, Layer:    AppCbrServer, (0) Client address: 10
+Node:     28, Layer:    AppCbrServer, (0) First packet received at [s]: 82.500210000
+Node:     28, Layer:    AppCbrServer, (0) Last packet received at [s]: 197.500450000
+Node:     28, Layer:    AppCbrServer, (0) Average end-to-end delay [s]: 0.012599387
+Node:     28, Layer:    AppCbrServer, (0) Session status: Closed
+Node:     28, Layer:    AppCbrServer, (0) Total number of bytes received: 24064
+Node:     28, Layer:    AppCbrServer, (0) Total number of packets received: 47
+Node:     28, Layer:    AppCbrServer, (0) Throughput (bits per second): 1674

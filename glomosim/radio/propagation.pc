@@ -1,0 +1,560 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: propagation.pc,v 1.14 2001/08/31 19:25:35 jmartin Exp $
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+
+#include "main.h"
+#include "api.h"
+#include "message.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "glomo.h"
+#include "propagation.h"
+#include "pathloss_free_space.h"
+#include "pathloss_two_ray.h"
+#include "pathloss_matrix.h"
+
+
+#define RAYLEIGH_VARIANCE 0.6366197723676
+
+
+// Output : fading_dB (positive values are signal gains)
+
+void FadingRayleigh(unsigned short seed[3], double *fading_dB) {
+    *fading_dB = 5.0 * log10(-2.0 * RAYLEIGH_VARIANCE * log(pc_erand(seed)));
+}
+
+
+//----------------------------------------------------------------------
+// Bessel Source "Numeric Recipes in *", William Press,et. all.
+
+double Besseli0(double x) {
+   if (fabs(x) < 3.75) {
+      double y = (x/3.75) * (x/3.75);
+      return (1.0 + y * (3.5156229 + y * (3.0899424 + y * (1.2067492 + 
+              y * (0.2659732+ y * (0.360768e-1 + y * 0.45813e-2))))));
+   } else {
+      double ax = fabs(x);
+      double y = 3.75/ax;
+      return (exp(ax)/sqrt(ax)) * (0.39894228 + y * (0.1328592e-1 + 
+              y * (0.225319e-2 + y * (-0.157565e-2 + y * (0.916281e-2 +
+              y * (-0.2057706e-1 + y * (0.2635537e-1 + y * (-0.1647633e-1 +
+              y * 0.392377e-2))))))));
+   }
+}
+
+
+double Besseli1(double x) {
+   if (fabs(x) < 3.75) {
+      double y = (x/3.75) * (x/3.75);
+      return (x * (0.5 + y * (0.87890494 + y * (0.51498869 + y * (0.15084934 +
+              y * (0.2658733e-1 + y * (0.301532e-2 + y * 0.32411e-3)))))));
+   } else {
+      double ax = fabs(x);
+      double y = 3.75/ax;
+      double ans;
+      
+      ans = 0.2282967e-1 + y * (-0.2895312e-1 + y * (0.1787654e-1 - 
+            y * 0.420059e-2));
+      ans = 0.39894228 + y *(-0.3988024e-1 + y * (-0.362018e-2 +
+            y * (0.163801e-2 + y * (-0.1031555e-1 + y * ans))));
+      return fabs((exp(ax)/sqrt(ax)) * ans);
+   }
+}
+//----------------------------------------------------------------------
+
+// Calulates the standard deviation for the Rician distribution so that
+// the mean of the distribution is 1.0.
+
+double CalculateRicianStandardDeviation(double kFactor) {
+   return 1.0/(sqrt(PI/2.0) * exp(-kFactor/2.0) *
+              ((1 + kFactor) * Besseli0(kFactor/2.0) + 
+               kFactor * Besseli1(kFactor/2.0)));
+}
+
+
+
+// Output : fading_dB (positive values are signal gains)
+
+static //inline//
+void FadingRician(double kFactor, 
+                  double standardDeviation, 
+                  unsigned short seed[3], 
+                  double *fading_dB) 
+{
+    double a = sqrt(2.0 * kFactor * standardDeviation * standardDeviation);
+    double value1;
+    double value2;
+    double r = 0.0;
+
+    while (r == 0.0 || r > 1.0) {
+        value1 = -1.0 + 2.0 * pc_erand(seed);
+        value2 = -1.0 + 2.0 * pc_erand(seed);
+
+        r = value1 * value1 + value2 * value2;
+    }
+
+    value1 = a + standardDeviation * value1 * sqrt(-2.0 * log(r) / r);
+    value2 = standardDeviation * value2 * sqrt(-2.0 * log(r) / r);
+
+    *fading_dB = 5.0 * log10(value1 * value1 + value2 * value2);
+}
+
+
+
+
+
+
+
+/*
+ * FUNCTION     GLOMO_GlobalPropInit
+ * PURPOSE      Initialization function for propagation functions
+ *
+ * Parameters:
+ *     propData: structure shared among nodes
+ *     nodeInput: structure containing contents of input file
+ */
+void GLOMO_GlobalPropInit(GlomoProp *propData,
+                          const GlomoNodeInput *nodeInput)
+{
+    BOOL wasFound;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+    double frequency;
+    double wavelength;
+    double temperature;
+    double noiseFigure;
+    double thermalNoise_mW;
+    double thermalNoise_dBm;
+    double ambientNoiseFactor;
+    double ambientNoise_mW;
+    double propLimit_dBm;
+    
+    GlomoNodeInput       berTableInput;
+    
+    
+    /*
+     * Get the temperature
+     */
+    wasFound = GLOMO_ReadDouble(-1, nodeInput, "TEMPERATURE", &temperature);
+    if (wasFound == FALSE) {
+        temperature = 290.0;
+    }
+    else {
+        assert(wasFound == TRUE);
+    }
+
+    /*
+     * Get the noise figure
+     */
+    wasFound = GLOMO_ReadDouble(-1, nodeInput, "NOISE-FIGURE", &noiseFigure);
+    if (wasFound == FALSE) {
+        noiseFigure = DEFAULT_NOISE_FIGURE;
+    }
+    else {
+        assert(wasFound == TRUE);
+    }
+    
+    /*
+     * Calculate thermal noise
+     */
+    thermalNoise_mW
+        = BOLTZMANN_CONSTANT * temperature * noiseFigure * 1000.0;
+    thermalNoise_dBm = IN_DB(thermalNoise_mW);
+
+    /*
+     * Get the ambient noise factor
+     */
+    wasFound = GLOMO_ReadDouble(-1,
+                              nodeInput,
+                              "PROPAGATION-AMBIENT-NOISE-FACTOR",
+                              &ambientNoiseFactor);
+    if (wasFound == FALSE) {
+        ambientNoiseFactor = 0.0;
+    }
+    ambientNoise_mW = ambientNoiseFactor * 1000.0;
+
+    propData->backgroundNoise_mW = ambientNoise_mW + thermalNoise_mW;
+    propData->backgroundNoise_dBm = IN_DB(propData->backgroundNoise_mW);
+    
+    /*
+     * Get the propagation limit
+     */
+    wasFound = GLOMO_ReadDouble(-1, nodeInput, "PROPAGATION-LIMIT", 
+                                &propLimit_dBm);
+    if (wasFound == FALSE) {
+        fprintf(stderr, "Error: PROPAGATION-LIMIT not specified\n");
+        assert(FALSE); abort();
+    }
+    
+    assert(wasFound == TRUE);
+
+    propData->propLimit_dBm = propLimit_dBm;
+    
+    //
+    // Set PROPAGATION-PATHLOSS
+    //
+    wasFound = GLOMO_ReadString(-1, nodeInput, "PROPAGATION-PATHLOSS", buf);
+    if (wasFound) {
+        if (strcmp(buf, "FREE-SPACE") == 0) {
+            propData->pathlossModel = FREE_SPACE;
+            PathlossFreeSpaceInit(propData, nodeInput);
+        }
+        else if (strcmp(buf, "TWO-RAY") == 0) {
+            propData->pathlossModel = TWO_RAY;
+            PathlossTwoRayInit(propData, nodeInput);
+        }
+        else if (strcmp(buf, "PATHLOSS-MATRIX") == 0) {
+            propData->pathlossModel = PATHLOSS_MATRIX;
+            PathlossMatrixInit(propData, nodeInput);
+        }
+        else {
+            fprintf(stderr, "Unknown PROPAGATION-PATHLOSS %s.\n", buf);
+            assert(FALSE); abort();
+        }
+    }
+    else {
+        fprintf(stderr, "PROPAGATION-PATHLOSS is missing.\n");
+        assert(FALSE); abort();
+    }
+
+    
+    //
+    // Set fadingModel
+    //
+    
+    wasFound = 
+       GLOMO_ReadString(
+           -1, 
+           nodeInput, 
+           "PROPAGATION-FADING-MODEL",
+           buf);
+    
+    if (!wasFound) {
+        propData->fadingModel = NONE;
+    } else {
+        if (strcmp(buf, "NONE") == 0) {
+            propData->fadingModel = NONE;
+        }
+        else if (strcmp(buf, "RAYLEIGH") == 0) {
+            propData->fadingModel = RAYLEIGH;
+        }
+        else if (strcmp(buf, "RICIAN") == 0) {
+            propData->fadingModel = RICIAN;
+            wasFound = GLOMO_ReadDouble(-1, nodeInput, "RICIAN-K-FACTOR", 
+                                &propData->ricianKFactor);
+            if (!wasFound) {
+               fprintf(stderr,"RICIAN-K-FACTOR not specified\n");
+               abort();
+            }
+            propData->ricianStandardDeviation = 
+               CalculateRicianStandardDeviation(propData->ricianKFactor);
+        }
+        else {
+            fprintf(
+               stderr,
+               "Error: unknown PROPAGATION-FADING-MODEL '%s'.\n",
+                buf);
+            abort();
+        }//if//
+    }//if//
+    
+    //
+    // Read BER-TABLE-FILE
+    //
+    wasFound = GLOMO_ReadCachedFile(nodeInput,
+                                    "BER-TABLE-FILE",
+                                    &berTableInput);
+    if (wasFound == TRUE) {
+        int i;
+        double snr, ber;
+
+        propData->numBerDataItems = berTableInput.numLines;
+        propData->berTable
+            = (GlomoPropBerTable *)calloc(propData->numBerDataItems,
+                                          sizeof(GlomoPropBerTable));
+
+        for (i = 0; i < berTableInput.numLines; i++) {
+            sscanf(berTableInput.inputStrings[i], "%lf %lf", &snr, &ber);
+            propData->berTable[i].snr = snr;
+            propData->berTable[i].ber = ber;
+        }
+    }
+    else {
+        propData->numBerDataItems = 0;
+        propData->berTable = NULL;
+    }
+}
+
+
+/*
+ * FUNCTION     GLOMO_PropagateInit
+ * PURPOSE      Initialization function for propagation functions
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     propagateData: shared structure for propagate data
+ */
+void GLOMO_PropInit(GlomoNode *node, GlomoProp *propData) {
+    node->propData = propData;
+}
+
+
+void GLOMO_PropBroadcast(GlomoPartition *partitionData, Message *msg)
+{
+    PropInfo  *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+    GlomoProp *propData = &(partitionData->propData);
+    GlomoNode *rxNode = partitionData->firstNode;
+                                                    
+    while (rxNode != NULL) {
+        int rxRadioNum = 
+            GLOMO_RadioGetRadioNumberForWavelength(
+               rxNode, propInfo->wavelength);
+    
+        if ((rxNode->nodeAddr != propInfo->txAddr) && 
+            (rxRadioNum != INVALID_RADIO_NUMBER)) 
+        {
+            double distance;
+            double pathloss_dB;
+            double fading_dB;
+            double rxPower_dBm;
+            float txAntennaGain_dB;
+            float rxAntennaGain_dB;
+            float rxAntennaHeight;
+            
+            distance
+                = sqrt(SQUARE(rxNode->position.x - propInfo->txPosition.x) +
+                       SQUARE(rxNode->position.y - propInfo->txPosition.y) +
+                       SQUARE(rxNode->position.z - propInfo->txPosition.z));
+
+            txAntennaGain_dB = propInfo->txAntennaGain_dB;
+            rxAntennaHeight = GLOMO_RadioAntennaHeight(rxNode, rxRadioNum);
+            rxAntennaGain_dB = GLOMO_RadioAntennaGain_dB(rxNode, rxRadioNum);
+
+            switch (propData->pathlossModel) {
+                case FREE_SPACE: {
+                    pathloss_dB = PathlossFreeSpace(distance,
+                                                    propInfo->wavelength,
+                                                    txAntennaGain_dB,
+                                                    rxAntennaGain_dB);
+                    break;
+                }
+                case TWO_RAY: {
+                    pathloss_dB = PathlossTwoRay(distance,
+                                                 propInfo->wavelength,
+                                                 txAntennaGain_dB,
+                                                 propInfo->txAntennaHeight,
+                                                 rxAntennaGain_dB,
+                                                 rxAntennaHeight);
+                    break;
+                }
+                case PATHLOSS_MATRIX: {
+                    //
+                    // This is tricky, but this model sets distance here
+                    //
+                    pathloss_dB = PathlossMatrix(propInfo->txAddr,
+                                                 rxNode->nodeAddr,
+                                                 txAntennaGain_dB,
+                                                 rxAntennaGain_dB,
+                                                 propData->pathlossVar,
+                                                 &distance);
+                    break;
+                }
+                default: {
+                    assert(FALSE); abort();
+                }
+            }
+
+            
+            switch (propData->fadingModel) {
+            case NONE: 
+                fading_dB = 0.0;
+                break;
+
+            case RAYLEIGH:
+                if (rxNode->nodeAddr == 
+                    propInfo->correlatedFastFadingDestinationNode)
+                {
+                   fading_dB = propInfo->correlatedFastFading_dB;
+                } else {
+                   FadingRayleigh(rxNode->seed, &fading_dB);
+                }//if//
+
+                break;
+            
+            case RICIAN:
+                if (rxNode->nodeAddr == 
+                    propInfo->correlatedFastFadingDestinationNode)
+                {
+                   fading_dB = propInfo->correlatedFastFading_dB;
+                } else {
+                   FadingRician(propData->ricianKFactor,
+                                propData->ricianStandardDeviation, 
+                                rxNode->seed, &fading_dB);
+                }//if//
+
+                break;
+            default: 
+                assert(FALSE); abort(); 
+                break;
+            }//switch//
+            
+            
+            rxPower_dBm = propInfo->txPower_dBm - pathloss_dB + fading_dB;
+                                                       
+            if (propData->propLimit_dBm > rxPower_dBm) {
+                // signal not reachable to the receiver
+            }
+            else {
+                // signal reachable to the receiver
+                // further optimization (passing pointer) is necessary..
+                Message *newMsg = NULL;
+                clocktype delay;
+                PropInfo *newPropInfo;
+                BOOL worthMsgCopying = GLOMO_RadioCanReceive(rxNode,
+                                                             rxRadioNum,
+                                                             rxPower_dBm);
+                if (worthMsgCopying == TRUE) {
+                    newMsg = GLOMO_MsgCopy(rxNode, msg);
+                    assert(newMsg != NULL);
+
+                    GLOMO_MsgSetLayer(newMsg, GLOMO_RADIO_LAYER, 0);
+                    GLOMO_MsgSetEvent(newMsg, MSG_RADIO_FromChannelBegin);
+                    GLOMO_MsgSetInstanceId(newMsg, rxRadioNum);
+                    newPropInfo = (PropInfo *)GLOMO_MsgReturnInfo(newMsg);
+                    newMsg->error = FALSE;
+                }
+                else {
+                    // do not copy the message as it cannot be received
+                    newMsg = GLOMO_MsgAlloc(rxNode,
+                                            GLOMO_RADIO_LAYER,
+                                            0,
+                                            MSG_RADIO_FromChannelBegin);
+                    GLOMO_MsgSetInstanceId(newMsg, rxRadioNum);
+                    GLOMO_MsgInfoAlloc(rxNode, newMsg, sizeof(PropInfo));
+                    newPropInfo = (PropInfo *)GLOMO_MsgReturnInfo(newMsg);
+                    memcpy(newPropInfo, propInfo, sizeof(PropInfo));
+                    //
+                    // You should not set packetSize manually like this..
+                    //
+                    newMsg->packetSize = msg->packetSize;
+                    newMsg->error = TRUE;
+                }
+                
+                newPropInfo->rxPower_mW = NON_DB(rxPower_dBm);
+                newPropInfo->correlatedFastFading_dB = fading_dB;
+
+        
+                //
+                // This is from another partition so the delay until
+                // airborne has already been factored during the 
+                // cross partition event (for lookahead).
+                //
+
+                GLOMO_MsgSend(rxNode,
+                              newMsg,
+                              ChannelPropagationDelay(distance));
+            }
+        }
+        rxNode = rxNode->nextNodeData;
+    }
+}
+
+
+double GLOMO_PropBER(const GlomoNode *node,
+                     const double signalPower,
+                     const double noisePower)
+{
+    GlomoProp *propData = node->propData;
+    const GlomoPropBerTable *berTable = propData->berTable;
+    const int numBerDataItems = propData->numBerDataItems;
+    int i1, i2;
+    double snrDiff;
+    double snr = signalPower / noisePower;
+
+    assert(numBerDataItems > 2);
+
+    //
+    // If the given snr is more than the biggest snr in the table,
+    // simply return the ber of 0.
+    //
+    if (snr > berTable[numBerDataItems - 1].snr) {
+        return 0.0;
+    }
+    
+    i1 = numBerDataItems / 2;
+    snrDiff = snr - berTable[i1].snr;
+
+    //
+    // Make berTable[i1].snr < snr < berTable[i2].snr
+    //
+    if (snrDiff < 0.0) {
+        i2 = i1;
+        i1 = 0;
+    }
+    else {
+        i2 = numBerDataItems - 1;
+    }
+
+    while (i2 - i1 > 1) {
+        int i3 = (i1 + i2) / 2;
+        double snrDiff3 = snr - berTable[i3].snr;
+
+        if (snrDiff3 < 0.0) {
+            i2 = i3;
+        }
+        else {
+            i1 = i3;
+        }
+    }
+
+    return ((berTable[i1].ber - berTable[i2].ber) *
+            (berTable[i2].snr - snr) /
+            (berTable[i2].snr - berTable[i1].snr)
+            + berTable[i2].ber);
+}
+
+
+

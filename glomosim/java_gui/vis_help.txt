@@ -1,0 +1,338 @@
+/* 
+ * Glomosim is COPYRIGHTED software.  It is freely available without fee for
+ * education, or research, or to non-profit agencies. No cost evaluation
+ * licenses are available for commercial users. By obtaining copies of this
+ * and other files that comprise GloMoSim, you, the Licensee, agree to abide
+ * by the following conditions and understandings with respect to the
+ * copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education, research, and non-profit purposes is hereby granted to
+ *   Licensee, provided that the copyright notice, the original author's names
+ *   and unit identification, and this permission notice appear on all such
+ *   copies, and that no charge be made for such copies. Any entity desiring
+ *   permission to incorporate this software into commercial products or to use
+ *   it for commercial purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+GloMoSim Visualization Tool User's Guide
+For questions and concerns about GloMoSim,
+please email glomosim@aspen.cs.ucla.edu
+
+-----------------------------------------------------------------------
+GloMoSim Java Visualization Tool, documentation version 1.1
+Author: Addison Lee
+Upgraded by Kaixin Xu
+-----------------------------------------------------------------------
+
+Outline:
+ [1] Overview
+ [2] Getting Started
+ [3] Features of the Visualization Tool
+ [4] Modifying GloMoSim to interact with the Visualization Tool
+
+note: Throughout this document, I will use "VT" as an abbreviation
+      for "Visualization Tool"
+
+-----------------------------------------------------------------------
+[1] Overview
+-----------------------------------------------------------------------
+
+The primary purpose of the Java VT is to help network designers debug
+their protocols. It is written in Java to provide portability across
+multiple platforms.
+
+The GloMoSim simulation can be run with or without the VT. If run without
+the VT, it can just be executed from the command line. However, if run with
+the VT, it must be executed through the GUI provided by the VT rather
+than from the command line.
+
+-----------------------------------------------------------------------
+[2] Getting Started 
+-----------------------------------------------------------------------
+
+[A] Preliminaries:
+    - Make sure that the Java Development Kit (JDK) version 1.2 or higher
+      is installed on your machine. Our VT now base on swing package of JDK
+      If you prefer to use JDK 1.1, you must install the swing package for
+      JDK 1.1. The swing package is included in JDK1.2.
+    - Make sure that you have already compiled the GloMoSim source files.
+      (see $glomo/doc/user.txt for more information on compiling GloMoSim)
+    - Compile the Java VT files:
+      - cd to the $glomo/java_gui/ directory
+      - type: "javac *.java"
+
+[B] Starting the VT:
+    - From the $glomo/java_gui/ directory, type: "java GlomoMain &"
+
+[C] An Example Use of the VT:
+    - Start up the VT as explained in part b above.
+    - Select "Real Time" from the "Simulate" menu.
+    - A dialog will pop up asking for the name of the executable to run.
+      The default is: "../bin/Sim ../bin/CONFIG.IN"(UNIX) 
+      or "..\bin\glomo ..\bin\CONFIG.IN"(Windows NT);
+      Click the "OK" button to continue.
+    Once you click the "OK" button, the VT will run GloMoSim, capture the
+    standard output (stdout) from GloMoSim, and graphically display the
+    results on the screen.
+
+-----------------------------------------------------------------------
+[3] Features of the Visualization Tool
+-----------------------------------------------------------------------
+
+[A] Simulate Menu:
+
+There are basically two ways to run GloMoSim with the VT: real time
+and play back.
+
+  [1] If you choose "Real Time" from the Simulate menu, then the VT will
+      display the results of GloMoSim while GloMoSim is running.
+
+  [2] If you wish to run GloMoSim first and then play the results of the
+      simulation back later, then you need to do the following:
+
+      (a) Choose "Write Trace" from the Simulate menu. A dialog will pop up
+      asking for the name of the executable and the name of the trace file
+      to write the output from GloMoSim to.
+
+      (b) Once the trace file has been written to, you can play it back by
+      choosing "Play Back" from the Simulate menu. A dialog will pop up asking
+      for the name of the trace file to play back.
+
+  The benefit of real time simulation is that you can see the results of
+  the GloMoSim simulation right away rather than having to wait for it
+  to be written to a trace file and then playing back the trace file.
+
+  The benefit of play back is that you can save a particular scenario
+  to file and play it back as many times as you want. Also, play back
+  runs faster than real time since only the VT is running as opposed
+  to both the VT and GloMoSim running at the same time.
+
+  Here is how the radio layer is currently displayed in the VT:
+  When a node transmits a packet, a yellow link is drawn from this node
+  to all nodes within it's power range (see main/channel.pc).
+  As each node receives the packet, the link is erased and a green line
+  is drawn for successful reception and a red line is drawn for
+  unsuccessful reception (see radio/radio_no.pc or radio/radio_has.pc).
+  No distinction is made between different packet types (ie: control
+  packets vs. regular pacekts, etc.)
+  To modify this basic functionality, just change the code in the
+  channel.pc and radio_*.pc files according to the specifications
+  that I discussed earlier in this document.
+
+  [3] There is also an abort option which can be used to abort the simulation.
+
+[B] Options Menu:
+
+The options menu allows the user to specify how things are to be displayed
+on the VT.
+
+    [1] Zoom Submenu:
+        Allows the user to specify how big images will appear in the VT.
+
+    [2] Background Colors Submenu:
+        Allows the user to set the background color by choosing favourite 
+        colors.
+
+    [3] Gui Options Submenu:
+        There is a tradeoff between specifying colors in the VT GUI
+        and specifying colors in the GloMoSim code. Specifying colors
+        in the VT GUI is much simpler for the user. However, it is not
+        very scalable since every time you want to add a new feature
+        which requires a color (such as a new type of packet), then
+        you need to modify the Java VT source code. On the other hand,
+        specifying all the colors in the GloMoSim code allows much more
+        flexiblity for the developer. Since this VT is primarily meant
+        for network designers to test out their protocols, I have chosen
+        to let all the colors be specified by GloMoSim rather than having
+        colors changeable through the VT GUI. In the near future, I will
+        add an option to VT which allows the user to select colors to be
+        chosen either from a small set of colors in the VT or to be
+        completely specified from the GloMoSim code; that way, the network
+        designers have the flexibility required to test their protocols,
+        but at the same time, the basic colors can be changed quickly
+        and easily as might be necessary if you are just doing a demo to show
+        other people the results of your work.
+
+        The "Show Transmission Range" option can be checked to display the
+        power range of each node as a circle around it. If you do not wish
+        to see the power range displayed, then just uncheck this option.
+
+[C] Debug Menu:
+
+  [1] The "Set Step Size..." option has been disabled for the time being since
+      we could not yet find a satisfactory way to handle stepping. This
+      functionality will be added soon.
+
+  [2] The "View Stats..." option is used to display statistics collected at
+      the end of the GloMoSim simulation. The statistics are located in a file
+      called GLOMO.STAT. (see $glomo/doc/user.txt for more details about
+      GLOMO.STAT) In order for GLOMO.STAT to be written to, the GloMoSim
+      simulation must be run to completion since it is written to at the end
+      of the simulation.  The GLOMO.STAT file will be placed in whichever
+      directory that GloMoSim is run from. So if you run GloMoSim without the
+      VT from the $glomo/bin/ directory, then it will be placed in that
+      directory. But if you run it from the VT in the $glomo/java_gui/
+      directory, then it will be placed in that directory instead.
+
+      Once the stats window is open, the left panel will allow you to select
+      which statistics you wish to view. Only those statistics which you set
+      as YES in the CONFIG.IN file will be displayed on the left panel.
+      For example, if you only set TCP-STATISTICS and ROUTING-STATISTICS to
+      YES and set everything else to NO, then only those two stats will be
+      available as options on the left menu. If you don't specify any statistics
+      as YES in the CONFIG.IN file, then nothing will be displayed on the
+      left panel. (see $glomo/doc/user.txt for more information about
+      statistics collected at the end of the simulation from GloMoSim)
+ 
+      In the future, when GloMoSim provides real time statistics during the
+      execution instead of just at the end, the VT will be augmented to
+      display these statistics. One way to implement this is to show statistics
+      for a particular node when you click on it. For now, I just wrote a dummy
+      function which displays the location of a node when you click on it. In
+      the future, some useful statistics will be displayed instead. Also, global
+      statistics will be displayed real time during the execution of GloMoSim
+      on the right panel of the VT when GloMoSim eventually develops the ability
+      to show global statistics.
+
+[D] The Speed Up and Slow Down buttons can be used to speed up or slow down
+    the simulation.
+    The Zoom our and Zoom In buttons can be used to scale the cordinate.
+    The Stop, Step and Run button can be used to pause, step and resume the 
+    simulation
+
+-----------------------------------------------------------------------
+[4] Modifying GloMoSim to interact with the Visualization Tool
+-----------------------------------------------------------------------
+
+GloMoSim already contains code which allows it to interact with
+the VT. However, the code is only written for the radio and channel
+layers for the time being. If you wish to extend the functionality
+of the code written in the radio and channel layers or if you wish
+to have other layers of GloMoSim displayed by the VT, then you will
+have to add the code yourself. Here is a brief description of the
+interface between GloMoSim and the VT:
+
+The way GloMoSim communicates with the VT is through standard output
+(stdout). When GloMoSim wants something to be displayed by the VT,
+it sends a formatted text message (basically a printf) to the VT
+specifying what it wants the VT to display. You do not have to worry
+about setting up the stdout link between GloMoSim and the VT - it is
+already taken care of when you execute GloMoSim from the VT.
+(ie: what you did in part c above)
+
+The text message that GloMoSim sends to the VT needs to be in a
+specific format for the VT to understand and execute it.
+The programmer does not have to worry about what the format is.
+Instead, a header file, "java_gui.h", contains prototypes of
+functions you can call to display certain things in the VT.
+When you call one of these functions from GloMoSim, it will send
+the text message to the VT in the proper format.
+Here is a current listing of the functions provided for communication
+between GloMoSim and the VT (example uses of these functions can
+be found in: main/channel.pc, main/mobility.pc, radio/radio_no.pc,
+and radio/radio_has.pc):
+
+[A] void JGUI_InitNode(long numGuiNodes, long id, long positionX,
+                       long positionY, long txRange, JGUI_COLOR color);
+    Purpose:
+       This function is used for initializing nodes at the beginning
+       of the simulation. The VT needs this information so that it
+       can allocate storage for each node in memory. Since it is called
+       only once for each node at the beginning of the simulation, you
+       will never need to use this function with GloMoSim since it has
+       already been included (in $glomo/main/mobility.pc).
+    Parameters:
+       numGuiNodes:   Number of nodes in the simulation
+       id:            Numerical id of the node
+       positionX:     Initial x coordinate of the node
+       positionY:     Initial y coordinate of the node
+       txRange:       Radio power range of the node
+       color:         Color of the node displayed in the VT
+
+[B] void JGUI_DrawLine(long srcId, long destId, unsigned char *simTime,
+                       JGUI_COLOR color);
+    Purpose:
+       This function is used to draw a temporary line between two nodes
+       which can represent the transmission of a packet between two nodes.
+       After a brief period of time, the line is erased.
+    Parameters:
+       srcId:    Id of the transmitting node
+       destId:   Id of the receiving node
+       simTime:  Current time of the PARSEC simulation clock
+       color:    Color of the line displayed in the VT
+
+[C] void JGUI_DrawThickLine(long srcId, long destId, long thickness,
+                            unsigned char *simTime, JGUI_COLOR color);
+    Purpose:
+       This function has the same functionality as JGUI_DrawLine except
+       it allows you to specify a thickness for the line.
+    Parameters:
+       srcId, destId, simTime, color: same as for JGUI_DrawLine
+       thickness:  The thickness of the line
+
+[D] void JGUI_DrawLink(long srcId, long destId, unsigned char *simTime,
+                       JGUI_COLOR color);
+    Purpose:
+       This function is similar to JGUI_DrawLine except that it is not
+       automatically erased after a short period of time. To erase the
+       line, call JGUI_EraseLink.
+    Parameters:
+       Same as for JGUI_DrawLine
+        
+[E] void JGUI_EraseLink(long srcId, long destId, unsigned char *simTime);
+    Purpose:
+       Erase the line drawn by JGUI_DrawLink
+    Parameters:
+       Same as for JGUI_DrawLine except it doesn't include the color
+       variable since it is not necessary
+
+[F] void JGUI_DrawBroadcast(long id, unsigned char *simTime,
+                            JGUI_COLOR color);
+    Purpose:
+       This function is used to draw an expanding circle within a node's
+       power range.
+    Parameters:
+       id:         Id of transmitting node
+       simTime:    Current time of the PARSEC simulation clock
+       color:      Color of the expanding circle displayed in the VT
+
+[G] void JGUI_MoveNode(long id, long x, long y, unsigned char *simTime);
+    Purpose:
+       This function is used to move a node from one part of the screen
+       to another. The user will never have to call this function because
+       it is already included in the mobility file (main/mobility.pc) which
+       is the only place where node movement takes place.
+    Parameters:
+       id:         Id of the node to be moved
+       x:          New x coordinate of the node
+       y:          New y coordinate of the node
+       simTime:    Current time of the PARSEC simulation clock
+
+The following is a list of enums that can be used for the JGUI_COLOR
+parameters of the function prototypes listed above:
+
+    typedef enum {
+        JGUI_BLACK=0, JGUI_BLUE=1, JGUI_CYAN=2, JGUI_DARK_GRAY=3, JGUI_GRAY=4,
+        JGUI_GREEN=5, JGUI_LIGHT_GRAY=6, JGUI_MAGENTA=7, JGUI_ORANGE=8,
+        JGUI_PINK=9, JGUI_RED=10, JGUI_WHITE=11, JGUI_YELLOW=12
+    } JGUI_COLOR;
+
+The functions provided are pretty generic. Hopefully it will provide
+enough power to display everything you want. If you have any suggestions
+for other functions to add, please let me know (addison@cs.ucla.edu).

@@ -1,0 +1,323 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: mobility.pc,v 1.52 2001/02/15 03:06:06 mineo Exp $
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+#include <limits.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+#include "structmsg.h"
+#include "driver.h"
+#include "glomo.h"
+#include "heap.h"
+
+#include "mobility.h"
+#include "mobility_waypoint.h"
+#include "mobility_trace.h"
+
+#include "java_gui.h"
+
+//
+// Following three functions are defined in pathloss_matrix.pc
+//
+extern void GLOMO_MobilityPathlossMatrixInit(GlomoNode *, GlomoNodeInput *);
+extern void GLOMO_MobilityPathlossMatrixFinalize(GlomoNode *);
+extern void GLOMO_MobilityPathlossMatrix(GlomoNode *);
+
+//
+// MAX_POWER_RANGE is only for visualization tool
+// This definition should be eliminated from this file
+// and be a variable in the visualization tool..
+//
+#define MAX_POWER_RANGE 250
+
+#define DEFAULT_DISTANCE_GRANULARITY 1
+
+
+
+
+
+#define SEED_TWEEKER 137
+
+/*
+ * FUNCTION     GLOMO_MobilityInit
+ * PURPOSE      Initialization function for mobility models.
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+void GLOMO_MobilityInit (GlomoNode *node, GlomoNodeInput *nodeInput) {
+    char    buf[GLOMO_MAX_STRING_LENGTH];
+    BOOL    retVal;
+    int    seedVal;
+    double  prob;
+    int    signalDir;
+    Heap    *heapPtr;
+
+    clocktype       startTime;
+    
+    node->mobilityData.seed[0] = node->initialSeedValue[0] + SEED_TWEEKER;
+    node->mobilityData.seed[1] = node->initialSeedValue[1] * SEED_TWEEKER;
+    node->mobilityData.seed[2] = node->initialSeedValue[2];
+    
+    node->mobilityData.totalMoves = 0;
+
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "MOBILITY-STATISTICS", buf);
+    if (retVal == FALSE) {
+        node->mobilityData.mobilityStats = FALSE;
+    }
+    else {
+        if (strcmp(buf, "YES") == 0) {
+            node->mobilityData.mobilityStats = TRUE;
+        }
+        else if (strcmp(buf, "NO") == 0) {
+            node->mobilityData.mobilityStats = FALSE;
+        }
+        else {
+            fprintf(stderr, "CONFIG.IN Error: %s is not a valid choice.\n", buf);
+            assert(FALSE);
+         }       
+    }
+
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "MOBILITY-INTERVAL", buf);
+    if (retVal) {
+       printf("(For Devs)MOBILITY-INTERVAL is temporary and needs to be removed.\n");
+    }
+
+    /* Read the minimum update distance between each move. */
+    
+
+    retVal = GLOMO_ReadDouble(node->nodeAddr, nodeInput, 
+                              "MOBILITY-POSITION-GRANULARITY",
+                              &(node->mobilityData.distance_granularity));
+
+    if (!retVal) {
+        node->mobilityData.distance_granularity = DEFAULT_DISTANCE_GRANULARITY;
+    }
+    
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "GUI-OPTION", buf);
+    if (retVal == FALSE) {
+        node->mobilityData.guiOption = FALSE;
+    }
+    else {    /* get gui option */ 
+        if (strcmp(buf, "YES") == 0) {
+            node->mobilityData.guiOption = TRUE;
+        }
+        else if (strcmp(buf, "NO") == 0) {
+            node->mobilityData.guiOption = FALSE;
+        }
+        else {
+           fprintf(stderr, "CONFIG.IN Error: %s is not a valid choice.\n", buf);
+           assert(FALSE);
+        }
+    }
+
+    node->mobilityData.nextMoveTime = CLOCKTYPE_MAX;
+
+    /* Determine mobility type */
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "MOBILITY", buf);
+    if (retVal == FALSE) {
+        node->mobilityData.mobilityType = MOBILITY_NONE;
+    }
+    else {
+        if (strcmp(buf, "NONE") == 0) {
+            node->mobilityData.mobilityType = MOBILITY_NONE;
+        }
+        else if (strcmp(buf, "RANDOM-WAYPOINT") == 0) {
+            node->mobilityData.mobilityType = MOBILITY_RANDOM_WAYPOINT;
+            GLOMO_MobilityRandomWaypointInit(node, nodeInput);
+        }
+        else if (strcmp(buf, "TRACE") == 0) {
+            node->mobilityData.mobilityType = MOBILITY_TRACE;
+            GLOMO_MobilityTraceInit(node, nodeInput);
+        }
+        else if (strcmp(buf, "PATHLOSS-MATRIX") == 0) {
+            node->mobilityData.mobilityType = MOBILITY_PATHLOSS_MATRIX;
+            GLOMO_MobilityPathlossMatrixInit(node, nodeInput);
+        }
+        else {
+            fprintf(stderr, "GLOMO Error: Invalid value for MOBITLIY: %s.\n",
+                    buf);
+            assert(FALSE);
+        }
+    }
+    
+    if (node->mobilityData.guiOption == TRUE) {
+        JGUI_COLOR nodeColor = JGUI_BLUE;
+        JGUI_COLOR connectionColor = JGUI_BLUE;
+        JGUI_InitNode(node->numNodes, node->nodeAddr,
+                      (int)ceil(node->position.x),
+                      (int)ceil(node->position.y),
+                      MAX_POWER_RANGE,
+                      nodeColor,
+                      connectionColor);
+    }
+
+    heapPtr = &(node->partitionData->mobilityInternal);
+    GLOMO_HeapMobilityInternalInsert(heapPtr, node);
+
+    
+}
+
+
+
+/*
+ * FUNCTION    GLOMO_MobilityFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of 
+ *             the simulation of the mobility data.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+void GLOMO_MobilityFinalize(GlomoNode *node) {
+
+    switch(node->mobilityData.mobilityType) {
+        case MOBILITY_NONE:
+            break;
+        case MOBILITY_RANDOM_WAYPOINT:
+            break;
+        case MOBILITY_TRACE:
+            break;
+        case MOBILITY_PATHLOSS_MATRIX:
+            GLOMO_MobilityPathlossMatrixFinalize(node);
+            break;
+        default:
+            assert(FALSE);
+    }
+}
+
+
+/*
+ * FUNCTION    GLOMO_Mobility
+ * PURPOSE     Models the behaviour of the mobility models on receiving
+ *             a message.
+ *
+ * Parameters:
+ *     node:     node which received the message
+ */
+void GLOMO_Mobility(GlomoNode *node) {
+    Heap    *heapPtr;
+    int    signalDir;
+    clocktype currentTime = simclock();
+
+    assert(node->mobilityData.nextMoveTime == currentTime);
+
+    
+
+    node->position = node->mobilityData.next;
+
+    if (node->mobilityData.guiOption == TRUE) {
+        char simTime[50];
+        ctoa(simclock(), simTime);
+        JGUI_MoveNode(node->nodeAddr, (int)ceil(node->position.x),
+                      (int)ceil(node->position.y), simTime);
+    }
+
+    switch(node->mobilityData.mobilityType) {
+        case MOBILITY_NONE:
+            break;
+        case MOBILITY_RANDOM_WAYPOINT:
+            GLOMO_MobilityRandomWaypoint(node);
+            break;
+        case MOBILITY_TRACE:
+            GLOMO_MobilityTrace(node);
+            break;
+        case MOBILITY_PATHLOSS_MATRIX:
+            GLOMO_MobilityPathlossMatrix(node);
+            break;
+
+        default:
+            assert(FALSE);
+    }
+
+    heapPtr = &(node->partitionData->mobilityInternal);
+    assert(heapPtr->heapNodePtr[1] == node);
+    GLOMO_HeapMobilityInternalFixDown(heapPtr, 1);
+
+    
+}
+
+
+
+/*
+ * FUNCTION    GLOMO_MobilityReturnAvgSpd
+ * PURPOSE     Returns the Average Speed of a node 
+ *
+ * Parameters:
+ *     node:      node needs to report the average speed
+ */
+double GLOMO_MobilityReturnAvgSpd(GlomoNode *node) {
+
+    return node->mobilityData.avgSpeed;
+}
+
+/*
+ * FUNCTION    GLOMO_MobilityReturnPositionX
+ * PURPOSE     Returns the X coordinate of a node
+ *
+ * Parameters:
+ *     node:      node needs to report its x coord (GPS) 
+ */
+double GLOMO_MobilityReturnPositionX(GlomoNode *node) {
+
+    return node->position.x;
+}
+
+/*
+ * FUNCTION    GLOMO_MobilityReturnPositionY
+ * PURPOSE     Returns the Y coordinate of a node
+ *
+ * Parameters:
+ *     node:      node needs to report its y coord (GPS)
+ */
+double GLOMO_MobilityReturnPositionY(GlomoNode *node) {
+
+    return node->position.y;
+}
+
+
+

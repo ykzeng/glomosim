@@ -1,0 +1,82 @@
+Copyright notice:
+----------------
+
+Glomosim is COPYRIGHTED software, and is the intellectual property of
+UCLA. Any entity desiring permission to incorporate this software into
+commercial products or to use it for commercial purposes should contact:
+
+   Professor Rajive Bagrodia
+   University of California, Los Angeles
+   Department of Computer Science
+   Box 951596
+   3532 Boelter Hall
+   Los Angeles, CA 90095-1596
+   rajive@cs.ucla.edu                                  
+
+Except for the TSMA additions (cataloged below), all files included in
+this distribution were not modified in any way. They are delivered in the
+exact form that they were received.
+
+CATSS copyrights apply only to those aspects of Glomosim that have been
+modified and those additions required to implement the Time-Spread
+Multiple-Access (TSMA) protocol.
+
+-------------------
+
+The "classic" version of TSMA has been implemented within UCLA's
+GlomoSim library. Simply put, this version of TSMA works as follows:
+
+    Upon receiving a packet p from the network layer,
+    a node running TSMA will simply transmit p in each 
+    of its assigned slots in a frame, and move on to the 
+    next packet in its queue.
+
+    All packets received from the radio layer are simply
+    passed up to the network layer for processing.
+
+For a more detailed description of TSMA, please refer to the following
+paper:
+
+    Chlamtac, I., Farago, A. "Making Transmission Schedules
+    Immune to Topology Changes in Multi-hop Packet Radio
+    Networks", IEEE/ACM Transactions on Networking, vol. 2,
+    no. 1, Feb. 1994.
+
+Using TSMA in GlomoSim:
+----------------------
+
+1. The included prime number database is limited to the first 170
+   prime numbers. Consequently, the included TSMA code is limited to
+   simulating networks of at most 1000 nodes.
+
+2. In order to simulate TSMA, you must specify the following two 
+   parameters in your configuration file:
+
+    MAC-PROTOCOL   TSMA
+    MAX-NODE-DEGREE  7
+
+The first selects TSMA as the protocol to be simulated. The second
+is a TSMA input parameter representing an upper-bound on the number of
+neighbors a node (Note: Setting this parameter does restrict node 
+movement in any way. It only impacts TSMA frame construction). In
+general, the smaller the degree, the shorter the TSMA frame length.
+
+
+TSMA GlomoSim files:
+-----------------------
+
+A list of new files that were added in the implementation of TSMA:
+
+    1. tsmaparam.c - computes the minimum TSMA parameters (q 
+             and k) necessary for the current number
+             of nodes and specified node degree. Note:
+             will be compiled into binary named
+             tsmaParamGen.
+
+    2. tsmacode.c - computes the TSMA codes for the given q 
+            and k parameters from (1). Note: will be 
+            compiled into binary called tsmaCodeGen.
+
+    3. tsma.h - header file for TSMA protocol.
+
+    4. tsma.pc - contains implementation of TSMA.

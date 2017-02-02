@@ -1,0 +1,199 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: nodes.pc,v 1.20 2001/02/15 03:06:32 mineo Exp $
+ *
+ * Function calls used by driver entity for partitioning
+ * and specifying positions to nodes.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "main.h"
+#include "message.h"
+#include "glomo.h"
+#include "api.h"
+
+#include "driver.h"
+
+
+
+
+int DriverGenerateRandomNodes(GlomoNodePositionInfo *nodeData, int nodeNum,
+                              GlomoCoordinates terrainDimensions,
+                              unsigned short seed[3])
+{
+    int i;
+
+    for (i = 0; i < nodeNum; i++) {
+        nodeData[i].nodeAddr = i;
+        nodeData[i].position.x = pc_erand(seed) * terrainDimensions.x;
+        nodeData[i].position.y = pc_erand(seed) * terrainDimensions.y;
+    }
+
+    return i;
+}
+
+
+int DriverGenerateUniformNodes(GlomoNodePositionInfo *nodeData, int numNodes,
+                               GlomoCoordinates terrainDimensions,
+                               unsigned short seed[3])
+{
+   int i, k;
+
+   double cellEdge  = sqrt((double)(terrainDimensions.x * terrainDimensions.y)
+                           / numNodes);
+
+   // Note you will lose some of the simulation_x range and
+   // the gain some simulation_y range with a partial last
+   // row. 
+
+   int numCellsX = (int)((terrainDimensions.x - 1) / cellEdge) + 1;
+   int numCellsY = ((numNodes-1)/numCellsX) + 1;
+
+   // Change Cell Edge size so that X axis and the Y axis fits
+   // in the terrain range. 
+
+   cellEdge = MIN(((double)terrainDimensions.x / (double)numCellsX),
+                  ((double)terrainDimensions.y / (double)numCellsY));
+   
+   i = 0;
+   for (k = 0; (k < numCellsY) && (i < numNodes); k++) {
+      int j;
+      for (j = 0; (j < numCellsX) && (i < numNodes); j++) {
+         nodeData[i].nodeAddr = i;
+         nodeData[i].position.x = (cellEdge * j) + (pc_erand(seed) * cellEdge);
+         nodeData[i].position.y = (cellEdge * k) + (pc_erand(seed) * cellEdge);
+         i++;
+      }
+   }
+
+   return i;
+}
+
+
+
+
+int DriverGenerateGridNodes(GlomoNodePositionInfo *nodeData, int nodeNum,
+                            int gridUnit,
+                            GlomoCoordinates terrainDimensions)
+{
+    int i, j, k;
+    int half = (int)sqrt((double)nodeNum);
+
+    i = 0;
+    for (k = 0; k < half; k++) {
+        for (j = 0; j < half; j++) {
+            i++;
+            nodeData[j + (k * half)].nodeAddr = j + (k * half);
+            nodeData[j + (k * half)].position.x = (double)(k * gridUnit);
+            nodeData[j + (k * half)].position.y = (double)(j * gridUnit);
+            assert(nodeData[j + (k * half)].position.x < terrainDimensions.x);
+            assert(nodeData[j + (k * half)].position.y < terrainDimensions.y);
+        }
+    }
+
+    if (i != nodeNum) {
+        fprintf(stderr, "GLOMO Error: Currently %d nodes are specified.\n"
+                "For grid topology, the number of specified nodes has to be "
+                "a square of an integer.\n", nodeNum);
+        assert(FALSE);
+    }
+
+    return i;
+}
+
+
+int DriverGenerateInputNodes(GlomoNodePositionInfo *nodeData,
+                             int nodeNum,
+                             GlomoCoordinates terrainDimensions,
+                             GlomoNodeInput *nodeInput)
+{
+    GlomoNodeInput placementInput;
+    BOOL retVal;
+    int  i;
+
+    retVal = GLOMO_ReadCachedFile(nodeInput,
+                                  "NODE-PLACEMENT-FILE",
+                                  &placementInput);
+    if (retVal == FALSE) {
+        fprintf(stderr, "Cannot open NODE-PLACEMENT-FILE.\n");
+        assert(FALSE); abort();
+    }
+
+    for (i = 0; i < placementInput.numLines; i++) {
+        int   nodeAddr;
+        char *stringPtr;
+        GlomoCoordinates position;
+
+        sscanf(placementInput.inputStrings[i],
+               "%d", &nodeAddr);
+
+        //
+        // The following assertion is temporary.
+        // It should be removed once noncontiguous address is supported.
+        assert(nodeAddr < nodeNum);
+
+        stringPtr = strchr(placementInput.inputStrings[i], '(');
+        if (stringPtr == NULL) {
+            char filename[GLOMO_MAX_STRING_LENGTH];
+
+            GLOMO_ReadString(-1, nodeInput, "NODE-PLACEMENT-FILE", filename);
+            fprintf(stderr,
+                    "The following line in '%s' includes no coordinates\n"
+                    "    %s",
+                    filename, placementInput.inputStrings[i]);
+            abort();
+        }
+
+        GLOMO_ConvertToCoordinates(stringPtr, &position);
+
+        assert(position.x <= terrainDimensions.x);
+        assert(position.y <= terrainDimensions.y);
+
+        nodeData[nodeAddr].nodeAddr = nodeAddr;
+        nodeData[nodeAddr].position = position;
+    }
+
+    return i;
+}
+

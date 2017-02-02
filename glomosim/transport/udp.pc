@@ -1,0 +1,241 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: udp.pc,v 1.13 2001/02/16 04:13:31 jmartin Exp $
+ *
+ * File: udp.pc
+ * Author: Teresa Yan (tyan@cs.ucla.edu)
+ * Objective: UDP
+ * Reference: Computer Networks by Tannebaum.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+#include "fileio.h"
+#include "structmsg.h"
+
+#include "ip.h"
+#include "udp.h"
+#include "network.h"
+#include "nwcommon.h"
+
+/*
+ * FUNCTION    TransportUpdInit
+ * PURPOSE     Initialization function for UDP.
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+void
+TransportUdpInit(GlomoNode *node, const GlomoNodeInput *nodeInput)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    BOOL retVal;
+    GlomoTransportUdp* udp = 
+       (GlomoTransportUdp*)checked_pc_malloc(sizeof(GlomoTransportUdp));
+    
+    node->transportData.udp = udp;
+    
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "UDP-STATISTICS", buf);
+    assert(retVal == TRUE);
+
+    if (strcmp(buf, "YES") == 0) {
+        udp->udpStatsEnabled = TRUE;
+    }
+    else if (strcmp(buf, "NO") == 0) {
+        udp->udpStatsEnabled = FALSE;
+    }
+    else {
+        fprintf (stderr, "TRANSPORT unknown (%s) for UDP-STATISTICS.\n",
+                 buf);
+        assert(FALSE);
+    }
+
+    if (udp->udpStatsEnabled == TRUE) {
+        udp->statistics = (TransportUdpStat *) pc_malloc
+                                               (sizeof(TransportUdpStat));
+        if (udp->statistics == NULL) {
+            fprintf(stderr, "TRANSPORT UDP: cannot allocate memory\n");
+            assert(FALSE);
+        }
+        memset(udp->statistics, 0, sizeof(TransportUdpStat));
+    }
+
+}
+
+
+
+
+/*
+ * FUNCTION    TransportUdpFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of
+ *             the simulation of the UDP protocol of Transport Layer.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+void TransportUdpFinalize(GlomoNode *node)
+{
+    char buf[200];
+    FILE *stat = NULL;
+    GlomoTransportUdp* udp = node->transportData.udp;
+    TransportUdpStat* st =  udp->statistics;
+    
+    
+    if (udp->udpStatsEnabled == TRUE) {
+   
+        sprintf (buf, "Number of pkts from application %d.", 
+                       st->numPktFromApp);
+        GLOMO_PrintStat(node, "TransportUdp", buf);
+        sprintf (buf, "Number of pkts to application %d.",
+                       st->numPktToApp);
+        GLOMO_PrintStat(node, "TransportUdp", buf);               
+    }
+}
+
+
+
+/*
+ * FUNCTION    TransportUdpLayer. 
+ * PURPOSE     Models the behaviour of UDP on receiving the
+ *             message encapsulated in msgHdr
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:   message received by the layer
+ */
+void TransportUdpLayer(GlomoNode *node,  Message *msg)
+{
+    /*
+     * Retrieve the pointer to the data portion which relates
+     * to the TCP protocol.
+     */
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+
+    switch (msg->eventType) {
+    case MSG_TRANSPORT_FromNetwork: 
+        {
+            TransportUdpSendToApp(node, msg);
+            break;
+        }
+    case MSG_TRANSPORT_FromAppSend:
+        {
+            TransportUdpSendToNetwork(node, msg);
+            break; 
+        }
+    default:
+        assert(FALSE);
+    }
+}
+
+
+
+
+void TransportUdpSendToApp(GlomoNode *node, Message *msg) 
+{
+    GlomoTransportUdp* udpLayer = node->transportData.udp;
+   
+    TransportUdpHeader* udpHdr = (TransportUdpHeader *) msg->packet;
+    NODE_ADDR sourceAddress = ((NetworkToTransportInfo *)msg->info)->sourceAddr;
+    NODE_ADDR destinationAddress = 
+       ((NetworkToTransportInfo *)msg->info)->destinationAddr;
+    UdpToAppRecv *info;
+    
+    /* should receive message with ip and udp headers,
+     * remove ip header
+     */
+    /* save these two fields before remove ip header */
+         
+    if (udpLayer->udpStatsEnabled == TRUE) {
+       udpLayer->statistics->numPktToApp++;
+    }
+
+    GLOMO_MsgSetLayer(msg, GLOMO_APP_LAYER, udpHdr->destPort);
+    GLOMO_MsgSetEvent(msg, MSG_APP_FromTransport);
+    GLOMO_MsgInfoAlloc(node, msg, sizeof(UdpToAppRecv));
+
+    /* info field to send to application */
+    info = (UdpToAppRecv *) msg->info;
+
+    info->sourceAddr = sourceAddress;
+    info->sourcePort = udpHdr->sourcePort;
+    info->destAddr = destinationAddress;
+    info->destPort = udpHdr->destPort;
+
+    /* remove udp header */
+    GLOMO_MsgRemoveHeader(node, msg, sizeof(TransportUdpHeader));
+    GLOMO_MsgSend (node, msg, TRANSPORT_DELAY);
+}
+
+
+
+
+void TransportUdpSendToNetwork(GlomoNode *node, Message *msg)
+{
+
+    GlomoTransportUdp* udp = node->transportData.udp;
+    int appLayer;
+    TransportUdpHeader *udpHdr;
+    AppToUdpSend *info;
+
+   
+    if (udp->udpStatsEnabled == TRUE) {
+       udp->statistics->numPktFromApp++;
+    }
+
+    GLOMO_MsgAddHeader(node, msg, sizeof(TransportUdpHeader));
+    udpHdr = (TransportUdpHeader *) msg->packet;
+    info = (AppToUdpSend *) msg->info;
+
+    udpHdr->sourcePort = info->sourcePort;
+    udpHdr->destPort = info->destPort;
+    udpHdr->length = msg->packetSize;
+    udpHdr->checksum = 0;      /* not doing checksum */
+
+    NetworkIpReceivePacketFromTransportLayer(node, msg, info->destAddr,
+                                             info->priority, 
+                                             IPPROTO_UDP, TRANSPORT_DELAY);
+}
+

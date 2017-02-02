@@ -1,0 +1,749 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: application.pc,v 1.45 2001/02/15 03:17:26 mineo Exp $
+ *
+ * This file contains initialization function, message processing
+ * function, and finalize function used by application layer. 
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "fileio.h"
+#include "main.h"
+#include "message.h"
+
+#include "application.h"
+#include "ftp_client.h"
+#include "ftp_server.h"
+#include "telnet_client.h"
+#include "telnet_server.h"
+#ifdef NSTELNET_STUFF
+#include "nstelnet_client.h"
+#include "nstelnet_server.h"
+#endif
+#include "cbr_client.h"
+#include "cbr_server.h"
+#include "gen_ftp_server.h"
+#include "gen_ftp_client.h"
+#include "http_server.h"
+#include "http_client.h"
+
+#include "bellmanford.h"
+#include "wrp.h"
+#include "nsdsdv.h"
+#include "static_routing.h"
+#include "fisheye.h"
+
+
+//#include "rumorsim/include/Limit.h"
+
+//extern void AppRumorInit(GlomoNode *nodePtr, const GlomoNodeInput *);
+//extern void AppLayerRumor(GlomoNode *node, Message *msg);
+
+#define noDEBUG
+
+/*
+ * NAME:        GLOMO_AppInit.
+ * PURPOSE:     start applications on nodes according to user's 
+ *              specification. 
+ * PARAMETERS:  node - pointer to the node, 
+ *              nodeInput - configuration information.
+ * RETURN:      none. 
+ */
+void
+GLOMO_AppInit(GlomoNode *node, const GlomoNodeInput *nodeInput)
+{
+    BOOL retVal;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+          
+    /* 
+     * Initialize application layer information.
+     * note that the starting ephemeral port number is 1024. 
+     */
+    node->appData.appPtr = NULL;
+    node->appData.nextPortNum = 1024; 
+    node->appData.numAppTcpFailure = 0;
+
+    /*
+     * Check if statistics needs to be printed.
+     */
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, 
+                              "APPLICATION-STATISTICS", buf);
+
+    if ((retVal == FALSE) || (strcmp(buf, "NO") == 0)) {
+        node->appData.appStats = FALSE;    
+    }
+    else if (strcmp(buf, "YES") == 0) {
+        node->appData.appStats = TRUE;    
+    }
+    else {
+        fprintf(stderr, "APPLICATION-STATISTICS not specified in input file.",
+                buf);
+        assert(FALSE);
+    }
+
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, 
+                              "ROUTING-STATISTICS", buf);
+
+    if (retVal == FALSE) {
+        fprintf(stderr, "ROUTING-STATISTICS not specified in input file.\n");
+        assert(FALSE);
+    }
+
+    if (strcmp(buf, "YES") == 0) {
+        node->appData.routingStats = TRUE;
+    }
+    else if (strcmp(buf, "NO") == 0) {
+        node->appData.routingStats = FALSE;
+    }
+    else {
+        fprintf(stderr, "ROUTING-STATISTICS has unknown value %s.", buf);
+        assert(FALSE);
+    }
+
+    /*
+     * Initialize which routing protocol to use.
+     */
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, 
+                              "ROUTING-PROTOCOL", buf);
+
+    if (retVal == FALSE) {
+        fprintf(stderr,"ROUTING-PROTOCOL not specified in input file.\n");
+        assert(FALSE);
+    }
+
+    if (strcmp(buf, "BELLMANFORD") == 0) {
+        node->appData.routingProtocol = APP_ROUTING_BELLMANFORD; 
+        RoutingBellmanfordInit(node); 
+    }
+    else if (strcmp(buf, "OSPF") == 0) {
+        // Protocol is at routing layer.
+    }
+    else if (strcmp(buf, "WRP") == 0) {
+        node->appData.routingProtocol = APP_ROUTING_WRP;
+        RoutingWrpInit(node, nodeInput);
+    }
+    else if (strcmp(buf, "FISHEYE") == 0) {
+        node->appData.routingProtocol = ROUTING_PROTOCOL_FISHEYE;
+        RoutingFisheyeInit(node, nodeInput);
+    }
+    else if (strcmp(buf, "NS_DSDV") == 0) {
+        node->appData.routingProtocol = APP_ROUTING_NS_DSDV;
+        RoutingNsDsdvInit(node);
+    }
+    
+    else if (strcmp(buf, "STATIC") == 0) {
+        node->appData.routingProtocol = APP_ROUTING_STATIC;
+        RoutingStaticInit(node, nodeInput);
+    }
+    else if (strcmp(buf, "LAR1") == 0) {
+        // Fine, because Lar is at the Network Level
+    }
+    else if (strcmp(buf, "AODV") == 0) {
+    }
+    else if (strcmp(buf, "DSR") == 0) {
+    }
+    else if (strcmp(buf, "ODMRP") == 0) {
+    }
+    else if (strcmp(buf, "ZRP") == 0) {
+    }
+    else {
+        assert(FALSE);
+    }
+
+    /* Setting up applications. */
+    
+    GLOMO_AppInitApplications(node, nodeInput);
+    
+    AppLayerInitUserApplications(
+       node, nodeInput, &node->appData.userApplicationData);
+
+}
+
+
+
+/*
+ * NAME:        GLOMO_AppInitApplications.
+ * PURPOSE:     start applications on nodes according to user's
+ *              specification.
+ * PARAMETERS:  node - pointer to the node,
+ *              nodeInput - configuration information.
+ * RETURN:      none.
+ */
+void GLOMO_AppInitApplications(GlomoNode *node,
+                               const GlomoNodeInput *nodeInput)
+{
+    GlomoNodeInput appInput;
+    char appStr[GLOMO_MAX_STRING_LENGTH];
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    char *tempStr;
+    BOOL retVal;
+    int  i;
+    
+    retVal = GLOMO_ReadCachedFile(nodeInput, "APP-CONFIG-FILE", &appInput);
+    if (retVal == FALSE) {
+        fprintf(stderr, "Application: Needs APP-CONFIG-FILE.\n");
+        assert(FALSE); abort();
+    }
+
+    node->appData.uniqueId = 0;
+
+    for (i = 0; i < appInput.numLines; i++) {
+        sscanf(appInput.inputStrings[i], "%s", appStr);
+
+        #ifdef DEBUG
+            printf("Application type is %s\n", appStr);
+        #endif
+
+        if (strcmp(appStr, "FTP") == 0) {
+            NODE_ADDR sourceAddr, destAddr;
+            int itemSize;
+            int itemsToSend;
+            clocktype startTime;
+            char startTimeStr[GLOMO_MAX_STRING_LENGTH];
+
+            retVal = sscanf(appInput.inputStrings[i],
+                            "%s %d %d %d %s",
+                            appStr,
+                            &sourceAddr,
+                            &destAddr,
+                            &itemsToSend,
+                            startTimeStr);
+
+            if (retVal != 5) {
+                fprintf(stderr,
+                        "Wrong FTP configuration format!\n"
+                        "FTP <src> <dest> <items to send> <start time>\n");
+                assert(0); abort();
+            }
+
+            if (node->nodeAddr == sourceAddr) {
+                startTime = GLOMO_ConvertToClock(startTimeStr);
+
+                #ifdef DEBUG
+                    printf("Starting FTP client with:\n");
+                    printf(" source: %u\n", node->nodeAddr);
+                    printf(" destination: %u\n", destAddr);
+                    printf(" items to send: %d\n", itemsToSend);
+
+                    ctoa(startTime, clockStr);
+                    printf(" start time string: %s\n", clockStr);
+                #endif
+
+                AppFtpClientInit(node, destAddr, itemsToSend, startTime);
+            }
+            else if (node->nodeAddr == destAddr) {
+                AppFtpServerInit(node);
+            }
+        }
+        else if (strcmp(appStr, "FTP/GENERIC") == 0) {
+            NODE_ADDR sourceAddr, destAddr;
+            int itemsToSend, itemSize;
+            clocktype startTime, endTime;
+            char startTimeStr[GLOMO_MAX_STRING_LENGTH];
+            char endTimeStr[GLOMO_MAX_STRING_LENGTH];
+
+            retVal = sscanf(appInput.inputStrings[i],
+                            "%s %ld %ld %ld %ld %s %s",
+                            appStr, &sourceAddr, &destAddr,
+                            &itemsToSend, &itemSize,
+                            startTimeStr, endTimeStr);
+
+            if (retVal != 7) {
+                fprintf(stderr,
+                        "Wrong FTP/GENERIC configuration format!\n"
+                        "FTP/GENERIC <src> <dest> <items to send> "
+                        "<item size> <start time> <end time>\n");
+                assert(0); abort();
+            }
+
+            if (sourceAddr == destAddr) {
+                fprintf(stderr,
+                        "Application: FTP/GENERIC configuration "
+                        "has same source/dest (node %ld) pair!\n", sourceAddr);
+                assert(0); abort();
+            }
+
+            if (node->nodeAddr == sourceAddr) {
+                startTime = GLOMO_ConvertToClock(startTimeStr);
+                endTime = GLOMO_ConvertToClock(endTimeStr);
+
+                #ifdef DEBUG
+                    printf("Starting FTP client with:\n");
+                    printf(" source: %u\n", node->nodeAddr);
+                    printf(" destination: %u\n", destAddr);
+                    printf(" items to send: %ld\n", itemsToSend);
+
+                    ctoa(startTime, clockStr);
+                    printf(" start time: %s\n", clockStr);
+                    ctoa(endTime, clockStr);
+                    printf(" end time: %s\n", clockStr);
+                #endif
+
+                AppGenFtpClientInit(node, destAddr, itemsToSend, itemSize,
+                                    startTime, endTime);
+            }
+            else if (node->nodeAddr == destAddr) {
+                AppGenFtpServerInit(node);
+            }
+        }
+        else if (strcmp(appStr, "TELNET") == 0) {
+            NODE_ADDR sourceAddr, destAddr;
+            char startTimeStr[GLOMO_MAX_STRING_LENGTH];
+            char sessDurationStr[GLOMO_MAX_STRING_LENGTH];
+            clocktype startTime, sessDuration;
+
+            retVal = sscanf(appInput.inputStrings[i],
+                            "%s %ld %ld %s %s",
+                            appStr, &sourceAddr, &destAddr,
+                            sessDurationStr, startTimeStr);
+
+            if (retVal != 5) {
+                fprintf(stderr,
+                        "Wrong TELNET configuration format!\n"
+                        "TELNET <src> <dest> <session duration> "
+                        "<start time>\n");
+                assert(0); abort();
+            }
+
+            if (sourceAddr == destAddr) {
+                fprintf(stderr, "Application: TELNET configuration "
+                        "has same source/dest (node %ld) pair!\n", sourceAddr);
+                assert(0); abort();
+            }
+
+            if (node->nodeAddr == sourceAddr) {
+                startTime = GLOMO_ConvertToClock(startTimeStr);
+                sessDuration = GLOMO_ConvertToClock(sessDurationStr);
+
+                #ifdef DEBUG
+                    printf("Starting TELNET client with:\n");
+                    printf(" source: %u\n", node->nodeAddr);
+                    printf(" destination: %u\n", destAddr);
+
+                    ctoa(sessDuration, clockStr);
+                    printf(" session duration: %s\n", clockStr);
+
+                    ctoa(startTime, clockStr);
+                    printf(" start time: %s\n", clockStr);
+                #endif
+
+                AppTelnetClientInit(node, destAddr, sessDuration, startTime);
+            }
+            else if (node->nodeAddr == destAddr) {
+                AppTelnetServerInit(node);
+            }
+        }
+#ifdef NSTELNET_STUFF
+        else if (strcmp(appStr, "NSTELNET") == 0) {
+            char sessDurationStr[GLOMO_MAX_STRING_LENGTH];
+            char startTimeStr[GLOMO_MAX_STRING_LENGTH];
+            NODE_ADDR sourceAddr, destAddr;
+            short     sourcePort, destPort;
+            clocktype startTime, sessDuration;
+            int itemsToSend;
+            int connId;
+             
+            /* For every NSTELNET entry in the app config file, call 
+             *  AppNsTelnetClientInit and AppNsTelnetServerInit
+             */
+            retVal = sscanf(appInput.inputStrings[i],
+                            "%s %ld %ld %s %s %u %hu %hu", 
+                            appStr, &sourceAddr, &destAddr,
+                            sessDurationStr, startTimeStr,
+                            &connId, &sourcePort, &destPort);
+
+            if (retVal != 8) {
+                fprintf(stderr, "Application: Wrong configuration format!\n"
+                assert(0); abort();
+            }
+
+            if (node->nodeAddr == sourceAddr || node->nodeAddr == destAddr) {
+                startTime = GLOMO_ConvertToClock(startTimeStr);
+                sessDuration = GLOMO_ConvertToClock(sessDurationStr);
+
+#ifdef DEBUG
+                if (node->nodeAddr == sourceAddr) {
+                    printf("Starting NSTELNET client with:\n");
+                }
+                else {
+                    printf("Starting NSTELNET server with:\n");
+                }
+                printf(" source address: %u\n", node->nodeAddr);
+                printf(" source port: %u\n", sourcePort);
+                printf(" destination address: %u\n", destAddr);
+                printf(" destination port: %u\n", destPort);
+                printf(" connection id: %u\n", connId);
+                
+                ctoa(sessDuration, clockStr);
+                printf(" session duration: %s\n", clockStr);
+                
+                ctoa(startTime, clockStr);
+                printf(" start time: %s\n", clockStr);
+#endif
+                node->appData.telnetSessTime = sessDuration;
+                
+                if (node->nodeAddr == sourceAddr) {
+                    AppNstelnetClientInit(node, sourcePort, destAddr, destPort,
+                                          connId, startTime);
+                }
+                else {
+                    AppNstelnetServerInit(node, destPort, sourceAddr, 
+                                          sourcePort, connId, startTime);
+                }
+            }
+        }
+#endif
+        else if (strcmp(appStr, "CBR") == 0) {
+            NODE_ADDR sourceAddr, destAddr;
+            int itemsToSend, itemSize;
+            char intervalStr[GLOMO_MAX_STRING_LENGTH];
+            char startTimeStr[GLOMO_MAX_STRING_LENGTH];
+            char endTimeStr[GLOMO_MAX_STRING_LENGTH];
+
+            retVal = sscanf(appInput.inputStrings[i],
+                            "%s %ld %ld %ld %ld %s %s %s",
+                            appStr, &sourceAddr, &destAddr,
+                            &itemsToSend, &itemSize,
+                            intervalStr, startTimeStr, endTimeStr);
+
+            if (retVal != 8) {
+                fprintf(stderr,
+                        "Wrong CBR configuration format!\n"
+                        "CBR <src> <dest> <items to send> <item size> "
+                        "<interval> <start time> <end time>\n");
+                assert(0); abort();
+            }
+
+            if (sourceAddr == destAddr) {
+                fprintf(stderr, "Application: CBR configuration "
+                        "has same source/dest (node %ld) pair!\n", sourceAddr);
+                assert(0); abort();
+            }
+
+            if (node->nodeAddr == sourceAddr) {
+                clocktype startTime, endTime, interval;
+                startTime = GLOMO_ConvertToClock(startTimeStr);
+                endTime = GLOMO_ConvertToClock(endTimeStr);
+                interval = GLOMO_ConvertToClock(intervalStr);
+
+                #ifdef DEBUG
+                    printf("Starting CBR client with:\n");
+                    printf(" source: %u\n", node->nodeAddr);
+                    printf(" destination: %u\n", destAddr);
+
+                    printf(" items to send: %ld\n", itemsToSend);
+                    printf(" item size: %ld\n", itemSize);
+
+                    ctoa(interval, clockStr);
+                    printf(" interval: %s\n", clockStr);
+
+                    ctoa(startTime, clockStr);
+                    printf(" start time: %s\n", clockStr);
+
+                    ctoa(endTime, clockStr);
+                    printf("  end time: %s\n", clockStr);
+                #endif
+
+                AppCbrClientInit(node, destAddr, itemsToSend, itemSize,
+                                 interval, startTime, endTime);
+            }
+            else if (node->nodeAddr == destAddr) {
+                AppCbrServerInit(node);
+            }
+        }
+        // else if (strcmp(appStr, "RUMOR") == 0) {
+        //    if (node->nodeAddr < NSERVER) {
+        //        AppRumorInit(node, nodeInput);
+        //    }
+        //}
+        else if (strcmp(appStr, "HTTP") == 0) {
+            NODE_ADDR clientAddr;
+            NODE_ADDR *serverAddrs;
+            long numServerAddrs;
+            long count;
+            long itemsToSend, itemSize;
+            char threshStr[GLOMO_MAX_STRING_LENGTH];
+            char startTimeStr[GLOMO_MAX_STRING_LENGTH];
+
+            tempStr = appInput.inputStrings[i] + 4;
+/*
+            retVal = sscanf(tempStr, "%ld%ld",
+                            &clientAddr, &numServerAddrs);
+            assert (retVal == 2);
+*/
+            retVal = sscanf(tempStr, "%s", clockStr);
+            tempStr += strlen(clockStr) + 1;
+            clientAddr = atol(clockStr);
+            retVal = sscanf(tempStr, "%s", clockStr);
+            numServerAddrs = atol(clockStr);
+            tempStr += strlen(clockStr) + 1;
+            assert (numServerAddrs > 0);
+            serverAddrs =
+                checked_pc_malloc(sizeof(NODE_ADDR) * numServerAddrs);
+            for (count = 0; count < numServerAddrs; count++)
+            {
+                retVal = sscanf(tempStr, "%s", clockStr);
+                assert (retVal == 1);
+                serverAddrs[count] = atol(clockStr);
+                tempStr += strlen(clockStr) + 1;
+            }
+            retVal = sscanf(tempStr, "%s%s", startTimeStr, threshStr);
+            assert (retVal == 2);
+            if (node->nodeAddr == clientAddr)
+            {
+                clocktype threshTime,
+                          startTime;
+                threshTime = GLOMO_ConvertToClock(threshStr);
+                startTime = GLOMO_ConvertToClock(startTimeStr);
+
+#ifdef DEBUG
+                printf("#%ld HTTP %ld servers: ", clientAddr, numServerAddrs);
+                for (count = 0; count < numServerAddrs; count++)
+                    printf("%ld ", serverAddrs[count]);
+                printf("\n");
+#endif
+                AppHttpClientInit(node, serverAddrs, numServerAddrs,
+                                  startTime, threshTime);
+            }
+        }
+        else if (strcmp(appStr, "HTTPD") == 0) {
+            NODE_ADDR serverAddr;
+
+            tempStr = appInput.inputStrings[i] + 5;
+            retVal = sscanf(tempStr, "%s", clockStr);
+            serverAddr = atol(clockStr);
+
+            assert(retVal == 1);
+
+            if (serverAddr == node->nodeAddr)
+                AppHttpServerInit(node);
+        }
+        else {
+            printf("Application: Unknown application %s\n", appStr);
+            assert(0); abort();
+        }
+    }
+}
+
+
+/*
+ * NAME:        GLOMO_AppLayer.
+ * PURPOSE:     call proper protocol to process messages. 
+ * PARAMETERS:  node - pointer to the node, 
+ *              msg - pointer to the received message.
+ * RETURN:      none. 
+ */
+void GLOMO_AppLayer(GlomoNode *node, Message *msg)
+{
+    switch(GLOMO_MsgGetProtocol(msg)) {
+    case APP_ROUTING_BELLMANFORD:
+        RoutingBellmanfordLayer(node, msg);
+        break;
+    case APP_ROUTING_WRP:
+        RoutingWrpLayer(node, msg);
+        break;
+    case ROUTING_PROTOCOL_FISHEYE:
+        RoutingFisheyeLayer(node,msg);
+        break;
+    case APP_ROUTING_NS_DSDV:            
+        RoutingNsDsdvLayer(node, msg);
+        break;
+    case APP_ROUTING_STATIC:
+        RoutingStaticLayer(node, msg);
+        break;
+#ifdef NSTELNET_STUFF
+    case APP_NSTELNET_CLIENT:
+        AppLayerNstelnetClient(node, msg);
+        break;
+#endif
+    case APP_TELNET_CLIENT:
+        AppLayerTelnetClient(node, msg);
+        break;
+    case APP_TELNET_SERVER:
+        AppLayerTelnetServer(node, msg);
+        break;
+    case APP_FTP_CLIENT:
+        AppLayerFtpClient(node, msg);
+        break;
+    case APP_FTP_SERVER:
+        AppLayerFtpServer(node, msg);
+        break;
+    case APP_GEN_FTP_CLIENT:
+        AppLayerGenFtpClient(node, msg);
+        break;
+    case APP_GEN_FTP_SERVER:
+        AppLayerGenFtpServer(node, msg);
+        break;
+    case APP_CBR_CLIENT:
+        AppLayerCbrClient(node, msg);
+        break;
+    case APP_CBR_SERVER:
+        AppLayerCbrServer(node, msg);
+        break;
+    case APP_HTTP_CLIENT:
+        AppLayerHttpClient(node, msg);
+        break;
+    case APP_HTTP_SERVER:
+        AppLayerHttpServer(node, msg);
+        break;
+    //case APP_RUMOR:
+    //    AppLayerRumor(node, msg);
+    //    break;
+    default:
+        AppLayerHandleUserAppEvent(
+            node, node->appData.userApplicationData, msg);
+        break;
+    }
+}
+
+
+/*
+ * NAME:        GLOMO_AppFinalize.
+ * PURPOSE:     call protocols to print statistics. 
+ * PARAMETERS:  node - pointer to the node, 
+ * RETURN:      none. 
+ */
+void 
+GLOMO_AppFinalize(GlomoNode *node)
+{
+    AppInfo *appList = NULL;
+    AppInfo *nextApp = NULL;
+
+    switch(node->appData.routingProtocol)  
+    {
+        case APP_ROUTING_BELLMANFORD:
+            RoutingBellmanfordFinalize(node);
+            break;
+
+        case APP_ROUTING_WRP:
+            RoutingWrpFinalize(node);
+            break;
+
+        case ROUTING_PROTOCOL_FISHEYE:
+            RoutingFisheyeFinalize(node);
+            break;
+            
+        case APP_ROUTING_NS_DSDV:
+            RoutingNsDsdvFinalize(node);
+            break;
+
+        case APP_ROUTING_STATIC:
+            RoutingStaticFinalize(node);
+            break;
+
+        default: 
+            break;
+    }
+
+    for (appList = node->appData.appPtr; appList != NULL; appList = nextApp) {
+        /*
+         * Get application specific data structure and call
+         * the corresponding protocol to print the stats.
+         */ 
+        switch (appList->appType) 
+        {
+            case APP_TELNET_CLIENT:
+                AppTelnetClientFinalize(node, (GlomoAppTelnetClient *) 
+                                        appList->appDetail);
+                break;
+
+            case APP_TELNET_SERVER:
+                AppTelnetServerFinalize(node, (GlomoAppTelnetServer *) 
+                                        appList->appDetail);
+                break;
+        
+            case APP_NSTELNET_CLIENT:
+                break;
+        
+            case APP_FTP_CLIENT:
+                AppFtpClientFinalize(node, (GlomoAppFtpClient *) 
+                                     appList->appDetail);
+                break;
+
+            case APP_FTP_SERVER:
+                AppFtpServerFinalize(node, (GlomoAppFtpServer *) 
+                                     appList->appDetail);
+                break;
+
+            case APP_GEN_FTP_CLIENT:
+                AppGenFtpClientFinalize(node, (GlomoAppGenFtpClient *)
+                                        appList->appDetail);
+                break;
+
+            case APP_GEN_FTP_SERVER:
+                AppGenFtpServerFinalize(node, (GlomoAppGenFtpServer *)
+                                        appList->appDetail);
+                break;
+
+            case APP_CBR_CLIENT:
+                AppCbrClientFinalize(node, (GlomoAppCbrClient *)
+                                     appList->appDetail);
+                break;
+
+            case APP_CBR_SERVER:
+                AppCbrServerFinalize(node, (GlomoAppCbrServer *)
+                                     appList->appDetail);
+                break;
+
+            case APP_HTTP_CLIENT:
+                AppHttpClientFinalize(node, (GlomoAppHttpClient *)
+                                      appList->appDetail);
+                break;
+            case APP_HTTP_SERVER:
+                AppHttpServerFinalize(node, (GlomoAppHttpServer *)
+                                      appList->appDetail);
+                break;
+
+            //case APP_RUMOR:
+            //     break;
+
+        }
+
+        nextApp = appList->appNext;
+        free(appList);
+    }
+    
+    AppLayerFinalizeUserApps(node, node->appData.userApplicationData);
+}
+

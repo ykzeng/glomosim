@@ -1,0 +1,805 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: glomo.pc,v 1.79 2001/04/14 03:35:12 jmartin Exp $
+ *
+ * Definition of entity which represents a partition in the simulation.
+ */
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+#include <limits.h>
+
+#include "main.h"
+#include "api.h"
+#include "fileio.h"
+
+#include "message.h"
+#include "splaytree.h"
+#include "driver.h"
+#include "structmsg.h"
+#include "glomo.h"
+#include "queue.h"
+#include "mobility.h"
+#include "propagation.h"
+#include "../mac/802_11.h"
+#include "../mac/wiredlink.h"
+
+#ifdef _WIN32
+  #include <sys\timeb.h>
+  static double RealTimeSecs() {
+      struct _timeb timerec;
+      _ftime(&timerec);
+      return ((double)(timerec.time) + ((double)(timerec.millitm)/1000.0));
+  }
+#else
+  #include <sys/time.h>
+  static double RealTimeSecs() {
+      struct timeval  Tp;
+      int rc = gettimeofday(&Tp,0);  assert((rc==0));
+      return ((double)(Tp.tv_sec) + ((double)(Tp.tv_usec) / 1000000.0));
+  }
+#endif
+
+static
+void FindNearestPositions(GlomoAreaNearestInfo *areaNearest,
+                          GlomoAreaInfo       **area,
+                          int numPartitionsX, int numPartitionsY,
+                          int x, int y);
+
+static GlomoNode *GLOMO_GetNodeData(GlomoNode *node, Message *msg);
+
+
+/*
+ * The definition for the partition entity. The following are the major
+ * steps performed in this program.
+ * 1] Receive information from driver entity.
+ * 2] Find out nodes which belong to this partition and initialize them.
+ * 3] Go into an infinite loop trying to receive messages. When message
+ *    is received call the appropriate node and layer.
+ * 4] When the simulation ends, go to the finalize code. This code will
+ *    call the Finalize function for all the layers of all the nodes in
+ *    this partition. We can thus collect any needed statistics.
+ */
+entity GLOMOPartition(int partitionId, ename creator) {
+    int    i;
+    int    numNodes;               /* number of nodes in simulation */
+    int    numPartitions;
+    char    buf[10];
+    double  StartRealTime = RealTimeSecs();
+    clocktype NextSimtimePrintTime = 0;
+    int NumMobilityEventsOnNextClockTick = 0;
+
+    unsigned short seedVal;         /* seed value supplied by creator */
+    GlomoNodeInput  nodeInput;
+    GlomoPartition *partitionData;
+    
+    /*
+     * Allocate space for partition information
+     */
+    partitionData =
+        (GlomoPartition *)checked_pc_malloc(sizeof(GlomoPartition));
+    memset(partitionData, 0, sizeof(GlomoPartition));
+    partitionData->partitionId = partitionId;
+    
+    
+                                  
+    /* mobility events currently do not exist */
+    partitionData->mobilityInternal.minTime = CLOCKTYPE_MAX;
+    partitionData->mobilityOutgoing.minTime = CLOCKTYPE_MAX;
+
+    /* file where stats will be stored for this partition */
+    sprintf(buf, ".STAT.%d", partitionId);
+    partitionData->statFd = fopen(buf, "w");
+    assert(partitionData->statFd != NULL);
+
+    add_source(creator);
+    add_dest(creator);
+
+    receive (PartitionInfoMsg partitionMsg) {
+        int x = partitionMsg.indexX;
+        int y = partitionMsg.indexY;
+        GlomoAreaInfo **area = partitionMsg.area;
+        int i, j;
+
+        partitionData->indexX = x;
+        partitionData->indexY = y;
+        partitionData->area = area;
+        partitionData->areaNearest = NULL;
+        
+        partitionData->terrainDimensions = partitionMsg.terrainDimensions;
+
+        partitionData->numPartitionsX = partitionMsg.numPartitionsX;
+        partitionData->numPartitionsY = partitionMsg.numPartitionsY;
+        numPartitions
+            = partitionData->numPartitionsX * partitionData->numPartitionsY;
+
+        for (j = 0; j < partitionData->numPartitionsY; j++) {
+            for (i = 0; i < partitionData->numPartitionsX; i++) {
+                if (((i != x) || (j != y)) &&
+                    (abs(i-x) <= partitionMsg.partitionConnectivityDistance) &&
+                    (abs(j-y) <= partitionMsg.partitionConnectivityDistance))
+                {
+                    add_source(area[i][j].partitionEname);
+                    add_dest(area[i][j].partitionEname);
+                }
+            }
+        }
+
+        seedVal = partitionMsg.seedVal;
+        numNodes = partitionMsg.numNodes;
+        
+        partitionData->nodeData
+            = (GlomoNode **)checked_pc_malloc(sizeof(GlomoNode *) * numNodes);
+        memset(partitionData->nodeData, 0, sizeof(GlomoNode *) * numNodes);
+
+        nodeInput = partitionMsg.nodeInput;
+    }
+    
+    
+
+ 
+    /*
+     * Receive source set and destination set information.
+     * Also receive information about Nodes represented by
+     * this entity. Break out of the loop once we receive
+     * NodeInfoFinish message.
+     */
+
+
+    while (TRUE) {
+        receive (NeighborInfoMsg nMsg) {
+            
+        }
+        /*
+         * All the information about the neighbors has been received.
+         * Get information about the node data structure.
+         */
+        or receive (NodePositionMsg nodePosMsg) {
+            GlomoNode *nextNode = NULL;     /* temporary pointer to node */
+            GlomoNodePositionInfo *nodePos;
+
+            partitionData->nodePositions
+                = (GlomoNodePositionInfo *)nodePosMsg.nodePos;
+            nodePos = partitionData->nodePositions;
+
+            /*
+             * Information about the nodes has been set by the driver entity.
+             * Go through all nodes to figure out which nodes belong to
+             * this entity
+             */
+            for (i = 0; i < numNodes; i++) {
+                
+                {
+                    int j;
+
+                    partitionData->nodeData[i] =
+                                (GlomoNode *) pc_malloc(sizeof(GlomoNode));
+                    assert(partitionData->nodeData[i] != NULL);
+                    memset(partitionData->nodeData[i], 0, sizeof(GlomoNode));
+
+                    partitionData->nodeData[i]->id = i;
+                    partitionData->nodeData[i]->numNodes = numNodes;
+                    partitionData->nodeData[i]->nodeAddr = nodePos[i].nodeAddr;
+                    partitionData->nodeData[i]->numberInterfaces = 0;
+                    /*
+                     * Set the seed of the node
+                     */
+                    partitionData->nodeData[i]->seed[2] =
+                                (unsigned short) ((i + 1) % (USHRT_MAX + 1));
+                    partitionData->nodeData[i]->seed[0] =
+                                (unsigned short) ((i + 1) / (USHRT_MAX + 1));
+                    partitionData->nodeData[i]->seed[1] = seedVal;
+                    
+                    partitionData->nodeData[i]->initialSeedValue[0] = 
+                       partitionData->nodeData[i]->seed[0];
+                    partitionData->nodeData[i]->initialSeedValue[1] =
+                       partitionData->nodeData[i]->seed[1];
+                    partitionData->nodeData[i]->initialSeedValue[2] = 
+                       partitionData->nodeData[i]->seed[2];
+                   
+
+                    /*
+                     * Set the neighborData and nodeData variables
+                     * needed by the channel layer.
+                     */
+                    partitionData->nodeData[i]->position = nodePos[i].position;
+                    partitionData->nodeData[i]->partitionData = partitionData;
+
+                    GLOMO_HeapSplayInsert(&(partitionData->heapSplayTree),
+                                          partitionData->nodeData[i]);
+
+                    
+                    
+                    /*
+                     * If firstNode is currently NULL, make this Node
+                     * the firstNode.
+                     */
+                    if (partitionData->firstNode == NULL) {
+                        partitionData->firstNode = partitionData->nodeData[i];
+                        partitionData->firstNode->prevNodeData = NULL;
+                        partitionData->firstNode->nextNodeData = NULL;
+                    }
+                    else {
+                        /*
+                         * We encountered a node previously.
+                         * Update the prevNodeData and nextNodeData
+                         * fields.
+                         */
+                        assert(nextNode != NULL);
+                        partitionData->nodeData[i]->prevNodeData = nextNode;
+                        nextNode->nextNodeData = partitionData->nodeData[i];
+                        partitionData->nodeData[i]->nextNodeData = NULL;
+                    }
+
+                    /*
+                     * Make the current node we are considering
+                     * the next code.
+                     */
+                    nextNode = partitionData->nodeData[i];
+                }
+            }
+
+            /*
+             * Initialize all the layers for all the nodes
+             */
+            GLOMO_GlobalPropInit(&(partitionData->propData), &nodeInput);
+
+            nextNode = partitionData->firstNode;
+
+            while (nextNode != NULL) {
+                GLOMO_NetworkPreInit(nextNode, &nodeInput);
+                     
+                GLOMO_PropInit(nextNode, &partitionData->propData);
+                GLOMO_RadioInit(nextNode, &nodeInput);
+                GLOMO_MacInit(nextNode, &nodeInput);
+                GLOMO_NetworkInit(nextNode, &nodeInput);
+                GLOMO_TransportInit(nextNode, &nodeInput);
+                GLOMO_AppInit(nextNode, &nodeInput);
+
+                GLOMO_MobilityInit(nextNode, &nodeInput);
+
+                assert((nextNode->nextNodeData == NULL) ||
+                       (nextNode->nextNodeData->prevNodeData == nextNode));
+                assert((nextNode->prevNodeData == NULL) || 
+                       (nextNode->prevNodeData->nextNodeData == nextNode));
+                nextNode = nextNode->nextNodeData;
+            }
+
+            
+
+            break;
+        }
+    }
+
+    
+
+
+    if (partitionData->firstNode != NULL) {
+        int    nodeCount = 0;
+        GlomoNode* nextNode = partitionData->firstNode;
+
+        while (nextNode != NULL) {
+            nodeCount++;
+            printf("Node %u (%.2lf, %.2lf, %.2lf).\n",
+                   nextNode->nodeAddr,
+                   nextNode->position.x,
+                   nextNode->position.y,
+                   nextNode->position.z);
+
+            nextNode = nextNode->nextNodeData;
+        } 
+
+        printf("Partition %d (%hu %hu) has range (%.0lf, %.0lf) to "
+               "(%.0lf, %.0lf): %d nodes\n",
+               partitionId, self.node, self.pid,
+               partitionData->thisArea.start_x,
+               partitionData->thisArea.start_y,
+               partitionData->thisArea.end_x,
+               partitionData->thisArea.end_y,
+               nodeCount);
+
+        if (nodeCount == 0) {
+            printf("Partition has zero nodes!.\n");
+            printf("This indicates a problem with node positions.\n");
+            assert(FALSE);
+        }
+    }
+
+    /*
+     * Inform creator that we are ready.
+     * Wait to receive Start Simulation message from creator.
+     */
+    send Ready { } to creator;
+    receive (StartSim smsg);
+    del_source(creator);
+    del_dest(creator);
+
+
+    NumMobilityEventsOnNextClockTick = 0;
+    
+    /*
+     * Upon receiving a message, retrieve information about the
+     * receiving node id. Call GLOMO_CallLayer which will call
+     * the appropriate layer.
+     */
+    while (TRUE) {
+        clocktype EarliestOutputTime;
+        clocktype timeoutDelay;
+        clocktype toVal;
+        BOOL IsATimeoutEvent;
+
+        /*
+         * Display the current simulation time.
+         */
+        if ((partitionId == 1) && (simclock() >= NextSimtimePrintTime)) {
+            int PercentageDone;
+            char TimeStringInSecond[GLOMO_MAX_STRING_LENGTH];
+
+            GLOMO_PrintClockInSecond(simclock(), TimeStringInSecond);
+
+            PercentageDone
+                = ((100 * (NextSimtimePrintTime/PrintSimTimeInterval)) /
+                   NUM_SIM_TIME_STATUS_PRINTS); 
+            
+            printf("Current Sim Time[s] =%15s  "
+                   "Real Time[s] =%5d  "
+                   "Completed%3d%%\n", 
+                   TimeStringInSecond,
+                   (int)(RealTimeSecs() - StartRealTime), 
+                   PercentageDone);
+            fflush(stdout);
+            NextSimtimePrintTime = NextSimtimePrintTime + PrintSimTimeInterval; 
+        } 
+
+        /* Determine the earliest regular and mobility event */
+        /* This time will be used to set a timeout. */
+        toVal = MIN(partitionData->mobilityInternal.minTime,
+                    partitionData->mobilityOutgoing.minTime);
+       
+        /* nNode represents the node with the earliest message */
+
+        if (partitionData->heapSplayTree.heapSize > 0) {
+            GlomoNode* nNode = partitionData->heapSplayTree.heapNodePtr[1];
+            if (nNode->splayTree.leastPtr != NULL) {
+                toVal = MIN(toVal, nNode->splayTree.leastPtr->timeValue);
+            }
+        }
+
+        if (NumMobilityEventsOnNextClockTick > 0) {
+            toVal = MIN(toVal, (simclock() + 1));
+        }
+        
+        assert(toVal >= simclock());
+        timeoutDelay = toVal - simclock();
+
+
+        
+        
+        /*
+         * DISTRIBUTION
+         * The next two receive statements can be removed for the purpose
+         * of distribution as we can't receive any remote messages. The
+         * declaration of the message types can also be removed.
+         */
+
+        /*
+         * Receive a message from a remote partition.
+         */
+        
+        IsATimeoutEvent = FALSE;
+        receive (RemoteMessage rMsg) {
+            
+        }
+
+        
+    
+        or timeout in (timeoutDelay) {
+           IsATimeoutEvent = TRUE;
+        }/*receive*/
+        
+        if (IsATimeoutEvent) {
+            clocktype CurrentTime = simclock();
+            BOOL foundOne = FALSE;
+            GlomoNode *node = NULL;
+            SplayNode *splayNodePtr = NULL;
+            Message *msg = NULL;
+            
+            assert(toVal == CurrentTime);
+
+            /*
+             * Check for any internal mobility events that need to be
+             * scheduled for this time period. The internal mobility event
+             * may cause the node to move to another partition. This will
+             * be taken care of by sending a "MovingNow" message to the
+             * remote partition. (see below)
+             */
+            
+            while (partitionData->mobilityInternal.minTime == CurrentTime) {
+                foundOne = TRUE;
+                node = partitionData->mobilityInternal.heapNodePtr[1];
+
+                GLOMO_Mobility(node);
+            }
+
+            
+            
+            /*
+             * Check to see if any normal messages are scheduled for this
+             * time.
+             */
+            if (partitionData->heapSplayTree.heapSize != 0) {
+                while (TRUE) {
+                    int msgLayer;
+                    
+                    node = partitionData->heapSplayTree.heapNodePtr[1];
+                    if ((node->splayTree.leastPtr == NULL) ||    
+                        (node->splayTree.leastPtr->timeValue != simclock())) 
+                    {
+                        break;
+                    }
+
+                    foundOne = TRUE;
+                    splayNodePtr = GLOMO_SplayTreeExtractMin(node);
+                    assert(splayNodePtr != NULL);
+                    msg = splayNodePtr->msg;
+
+                    if (partitionData->splayNodeFreeListNum <
+                        SPLAYTREE_MAX_FREE_LIST)
+                    {
+                        SplayNodeListCell* cellPtr =
+                            (SplayNodeListCell*)splayNodePtr;
+                        cellPtr->next = partitionData->splayNodeFreeList;
+                        partitionData->splayNodeFreeList = cellPtr;
+                        (partitionData->splayNodeFreeListNum)++;
+                    } else {
+                        pc_free(splayNodePtr);
+                    }
+                    splayNodePtr = NULL;
+                    
+                    msgLayer = msg->layerType;
+                    GLOMO_GetNodeData(node, msg);
+                    
+                    
+                }
+            }
+            assert(foundOne == TRUE);
+        }
+    }
+
+    finalize {
+        /*
+         * Finalize all the layers.
+        */
+        if (partitionData->firstNode != NULL) {
+            GlomoNode *nextNode = partitionData->firstNode;
+
+            while (nextNode != NULL) {
+                GLOMO_RadioFinalize(nextNode);
+                GLOMO_MacFinalize(nextNode);
+                GLOMO_NetworkFinalize(nextNode);
+                GLOMO_TransportFinalize(nextNode);
+                GLOMO_AppFinalize(nextNode);
+                GLOMO_MobilityFinalize(nextNode);
+                nextNode = nextNode->nextNodeData;
+           } 
+        }
+
+        fclose(partitionData->statFd);
+    }
+}
+
+static
+void FindNearestPositions(GlomoAreaNearestInfo *partitionNearest,
+                          GlomoAreaInfo **area,
+                          int numPartitionsX, int numPartitionsY,
+                          int x, int y)
+{
+    //
+    // Assume a grid for now..
+    //
+    int i, j;
+    GlomoAreaInfo *thisArea = &(area[x][y]);
+
+    for (j = 0; j < numPartitionsY; j++) {
+        for (i = 0; i < numPartitionsX; i++) {
+            double nearestX, nearestY;
+            GlomoAreaInfo *anotherArea = &(area[i][j]);
+
+            if (i == x && j == y) {
+                continue;
+            }
+
+            if (anotherArea->start_x < thisArea->start_x) {
+                nearestX = anotherArea->end_x;
+            }
+            else if (anotherArea->start_x > thisArea->start_x) {
+                nearestX = anotherArea->start_x;
+            }
+            else {
+                nearestX = -1.0;
+            }
+
+            if (anotherArea->start_y < thisArea->start_y) {
+                nearestY = anotherArea->end_y;
+            }
+            else if (anotherArea->start_y > thisArea->start_y) {
+                nearestY = anotherArea->start_y;
+            }
+            else {
+                nearestY = -1.0;
+            }
+            partitionNearest[i + j * numPartitionsX].nearestX = nearestX;
+            partitionNearest[i + j * numPartitionsX].nearestY = nearestY;
+            partitionNearest[i + j * numPartitionsX].partitionEname
+                = anotherArea->partitionEname;
+        }
+    }
+}
+
+/*
+ * FUNCTION     GLOMO_GetNodeData
+ * PURPOSE      The partition has just received a message. If this is a
+ *              special message for broadcasting catch it in this function.
+ *              Otherwise retrieve data for the node and call CallLayer
+ *              to execute the correct layer.
+ *
+ * Parameters:
+ *     node         the node receiving the message
+ *     msg          the message which has just been received
+ */
+static GlomoNode *GLOMO_GetNodeData(GlomoNode *node, Message *msg) {
+    assert(node != NULL);
+
+    switch(msg->eventType) {
+        case MSG_MAC_SlotFront:
+            /* 
+             * Slot synchronization is taken for granted.  Therefore,
+             * this message doesn't use any resources.
+             */
+            assert(GLOMO_MsgGetLayer(msg) == GLOMO_MAC_LAYER);
+            GLOMO_MacLayer(node, msg);
+            break;
+
+        case MSG_SPECIAL_Broadcast:
+            assert(FALSE);
+            exit(1);
+            break;
+
+        default:
+            /*
+             * Otherwise this is a normal packet.
+             */
+            GLOMO_CallLayer(node, msg);
+            break;
+    }
+    
+    return 0;  /* Fix This (Code wasn't returning a value) */
+}
+
+
+
+/*
+ * FUNCTION     GLOMO_CallLayer
+ * PURPOSE      Function used to call the appropriate layer to execute
+ *              instructions for the message
+ *
+ * Parameters
+ *     node:         node for which message is to be delivered
+ *     msg:          message for which instructions are to be executed
+ */
+void GLOMO_CallLayer(GlomoNode *node, Message *msg) {
+    /*
+     * As layers are added this function will have to be changed.
+     */
+    switch(GLOMO_MsgGetLayer(msg)) {
+        case GLOMO_RADIO_LAYER:
+            GLOMO_RadioLayer(node, msg);
+            break;
+        case GLOMO_MAC_LAYER:
+            GLOMO_MacLayer(node, msg);
+            break;
+        case GLOMO_NETWORK_LAYER:
+            GLOMO_NetworkLayer(node, msg);
+            break;
+        case GLOMO_TRANSPORT_LAYER:
+            GLOMO_TransportLayer(node, msg);
+            break;
+        case GLOMO_APP_LAYER:
+            GLOMO_AppLayer(node, msg);
+            break;
+        default:
+            fprintf(stderr, "GLOMO Error: Received message for"
+                    " unknown layer %ld.\n", msg->layerType);
+            assert(FALSE);
+    }
+}
+
+
+/*
+ * FUNCTION      GLOMO_ConvertToClock
+ * PURPOSE       Read the string in "buf" and provide the corresponding
+ *               clocktype value for the string. Use the following conversions:
+ *               NS - nano-seconds
+ *               MS - milli-seconds
+ *               S  - seconds (default if no specification)
+ *               H  - hours
+ *               D  - days
+ */
+void GLOMO_ConvertToCoordinates(char *buf, GlomoCoordinates *coordinates) {
+    char localBuffer[GLOMO_MAX_STRING_LENGTH];
+    char *stringPtr;
+
+    strcpy(localBuffer, buf);
+
+    stringPtr = strtok(localBuffer, "(,) ");
+    coordinates->x = atof(stringPtr);
+
+    stringPtr = strtok(NULL, "(,) ");
+    coordinates->y = atof(stringPtr);
+
+    stringPtr = strtok(NULL, "(,) ");
+    //
+    // If the third parameter is omitted, set it to zero.
+    //
+    if (stringPtr != NULL) {
+        coordinates->z = atof(stringPtr);
+    }
+    else {
+        coordinates->z = 0.0;
+    }
+
+    return;
+}
+
+
+/*
+ * FUNCTION      GLOMO_ConvertToClock
+ * PURPOSE       Read the string in "buf" and provide the corresponding
+ *               clocktype value for the string. Use the following conversions:
+ *               NS - nano-seconds
+ *               MS - milli-seconds
+ *               S  - seconds (default if no specification)
+ *               H  - hours
+ *               D  - days
+ */
+clocktype GLOMO_ConvertToClock(char *buf) {
+    char        *temp;
+    clocktype maxSimClock;
+
+    if ((temp = strstr(buf, "NS")) != NULL) {
+        temp[0] = 0;
+        assert(temp[2] == 0);
+        maxSimClock = (clocktype) (atof(buf) + 0.5);
+    }
+    else if ((temp = strstr(buf, "MS")) != NULL) {
+        temp[0] = 0;
+        assert(temp[2] == 0);
+        maxSimClock = (clocktype) ((atof(buf) * MILLI_SECOND) + 0.5);
+    }
+    else if ((temp = strstr(buf, "S")) != NULL) {
+        temp[0] = 0;
+        assert(temp[1] == 0);
+        maxSimClock = (clocktype) ((atof(buf) * SECOND) + 0.5);
+    }
+    else if ((temp = strstr(buf, "M")) != NULL) {
+        temp[0] = 0;
+        assert(temp[1] == 0);
+        maxSimClock = (clocktype) ((atof(buf) * MINUTE) + 0.5);
+    }
+    else if ((temp = strstr(buf, "H")) != NULL) {
+        temp[0] = 0;
+        assert(temp[1] == 0);
+        maxSimClock = (clocktype) ((atof(buf) * HOUR) + 0.5);
+    }
+    else if ((temp = strstr(buf, "D")) != NULL) {
+        temp[0] = 0;
+        assert(temp[1] == 0);
+        maxSimClock = (clocktype) ((atof(buf) * DAY) + 0.5);
+    }
+    else {
+        maxSimClock = (clocktype) ((atof(buf) * SECOND) + 0.5);
+    }
+
+    return maxSimClock;
+}
+
+
+/*
+ * FUNCTION      GLOMO_PrintStat
+ * PURPOSE       Print out the relevant stat in "buf", along with the
+ *               node id and the layer type generating this stat.
+ *               
+ * Paramters:
+ *     node         the node generating the stat
+ *     layer        the layer generating the stat
+ *     buf          string which has the statistic to be printed out
+ */
+void GLOMO_PrintStat(GlomoNode *node, char *layer, char *buf) {
+    fprintf(node->partitionData->statFd, "Node: %6u, Layer: %15.15s, %s\n",
+            node->nodeAddr, layer, buf);
+}
+
+void GLOMO_PrintClockInSecond(clocktype clock, char stringInSecond[]) {
+    char TimeString[GLOMO_MAX_STRING_LENGTH];
+    char TimeStringTemp[GLOMO_MAX_STRING_LENGTH];
+    char TimeStringSecond[GLOMO_MAX_STRING_LENGTH];
+    char TimeStringNanoSecond[GLOMO_MAX_STRING_LENGTH];
+    int  LengthOfTimeString;
+
+    ctoa(clock, TimeString);
+
+    LengthOfTimeString = strlen(TimeString);
+    if (LengthOfTimeString <= 9) {
+        strcpy(TimeStringSecond, "0");
+        strncpy(TimeStringNanoSecond, "000000000", 9 - LengthOfTimeString);
+        strncpy(&TimeStringNanoSecond[9-LengthOfTimeString],
+            TimeString, LengthOfTimeString);
+        TimeStringNanoSecond[9] = 0;
+    //    strcpy(TimeStringTemp, "000000000");
+    //    strcpy(TimeStringSecond, "0");
+    //    sprintf(TimeStringNanoSecond, "%09s", TimeString);
+    }
+    else {
+        strncpy(TimeStringSecond, TimeString, LengthOfTimeString - 9);
+        TimeStringSecond[LengthOfTimeString - 9] = 0;
+        strncpy(TimeStringNanoSecond,
+                &TimeString[LengthOfTimeString - 9],
+                9);
+        TimeStringNanoSecond[9] = 0;
+    }
+
+    sprintf(stringInSecond, "%s.%s", TimeStringSecond, TimeStringNanoSecond);
+}
+
+void* checked_pc_malloc(size_t size) {
+   void* Ptr = pc_malloc(size);
+   if (Ptr == NULL) {
+      printf("pc_malloc: Ran out of Memory. Run in debugger to see " 
+             "the location.\n");
+      assert(FALSE); abort();
+   }
+   return Ptr;
+}
+
+clocktype PrintSimTimeInterval;
+

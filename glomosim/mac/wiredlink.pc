@@ -1,0 +1,330 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: wiredlink.pc,v 1.12 2001/04/12 18:31:12 jmartin Exp $
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+#include "structmsg.h"
+
+#include "glomo.h"
+#include "fileio.h"
+
+#include "wiredlink.h"
+#include "network.h"
+
+#define NUM_LINKS_INCREMENT 10
+
+/* this function defined in driver.pc*/
+extern clocktype GLOMO_ConvertToClock(char *buf);
+
+static void WiredLinkPrintStats(GlomoNode * node, GlomoWiredLink * wired);
+
+void WiredLinkInit(GlomoNode *node,
+                   const GlomoNodeInput *nodeInput)
+{
+    GlomoNodeInput wiredInput;
+    int  i;
+    BOOL wasFound;
+    int  numReturnVals;
+
+    assert(sizeof(MacWiredFrameHeader) == 28);
+
+    wasFound = GLOMO_ReadCachedFile(nodeInput, "WIRED-LINK-FILE", &wiredInput);
+    if (wasFound == FALSE) {
+        fprintf(stderr, "Mac: Needs WIRED-LINK-FILE.\n");
+        assert(FALSE); abort();
+    }
+
+    for (i = 0; i < wiredInput.numLines; i++) {
+        NODE_ADDR nodeAddr1, nodeAddr2;
+        int bandwidth1, bandwidth2;
+        char propDelayString1[GLOMO_MAX_STRING_LENGTH];
+        char propDelayString2[GLOMO_MAX_STRING_LENGTH];
+
+        numReturnVals = sscanf(wiredInput.inputStrings[i],
+                               "%u %u %d %s %d %s",
+                               &nodeAddr1, &nodeAddr2,
+                               &bandwidth1, propDelayString1,
+                               &bandwidth2, propDelayString2);
+
+        assert(numReturnVals == 4 || numReturnVals == 6);
+
+        if (node->nodeAddr == nodeAddr1 || node->nodeAddr == nodeAddr2) {
+            GlomoMac *thisMac;
+            GlomoWiredLink *wired;
+            GlomoNode *dest = node->partitionData->firstNode;
+            NODE_ADDR theOtherAddr;
+            int interfaceId;
+
+            interfaceId = node->numberInterfaces;
+
+            assert(interfaceId < MAX_NUM_INTERFACES);
+
+            thisMac = (GlomoMac *)checked_pc_malloc(sizeof(GlomoMac));
+            node->macData[interfaceId] = thisMac;
+            
+            wired =
+                (GlomoWiredLink *)checked_pc_malloc(sizeof(GlomoWiredLink));
+
+            thisMac->macProtocol = MAC_PROTOCOL_WIRED;
+            thisMac->interfaceIndex = interfaceId;
+            
+            if (numReturnVals == 6 && node->nodeAddr == nodeAddr2) {
+                thisMac->bandwidth = bandwidth2;
+                thisMac->propDelay = GLOMO_ConvertToClock(propDelayString2);
+            }
+            else {
+                thisMac->bandwidth = bandwidth1;
+                thisMac->propDelay = GLOMO_ConvertToClock(propDelayString1);
+            }
+            thisMac->macVar = (void *)wired;
+            thisMac->promiscuousMode = FALSE;
+            
+            NetworkIpAddNewInterfaceWithOutputQueue(
+               node, interfaceId, nodeInput);
+
+            wired->myGlomoMac = thisMac;
+            if (node->nodeAddr == nodeAddr1) {
+                theOtherAddr = nodeAddr2;
+            }
+            else {
+                theOtherAddr = nodeAddr1;
+            }
+
+            //
+            // Redundant links are not supported in this model.
+            //
+            if (WiredLinkInterfaceIdForThisDest(node, theOtherAddr) != -1) {
+                fprintf(stderr,
+                        "Link between (%u) and (%u) is already established\n",
+                        node->nodeAddr, theOtherAddr);
+
+                assert(FALSE); abort();
+            }
+
+            wired->destAddr = theOtherAddr;
+            wired->status = IDLE;
+            wired->stats.packetsSent = 0;
+
+            node->numberInterfaces++;
+            
+            //
+            // Check if the destination is in this partition
+            //
+            while (dest != NULL) {
+                if (dest->nodeAddr == theOtherAddr) {
+                    break;
+                }
+                dest = dest->nextNodeData;
+            }
+
+            wired->dest = dest;
+
+            if (dest == NULL) {
+                
+                assert(FALSE); abort();
+            }
+            else {
+                wired->destInterfaceId
+                    = WiredLinkInterfaceIdForThisDest(dest, node->nodeAddr);
+
+                if (wired->destInterfaceId != -1) {
+                    GlomoWiredLink *theOtherEnd
+                        = dest->macData[wired->destInterfaceId]->macVar;
+
+                    theOtherEnd->destInterfaceId = interfaceId;
+                }
+            }
+        }
+    }
+}
+
+void WiredLinkLayer(GlomoNode *node, int interfaceIndex, Message *msg) {
+    GlomoWiredLink *wired =
+        (GlomoWiredLink *)node->macData[interfaceIndex]->macVar;
+
+    switch (msg->eventType) {
+        case MSG_MAC_FromNetwork: {
+            WiredLinkNetworkLayerHasPacketToSend(node, wired);
+            break;
+        }
+        case MSG_MAC_WiredToWired: {
+            WiredLinkMessageFromWire(node, interfaceIndex, msg);
+            break;
+        }
+        case MSG_MAC_TransmissionFinished: {
+            WiredLinkTransmissionFinished(node, interfaceIndex, msg);
+            break;
+        }
+        default: {
+            assert(FALSE); abort();
+        }
+    }
+}
+
+void WiredLinkFinalize(GlomoNode *node, int interfaceIndex) {
+    int i;
+    
+    if (node->macData[interfaceIndex]->macStats == TRUE) {
+        for (i = interfaceIndex; i < node->numberInterfaces; i++) {
+            WiredLinkPrintStats(node, node->macData[i]->macVar);
+        }
+    }
+}
+
+void WiredLinkPrintStats(GlomoNode *node, GlomoWiredLink *wired) {
+    char buf[100];
+
+    sprintf(buf, "(%d) Destination: %u",
+            wired->myGlomoMac->interfaceIndex, wired->destAddr);
+    GLOMO_PrintStat(node, "WiredLink", buf);
+
+    sprintf(buf, "(%d) Frames sent: %d",
+            wired->myGlomoMac->interfaceIndex, wired->stats.packetsSent);
+    GLOMO_PrintStat(node, "WiredLink", buf);
+}
+
+void WiredLinkMessageFromWire(GlomoNode *node,
+                              int interfaceIndex,
+                              Message *msg)
+{
+    MacWiredFrameHeader *header = (MacWiredFrameHeader *)msg->packet;
+
+    assert(header->destAddr == node->nodeAddr);
+
+    GLOMO_MsgRemoveHeader(node, msg, sizeof(MacWiredFrameHeader));
+    NetworkIpReceivePacketFromMacLayer(node, msg, header->sourceAddr);
+}
+
+void WiredLinkTransmissionFinished(GlomoNode *node,
+                                   int interfaceIndex,
+                                   Message *msg)
+{
+    GlomoWiredLink *wired
+        = (GlomoWiredLink *)node->macData[interfaceIndex]->macVar;
+
+    assert(wired != NULL);
+    assert(wired->status == BUSY);
+    wired->status = IDLE;
+    wired->stats.packetsSent++;
+
+    if (NetworkIpOutputQueueIsEmpty(node, interfaceIndex) != TRUE) {
+        WiredLinkNetworkLayerHasPacketToSend(node, wired);
+    }
+    GLOMO_MsgFree(node, msg);
+}
+
+void WiredLinkNetworkLayerHasPacketToSend(GlomoNode *node,
+                                          GlomoWiredLink *wired)
+{
+    Message *newMsg = NULL;
+    Message *txFinishedMsg;
+    clocktype txDelay;
+    NODE_ADDR nextHopAddress;
+    NetworkQueueingPriorityType priority;
+    MacWiredFrameHeader *header;
+    GlomoMac *thisMac = wired->myGlomoMac;
+    int interfaceIndex = thisMac->interfaceIndex;
+
+    if (wired->status == BUSY) {
+        return;
+    }
+    assert(wired->status == IDLE);
+
+    NetworkIpOutputQueueDequeuePacket(node, interfaceIndex, &newMsg,
+                                      &nextHopAddress, &priority);
+    assert(newMsg != NULL);
+
+    GLOMO_MsgAddHeader(node, newMsg, sizeof(MacWiredFrameHeader));
+    header = (MacWiredFrameHeader *)newMsg->packet;
+    header->sourceAddr = node->nodeAddr;
+    header->destAddr = nextHopAddress;
+
+    txDelay = (clocktype)(newMsg->packetSize * 8 * SECOND
+                          / thisMac->bandwidth);
+
+    GLOMO_MsgSetEvent(newMsg, MSG_MAC_WiredToWired);
+    GLOMO_MsgSetLayer(newMsg, GLOMO_MAC_LAYER, 0);
+
+    if (wired->dest == NULL) {
+        
+        assert(FALSE); abort();
+    }
+    else {
+        GLOMO_MsgSetInstanceId(newMsg, wired->destInterfaceId);
+        GLOMO_MsgSend(wired->dest, newMsg, txDelay + thisMac->propDelay);
+    }
+
+    wired->status = BUSY;
+
+    txFinishedMsg = GLOMO_MsgAlloc(node,
+                                   GLOMO_MAC_LAYER,
+                                   0, MSG_MAC_TransmissionFinished);
+    GLOMO_MsgSetInstanceId(txFinishedMsg, interfaceIndex);
+    GLOMO_MsgSend(node, txFinishedMsg, txDelay);
+}
+
+int WiredLinkInterfaceIdForThisDest(GlomoNode *node, NODE_ADDR destAddr) {
+    int i;
+
+    for (i = node->numberRadios; i < node->numberInterfaces; i++) {
+        GlomoWiredLink *wired;
+
+        wired = node->macData[i]->macVar;
+
+        if (wired->destAddr == destAddr) {
+            break;
+        }
+    }
+    if (i != node->numberInterfaces) {
+        return i;
+    }
+    else {
+        return -1;
+    }
+}
+

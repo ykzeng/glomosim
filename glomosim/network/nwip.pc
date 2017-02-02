@@ -1,0 +1,2467 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+//------------------------------------------------------------------------
+// $Id: nwip.pc,v 1.95 2001/12/19 22:33:43 jmartin Exp $
+//
+// File: nwip.pc
+// By: Teresa Yan (tyan@cs.ucla.edu) 
+//     Jay Martin (jmartin@cs.ucla.edu) 
+// Objectives: IP (Internet Protocol) 
+//             A very simple IP that do fragmentation, reassembly and
+//             multiplexing and demultiplexing. 
+// References: RFC 791
+// Date: 8/20/1999
+//
+//------------------------------------------------------------------------
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "ip.h"
+#include "nwip.h"
+#include "nwcommon.h"
+#include "application.h"
+#include "transport.h"
+#include "nwlar1.h"
+#include "aodv.h"
+#include "dsr.h"
+#include "odmrp.h"
+#include "zrp.h"
+//#include "ospf.h"
+#include "java_gui.h"
+#include "fifoqueue.h"
+
+
+//----------------------------------------------------------------------------
+
+//    IP PACKET HEADER INFORMATION MANIPULATION ROUTINES
+
+
+//
+// MACRO       IpPacketIsFragmented()
+// PURPOSE     Return whether the IP packet is fragmented.
+// PARAMETERS  An IP Header.
+//
+
+#define IpPacketIsFragmented(IpHeader) \
+  (((IpHeader)->ip_more_fragments == 1) || \
+   (FragmentOffset(IpHeader) != 0))
+
+
+//
+// FUNCTION    IpHeaderSourceRouteOptionField
+// PURPOSE     Returns whether the IP header has a source route.
+// PARAMETERS  An IP Header.
+//
+
+static
+IpOptionsHeaderType* IpHeaderSourceRouteOptionField(IpHeaderType* ipHeader) {
+   return (FindAnIpOptionField(ipHeader, IPOPT_SSRR));
+}
+
+#define IpHeaderHasSourceRoute(ipHeader) \
+    (IpHeaderSourceRouteOptionField(ipHeader) != NULL)
+
+
+//
+// FUNCTION    IsMyPacket()
+// PURPOSE     Determines whether the packet is for this node.
+// PARAMETERS  msg - A Glomosim message that must be an IP packet.
+//
+
+static
+BOOL IsMyPacket(GlomoNode *node, Message *msg)
+{ 
+   IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+
+   if ((ipHeader->ip_dst == ANY_DEST) || (node->nodeAddr == ipHeader->ip_dst)) 
+   {
+      return TRUE;
+   }
+   else {
+      return FALSE;
+   }
+}
+
+
+//
+// FUNCTION    IsIpFragmentOf()
+// PURPOSE     Determines whether two packet fragments are fragments of
+//             the same packet.
+// PARAMETERS  msg1 - A Glomosim message that must be an IP packet.
+//             msg2 - A Glomosim message that must be an IP packet.
+//
+
+static
+BOOL IsIpFragmentOf(const Message* msg1, const Message* msg2) 
+{
+   IpHeaderType* ipHeader1 = (IpHeaderType*)msg1->packet;
+   IpHeaderType* ipHeader2 = (IpHeaderType*)msg2->packet;
+
+   return ((ipHeader1->ip_id == ipHeader2->ip_id) &&
+           (ipHeader1->ip_src == ipHeader2->ip_src) &&
+           (ipHeader1->ip_p == ipHeader2->ip_p));
+}
+
+
+//
+// FUNCTION    AddIpHeader() 
+// PURPOSE     Add an IP packet header to a Glomo message.
+// PARAMETERS  
+//   msg - A Glomosim message.
+//   destinationAddress - Where this packet is going.
+//   priority - Currently a MacQueuePriority (values are not standard for 
+//              "IP type of service field" but has correct function).
+//   protocol - The IP protocol number to put in header.
+//
+
+void AddIpHeader(
+   GlomoNode *node, 
+   Message *msg,
+   NODE_ADDR destinationAddress,
+   NetworkQueueingPriorityType priority,
+   unsigned char protocol,
+   unsigned int ttl)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   IpHeaderType* ipHeader;
+   GLOMO_MsgAddHeader(node, msg, sizeof(IpHeaderType));
+   ipHeader = (IpHeaderType *) msg->packet;
+   memset(ipHeader, 0, sizeof(IpHeaderType));
+   
+   ipHeader->ip_id = ipLayer->packetIdCounter;
+   ipLayer->packetIdCounter++;
+   ipHeader->ip_src = node->nodeAddr;
+   ipHeader->ip_dst = destinationAddress;
+   if (ttl == 0) {
+      ipHeader->ip_ttl = IPDEFTTL; 
+   } else {
+      ipHeader->ip_ttl = ttl;
+   }
+   ipHeader->ip_tos = priority;
+   ipHeader->ip_p = protocol;
+   assert(msg->packetSize <= IP_MAXPACKET);
+   ipHeader->ip_len = msg->packetSize;
+   SetIpHeaderSize(ipHeader, sizeof(IpHeaderType));
+}
+
+
+
+//
+// FUNCTION    ExpandOrShrinkIpHeader() 
+// PURPOSE     Increases the size of an Ip header so as to allow for
+//             adding a new source route or other options.
+// PARAMETERS  
+//   msg - A Glomosim message.
+//   NewHeaderSize -  The new expanded IP header size.
+//
+
+static
+void ExpandOrShrinkIpHeader(GlomoNode* node, Message* msg, int newHeaderSize) 
+{
+   IpHeaderType* ipHeader = (IpHeaderType*) msg->packet;
+   assert(newHeaderSize <= IP_MAX_HEADER_SIZE);
+   if (IpHeaderSize(ipHeader) != newHeaderSize) {
+      IpHeaderType* origIpHeader = ipHeader;
+      int oldIpHeaderSize = IpHeaderSize(ipHeader);
+      GLOMO_MsgRemoveHeader(node, msg, oldIpHeaderSize);
+      GLOMO_MsgAddHeader(node, msg, newHeaderSize);   
+      ipHeader = (IpHeaderType*) msg->packet;
+      memmove((char*)ipHeader, (char*)origIpHeader, 
+              MIN(oldIpHeaderSize, newHeaderSize));
+      SetIpHeaderSize(ipHeader, newHeaderSize);
+   }//if//
+}
+
+
+
+void AddIpOptionField(
+   GlomoNode* node, 
+   Message* msg,
+   int OptionCode, 
+   int OptionSize) 
+{
+   IpOptionsHeaderType* newIpOption = NULL;
+   int oldHeaderSize = IpHeaderSize((IpHeaderType*)msg->packet);
+   // Round up to nearest option size divisable by 4.
+   int newIpOptionSize = 4 * ((((sizeof(IpOptionsHeaderType) + OptionSize) - 1)/4) + 1); 
+   int newHeaderSize = oldHeaderSize + newIpOptionSize;
+
+   assert(FindAnIpOptionField((IpHeaderType*)msg->packet, OptionCode) == NULL);
+
+   ExpandOrShrinkIpHeader(node, msg, newHeaderSize);
+   newIpOption = (IpOptionsHeaderType*)((char*)msg->packet + oldHeaderSize);
+   newIpOption->len = newIpOptionSize;
+   newIpOption->code = OptionCode;
+   newIpOption->ptr = IPOPT_MINOFF;
+}
+
+
+static
+void ExpandOrShrinkIpOptionField(
+   GlomoNode* node, 
+   Message* msg,
+   const int optionCode, 
+   const int newIpOptionSize) 
+{
+   IpHeaderType* ipHeader = (IpHeaderType*)msg->packet;
+   IpOptionsHeaderType* ipOption = FindAnIpOptionField(ipHeader, optionCode);
+   int oldHeaderSize = IpHeaderSize(ipHeader);
+   int oldIpOptionSize = ipOption->len;
+   int deltaOptionSize = newIpOptionSize - ipOption->len;
+   int newHeaderSize = oldHeaderSize + deltaOptionSize;
+   int bytesAfterOption = (int)(((char*)ipHeader + oldHeaderSize) - 
+                                ((char*)ipOption + oldIpOptionSize));
+      
+   assert(newIpOptionSize % 4 == 0);
+
+   ExpandOrShrinkIpHeader(node, msg, newHeaderSize);
+
+   ipHeader = (IpHeaderType*)msg->packet;
+   ipOption = FindAnIpOptionField(ipHeader, optionCode);
+   ipOption->len = newIpOptionSize;
+   
+   // Move the header data after this option field to make room for
+   // the new option data.
+   
+   memmove(((char*)ipOption + newIpOptionSize),
+           ((char*)ipOption + oldIpOptionSize),
+           bytesAfterOption);
+} 
+
+
+//
+// FUNCTION    NetworkIpRemoveIpHeader() 
+// PURPOSE     Removes the IP header while also returning the source 
+//             address and IP protocol code and other fields from the header.
+// 
+//   sourceAddress - Extracted source address.
+//   destinationAddress - Extracted destination address.
+//   priority - Currently a MacQueuePriority (values are not standard for 
+//              "IP type of service field" but has correct function).
+//   protocol - Extracted IP protocol field. 
+//
+//
+
+void NetworkIpRemoveIpHeader(
+   GlomoNode *node, 
+   Message *msg, 
+   NODE_ADDR* sourceAddress,
+   NODE_ADDR* destinationAddress,
+   NetworkQueueingPriorityType* priority,
+   unsigned char* protocol,
+   unsigned int* ttl)
+{
+   IpHeaderType *ipHeader = (IpHeaderType *)msg->packet;
+   *priority = ipHeader->ip_tos;
+   *ttl = ipHeader->ip_ttl;
+   *protocol = ipHeader->ip_p;
+   *sourceAddress = ipHeader->ip_src;
+   *destinationAddress = ipHeader->ip_dst;
+   GLOMO_MsgRemoveHeader(node, msg, IpHeaderSize(ipHeader));
+}    
+
+
+//
+// FUNCTION    ExtractIpSourceAndRecordedRoute() 
+// PURPOSE     Retrieves a copy of the source and recorded route from
+//             the options field in the header.
+// 
+//   msg - The message with an IP header with a source/recorded route.
+//   RouteAddress - An array for the returned addresses.
+//   NumAddresses - The returned size of this array.
+//   RouteAddressIndex - The index of the first address of the source
+//                       route, before this index is the recorded route.
+
+
+void ExtractIpSourceAndRecordedRoute(
+   Message* msg, 
+   NODE_ADDR RouteAddresses[],
+   int*  NumAddresses,
+   int*  RouteAddressIndex)
+{
+   IpHeaderType* ipHeader = (IpHeaderType*)msg->packet;
+   IpOptionsHeaderType* ipOptions = IpHeaderSourceRouteOptionField(ipHeader);
+   char* FirstAddress = ((char*)ipOptions + sizeof(IpOptionsHeaderType));
+   assert(IpHeaderHasSourceRoute(ipHeader));
+   *NumAddresses = 
+      (ipOptions->len - sizeof(IpOptionsHeaderType) - 
+       IP_SOURCE_ROUTE_OPTION_PADDING) / sizeof(NODE_ADDR);
+   *RouteAddressIndex = 
+      (ipOptions->ptr - sizeof(IpOptionsHeaderType) - 
+       IP_SOURCE_ROUTE_OPTION_PADDING) / sizeof(NODE_ADDR);
+   memmove(RouteAddresses, FirstAddress,((*NumAddresses) * sizeof(NODE_ADDR)));
+}
+
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+
+// Network Queue Routines.
+
+
+typedef struct {
+   NODE_ADDR nextHopAddress;
+} TackedOnInfoWhileInNetworkQueueType;
+
+
+BOOL NetworkIpOutputQueueIsEmpty(GlomoNode* node, InterfaceIdType interfaceId) 
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+   IpOutputQueueType* queue;
+   
+   
+   assert(interfaceId >= 0);
+   assert(interfaceId < node->numberInterfaces);
+   queue = ipLayer->interfaceQueues[interfaceId];
+   
+   // Call the "isEmptyFunction" via a ugly function pointer.
+    
+   return ((*queue->isEmptyFunction)(queue->queueUnion));
+}
+
+int NetworkIpOutputQueueNumberInQueue(
+   GlomoNode* node, 
+   InterfaceIdType interfaceId,
+   NetworkQueueingPriorityType priority)
+
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+   IpOutputQueueType* queue;
+   
+   assert(interfaceId >= 0);
+   assert(interfaceId < node->numberInterfaces);
+   queue = ipLayer->interfaceQueues[interfaceId];
+   
+   // Call the "numberInQueueFunction" via a ugly function pointer.
+    
+   return ((*queue->numberInQueueFunction)(queue->queueUnion, priority));
+}
+
+
+void NetworkIpOutputQueueDequeuePacket(
+   GlomoNode* node,
+   InterfaceIdType interfaceId, 
+   Message** msg,
+   NODE_ADDR* nextHopAddress,
+   NetworkQueueingPriorityType* priority)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+   IpOutputQueueType* queue;
+   NetworkQueueingPriorityType NotUsed = 0;
+   
+   assert(interfaceId >= 0);
+   assert(interfaceId < node->numberInterfaces);
+   queue = ipLayer->interfaceQueues[interfaceId];
+   
+   (*queue->retrieveAndMaybeDequeueFunction)(
+      queue->queueUnion, 
+      FALSE, NotUsed, 0, 
+      msg, priority,
+      TRUE);
+      
+   assert(*msg != NULL);
+      
+   *nextHopAddress = 
+      ((TackedOnInfoWhileInNetworkQueueType*)((*msg)->info))->nextHopAddress;
+}
+
+   
+void NetworkIpOutputQueueDequeuePacketForAPriority(
+   GlomoNode* node,
+   InterfaceIdType interfaceId, 
+   NetworkQueueingPriorityType priority,
+   Message** msg,
+   NODE_ADDR* nextHopAddress)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+   IpOutputQueueType* queue;
+   NetworkQueueingPriorityType NotUsed = 0;
+   
+   assert(interfaceId >= 0);
+   assert(interfaceId < node->numberInterfaces);
+   queue = ipLayer->interfaceQueues[interfaceId];
+   
+   (*queue->retrieveAndMaybeDequeueFunction)(
+      queue->queueUnion, 
+      TRUE, priority, 0, 
+      msg, &NotUsed,  
+      TRUE);
+      
+   *nextHopAddress = 
+      ((TackedOnInfoWhileInNetworkQueueType*)((*msg)->info))->nextHopAddress;
+}
+
+
+
+void NetworkIpOutputQueueTopPacket(
+   GlomoNode* node,
+   InterfaceIdType interfaceId, 
+   Message** msg,
+   NODE_ADDR* nextHopAddress,
+   NetworkQueueingPriorityType* priority)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+   IpOutputQueueType* queue;
+   NetworkQueueingPriorityType NotUsed = 0;
+   
+   assert(interfaceId >= 0);
+   assert(interfaceId < node->numberInterfaces);
+   queue = ipLayer->interfaceQueues[interfaceId];
+   
+   (*queue->retrieveAndMaybeDequeueFunction)(
+      queue->queueUnion, 
+      FALSE, NotUsed, 0, 
+      msg, priority, 
+      FALSE);
+      
+   *nextHopAddress = 
+      ((TackedOnInfoWhileInNetworkQueueType*)((*msg)->info))->nextHopAddress;
+}
+
+   
+void NetworkIpOutputQueueTopPacketForAPriority(
+   GlomoNode* node,
+   InterfaceIdType interfaceId, 
+   NetworkQueueingPriorityType priority,
+   Message** msg,
+   NODE_ADDR* nextHopAddress)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+   IpOutputQueueType* queue;
+   NetworkQueueingPriorityType NotUsed = 0;
+   
+   assert(interfaceId >= 0);
+   assert(interfaceId < node->numberInterfaces);
+   queue = ipLayer->interfaceQueues[interfaceId];
+   
+   (*queue->retrieveAndMaybeDequeueFunction)(
+      queue->queueUnion, 
+      TRUE, priority, 0,
+      msg, &NotUsed, 
+      FALSE);
+      
+   *nextHopAddress = 
+      ((TackedOnInfoWhileInNetworkQueueType*)((*msg)->info))->nextHopAddress;
+}
+
+
+static
+void NetworkIpOutputQueueInsert(
+   GlomoNode* node,
+   InterfaceIdType interfaceId,
+   Message* msg,
+   NODE_ADDR nextHopAddress, 
+   BOOL* QueueIsFull)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+   IpHeaderType* ipHeader = (IpHeaderType*)msg->packet;
+   IpOutputQueueType* queue;
+   
+   assert(interfaceId >= 0);
+   assert(interfaceId < node->numberInterfaces);
+   queue = ipLayer->interfaceQueues[interfaceId];
+   
+   GLOMO_MsgInfoAlloc(node, msg, sizeof(TackedOnInfoWhileInNetworkQueueType));
+   
+   // Tack on the nextHopAddress to the message using the insiduous "info"
+   // field.
+                                          
+   ((TackedOnInfoWhileInNetworkQueueType*)(msg->info))->nextHopAddress = 
+      nextHopAddress;
+   
+   // Call the "insertFunction" via a ugly function pointer.
+   
+   (*ipLayer->interfaceQueues[interfaceId]->insertFunction)(
+      ipLayer->interfaceQueues[interfaceId]->queueUnion,
+      msg, 
+      ipHeader->ip_tos,
+      QueueIsFull);
+}      
+   
+
+
+   
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+
+//    SIMPLE GLOMOSIM MESSAGE SENDING ROUTINES           
+
+
+//
+// FUNCTION   QueueUpIpFragmentForMacLayer()
+// PURPOSE    Sends a IP packet to the Mac layer specifying the
+//            next node address "nextHop" for it to go.
+//
+
+static
+void QueueUpIpFragmentForMacLayer(
+   GlomoNode* node, 
+   Message* msg, 
+   InterfaceIdType initInterfaceId,
+   NODE_ADDR nextHop)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+   IpHeaderType* ipHeader = (IpHeaderType*)msg->packet;
+   BOOL QueueIsFull;
+   BOOL QueueWasEmpty;
+   
+   InterfaceIdType interfaceId = initInterfaceId;
+   
+   if (interfaceId == GET_INTERFACE_FROM_TABLE) {
+      NODE_ADDR nextHopCheck;
+      NetworkGetInterfaceAndNextHopFromForwardingTable(node, nextHop,
+         &interfaceId, &nextHopCheck);
+      if (nextHopCheck == NETWORK_UNREACHABLE) {
+         fprintf(stderr, "IP Routing Error: Interface for next hop is ",
+                  "not in the forwarding table.");
+         assert(FALSE); abort();
+      }
+   }
+  
+   QueueWasEmpty = NetworkIpOutputQueueIsEmpty(node, interfaceId);
+   
+   NetworkIpOutputQueueInsert(node, interfaceId, msg, nextHop, &QueueIsFull);
+   
+   if (QueueIsFull) {
+      ipLayer->interfaceQueues[interfaceId]->packetsLostToOverflow++;
+      GLOMO_MsgFree(node, msg);
+   } else { 
+      if (QueueWasEmpty) {
+         GLOMO_MacNetworkLayerHasPacketToSend(node, interfaceId);
+      }
+   }
+}
+
+
+
+
+
+//
+// FUNCTION   SendToUdp()
+// PURPOSE    Simply sends a message already stripped of its IP
+//            header up to UDP in the transport layer.  The 
+//            source address of the packet is also sent. 
+//
+
+void SendToUdp(
+   GlomoNode *node,  
+   Message *msg, 
+   NetworkQueueingPriorityType priority,
+   NODE_ADDR sourceAddress,
+   NODE_ADDR destinationAddress) 
+{
+   GLOMO_MsgSetEvent(msg, MSG_TRANSPORT_FromNetwork);
+   GLOMO_MsgSetLayer(msg, GLOMO_TRANSPORT_LAYER, TRANSPORT_PROTOCOL_UDP);
+   GLOMO_MsgInfoAlloc(node, msg, sizeof(NetworkToTransportInfo));
+   ((NetworkToTransportInfo *)msg->info)->sourceAddr = sourceAddress;
+   ((NetworkToTransportInfo *)msg->info)->destinationAddr = destinationAddress;
+   ((NetworkToTransportInfo *)msg->info)->priority = priority;
+   GLOMO_MsgSend(node, msg, PROCESS_IMMEDIATELY);
+}
+
+
+//
+// FUNCTION   SendToTcp()
+// PURPOSE    Simply sends a message already stripped of its IP
+//            header up to TCP in the transport layer.  The 
+//            source address of the packet is also sent. 
+//
+
+static
+void SendToTcp(
+   GlomoNode *node,  
+   Message *msg, 
+   NetworkQueueingPriorityType priority,
+   NODE_ADDR sourceAddress,
+   NODE_ADDR destinationAddress) 
+{
+   GLOMO_MsgSetEvent(msg, MSG_TRANSPORT_FromNetwork);
+   GLOMO_MsgSetLayer(msg, GLOMO_TRANSPORT_LAYER, TRANSPORT_PROTOCOL_TCP);
+   GLOMO_MsgInfoAlloc(node, msg, sizeof(NetworkToTransportInfo));
+   ((NetworkToTransportInfo *)msg->info)->sourceAddr = sourceAddress;
+   ((NetworkToTransportInfo *)msg->info)->destinationAddr = destinationAddress;
+   ((NetworkToTransportInfo *)msg->info)->priority = priority;
+   GLOMO_MsgSend(node, msg, PROCESS_IMMEDIATELY);
+}
+
+
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+
+//    REASSEMBLY BUFFER LIST ROUTINES
+  
+// Functions for a Simple list abstract data type 
+// for storing reassembly buffers.
+
+
+//
+// FUNCTION    IpReassemblyBufferList_Init()
+// PURPOSE     Initalize the list.
+//
+
+static 
+void IpReassemblyBufferList_Init(
+   IpReassemblyBufferListType* reassemblyBufferList) 
+{
+   reassemblyBufferList->firstPtr = NULL;
+   reassemblyBufferList->freeListPtr = NULL;
+}
+
+
+//
+// FUNCTION  IpReassemblyBufferList_Delete()
+// PURPOSE   Searches the list and deletes the list element
+//           identified by the "reassemblyBufferPtr" parameter.
+//           The deleted list cell is put on a free list.
+//
+   
+static                                              
+void IpReassemblyBufferList_Delete(
+   IpReassemblyBufferListType* reassemblyBufferList,
+   IpReassemblyBufferType** reassemblyBufferPtr) 
+{
+   //
+   // Find the reassembly buffer in the list.
+   //
+   IpReassemblyBufferListCellType* previousCellPtr = NULL;    
+   IpReassemblyBufferListCellType* 
+      currentCellPtr = reassemblyBufferList->firstPtr; 
+        
+   while ((currentCellPtr != NULL) && 
+          (currentCellPtr->reassemblyBuffer.packetUnderConstruction !=
+           (*reassemblyBufferPtr)->packetUnderConstruction))
+   {
+      previousCellPtr = currentCellPtr;
+      currentCellPtr = currentCellPtr->nextPtr;
+   }//while//
+   
+   assert(currentCellPtr != NULL);
+   //
+   // Unlink the cell.
+   //
+   if (previousCellPtr == NULL) {
+      reassemblyBufferList->firstPtr = currentCellPtr->nextPtr;
+   } else {
+      previousCellPtr->nextPtr = currentCellPtr->nextPtr;
+   }//if//
+   //
+   // Put the cell on Free List.
+   //
+   currentCellPtr->nextPtr =  reassemblyBufferList->freeListPtr;
+   reassemblyBufferList->freeListPtr = currentCellPtr;
+   (*reassemblyBufferPtr) = NULL;
+}//Delete//
+
+
+
+//
+// FUNCTION  IpReassemblyBufferList_AddNewBuffer()
+// PURPOSE   Adds a new element to the list, getting 
+//           the list cell from the free list if there
+//           is one.
+// RETURN    reassemblyBufferPtr - The new reassembly buffer.
+//
+   
+static
+void IpReassemblyBufferList_AddNewBuffer(
+   IpReassemblyBufferListType* reassemblyBufferList,
+   IpReassemblyBufferType** reassemblyBufferPtr) 
+{
+   IpReassemblyBufferListCellType* newCell = NULL;
+   
+   if (reassemblyBufferList->freeListPtr == NULL) {
+      newCell = (IpReassemblyBufferListCellType*)checked_pc_malloc(
+         sizeof(IpReassemblyBufferListCellType));
+   } else {
+      newCell = reassemblyBufferList->freeListPtr;
+      reassemblyBufferList->freeListPtr = 
+         reassemblyBufferList->freeListPtr->nextPtr;
+   }//if//
+   
+   newCell->nextPtr = reassemblyBufferList->firstPtr;
+   reassemblyBufferList->firstPtr = newCell;
+   
+   *reassemblyBufferPtr = &newCell->reassemblyBuffer;
+}
+
+
+//
+// FUNCTION  IpReassemblyBufferList_AddNewBuffer()
+// PURPOSE   Searches for a reassembly buffer that matches
+//           the packet fragment in "packetFragment".
+//           If one is not found, then make a new one
+//           and return that.
+// RETURN    reassemblyBufferPtr - A reassembly buffer for the fragment.
+//
+
+static
+void IpReassemblyBufferList_FindOrCreateNew(
+   IpReassemblyBufferListType* reassemblyBufferList,
+   const Message* packetFragment,
+   IpReassemblyBufferType** FragBufferPtr,
+   BOOL* FoundExistingBuffer) 
+{
+   IpReassemblyBufferListCellType* 
+      currentCellPtr = reassemblyBufferList->firstPtr; 
+        
+   while ((currentCellPtr != NULL) &&
+          (!IsIpFragmentOf(
+              currentCellPtr->reassemblyBuffer.packetUnderConstruction, 
+              packetFragment)))
+   {
+      currentCellPtr = currentCellPtr->nextPtr;
+   }//while//
+
+   if (currentCellPtr == NULL) {
+      *FoundExistingBuffer = FALSE;
+      IpReassemblyBufferList_AddNewBuffer(reassemblyBufferList, FragBufferPtr);
+   } else {
+      *FoundExistingBuffer = TRUE;
+      (*FragBufferPtr) = &(currentCellPtr->reassemblyBuffer);
+   }//if//
+}//FindOrCreateNew//   
+
+
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+
+
+//  REASSEMBLY BUFFER MANAGEMENT
+
+
+//
+// FUNCTION  ClearReassemblyBuffer() 
+// PURPOSE   Frees resources held by a reassembly buffer.
+//
+
+static
+void ClearReassemblyBuffer(
+   GlomoNode* node, 
+   IpReassemblyBufferType* FragBuffer) 
+{
+   GLOMO_MsgFree(node, FragBuffer->packetUnderConstruction);
+}
+
+
+
+//
+// FUNCTION  ReassemblyBufferHasExpired() 
+// PURPOSE   Is true if the reassembly buffer has expired.
+//
+
+static
+BOOL ReassemblyBufferHasExpired(
+   IpReassemblyBufferType* reassemblyBuffer,
+   clocktype currentTime) 
+{
+   return (reassemblyBuffer->expirationDate < currentTime);   
+}
+
+
+
+//
+// FUNCTION  RemoveExpiredIpReassemblyBuffers() 
+// PURPOSE   Deletes expired reassembly buffers by iterating through the
+//           reassembly buffer list.
+//
+
+static
+void RemoveExpiredIpReassemblyBuffers(
+   GlomoNode* node,
+   IpReassemblyBufferListType* reassemblyBufferList,
+   clocktype currentTime) 
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   IpReassemblyBufferListCellType* previousCellPtr = NULL;    
+   IpReassemblyBufferListCellType* 
+      currentCellPtr = reassemblyBufferList->firstPtr; 
+        
+   while (currentCellPtr != NULL) {
+      if (ReassemblyBufferHasExpired(
+         &(currentCellPtr->reassemblyBuffer), currentTime)) 
+      {
+         IpReassemblyBufferListCellType* 
+            nextCellPtr = currentCellPtr->nextPtr;
+         
+         //
+         // Unlink the cell.
+         //
+         
+         if (previousCellPtr == NULL) {
+            reassemblyBufferList->firstPtr = currentCellPtr->nextPtr;
+         } else {
+            previousCellPtr->nextPtr = currentCellPtr->nextPtr;
+         }//if//
+         //
+         // Put the cell on Free List.
+         //
+         currentCellPtr->nextPtr =  reassemblyBufferList->freeListPtr;
+         reassemblyBufferList->freeListPtr = currentCellPtr;
+         
+         ClearReassemblyBuffer(node, &currentCellPtr->reassemblyBuffer);
+         
+         currentCellPtr = nextCellPtr; 
+         
+         
+      } else {
+         previousCellPtr = currentCellPtr;
+         currentCellPtr = currentCellPtr->nextPtr;
+      }//if//
+   }//while//
+}//RemoveExpiredIpFragmentBuffers//
+
+
+
+
+//-----------------------------------------------------------------------------
+
+//   FRAGMENT REASSEMBLY ROUTINES
+
+
+
+//
+// FUNCTION ExpandReassemblyBuffer() 
+//
+// PURPOSE  Expands a reassembly buffer for when large packets are
+//          defragmented.  The "minSize" specifies the minimal
+//          size that the buffer should be expanded to.
+//
+
+static
+void ExpandReassemblyBuffer(
+   GlomoNode* node,
+   IpReassemblyBufferType* reassemblyBuffer, 
+   int minSize) 
+{
+   int newSize;
+   Message* biggerBufferPacket = GLOMO_MsgAlloc(node, 0, 0, 0);
+   
+   newSize= (reassemblyBuffer->sizeLimit * 
+             REASSEMBLY_BUFFER_EXPANSION_MULTIPLIER);
+             
+   if (newSize < minSize) {
+      assert(minSize <= IP_MAXPACKET);
+      newSize = minSize;
+   }//if//
+             
+   if (newSize > IP_MAXPACKET) {
+      newSize = IP_MAXPACKET;
+   }//if//
+   
+      
+   GLOMO_MsgPacketAlloc(node, biggerBufferPacket, newSize);
+   
+   memcpy(biggerBufferPacket->packet, 
+          reassemblyBuffer->packetUnderConstruction->packet,
+          reassemblyBuffer->sizeLimit);
+
+   reassemblyBuffer->sizeLimit = newSize;
+
+   GLOMO_MsgFree(node, reassemblyBuffer->packetUnderConstruction);
+   reassemblyBuffer->packetUnderConstruction = biggerBufferPacket;
+}
+
+
+
+//
+//  Simple Bit vector manipulation macros.
+//
+
+
+#define BitIsSet(BitVector, Index)  \
+   ((BitVector[(Index)/8] & (1 << ((Index) % 8))) != 0)
+   
+#define SetBit(BitVector, Index) \
+   BitVector[(Index)/8] |= (1 << ((Index) % 8));
+
+
+//
+// FUNCTION CheckForFragmentBufferCompletion() 
+//
+// PURPOSE  Checks the reassembly buffer to if it is complete.
+//          The answer is passed back in the "packetIsComplete" 
+//          boolean output variable.
+//
+
+static
+void CheckForFragmentBufferCompletion(
+   IpReassemblyBufferType* reassemblyBuffer,
+   BOOL* packetIsComplete)
+{
+   int I;
+   int lastIndex = 
+      reassemblyBuffer->endFragmentOffset / reassemblyBuffer->fragmentationSize;
+   
+   // Set the extra bits in the end char in the bit vector, if they
+   // have not already been set.
+   
+   if (!BitIsSet(reassemblyBuffer->fragmentIsHereBitTable, lastIndex)) {
+      for(I = lastIndex; (I < ((lastIndex/8) + 1) * 8); I++) {
+         SetBit(reassemblyBuffer->fragmentIsHereBitTable, I);
+      }//for//
+   }//if//
+   
+   // Super fast byte comparison.  All the bits of the bit vector must
+   // be 1.
+                                             
+   for(I = 0; (I < ((lastIndex/8) + 1)); I++) {
+      if (reassemblyBuffer->fragmentIsHereBitTable[I] != 0xFF) {
+         *packetIsComplete = FALSE;
+         return;
+      }//if//
+   }//for//
+   *packetIsComplete = TRUE;
+}
+      
+      
+   
+//
+// FUNCTION  AddFragmentToReassemblyBuffer() 
+//
+// PURPOSE   Adds the data in a packet fragment to the reassembly buffer.
+//           if that was the last fragment the routine sets a boolean
+//           ("packetIsComplete") and returns a pointer to the complete
+//           packet ("competedPacket").
+//
+   
+   
+static
+void AddFragmentToReassemblyBuffer(
+   GlomoNode* node,
+   IpReassemblyBufferType* reassemblyBuffer,
+   const Message* msg,
+   BOOL* packetIsComplete,
+   Message** completedPacket)
+{
+   // 
+   // Determine the length and where the fragment's data should go.
+   // Expand the reassembly buffer if the packet is too large.
+   //
+
+   Message* bufferPacket = NULL;
+   IpHeaderType* ipHeader = (IpHeaderType*)msg->packet;
+   int ipHeaderSize = IpHeaderSize(ipHeader);
+   
+   int fragmentOffset = FragmentOffset(ipHeader);
+   int fragmentDataLength = ipHeader->ip_len - ipHeaderSize;
+   char* fragmentData = msg->packet + IpHeaderSize(ipHeader);
+   int packetLengthSoFar = ipHeaderSize + fragmentOffset + fragmentDataLength;
+   
+   *packetIsComplete = FALSE;
+   reassemblyBuffer->expirationDate = simclock() + NETWORK_IP_REASS_BUFF_TIMER;
+   
+   if (packetLengthSoFar > reassemblyBuffer->sizeLimit) {
+      ExpandReassemblyBuffer(node, reassemblyBuffer, packetLengthSoFar);
+   }//if//
+   
+                                                        
+   //
+   // Copy in the fragment's data into the reassembly buffer.  Then
+   // set the bit in the table to says that the fragment has arrived.
+   // Currently one bit for each equally sized fragment (except last).
+   // Its not totally general, but probably is good enough.
+   //                                                      
+                                                        
+   bufferPacket = reassemblyBuffer->packetUnderConstruction;
+   
+   memcpy(
+      &(bufferPacket->packet[ipHeaderSize + fragmentOffset]),
+      fragmentData, 
+      fragmentDataLength);
+   
+   if (ipHeader->ip_more_fragments == 0) {
+      reassemblyBuffer->endFragmentHasArrived = TRUE;
+      reassemblyBuffer->endFragmentOffset = fragmentOffset;
+   } else {
+      int fragmentIndex;
+      if (reassemblyBuffer->fragmentationSize == 0) {
+         reassemblyBuffer->fragmentationSize = fragmentDataLength;
+      }//if//
+      
+      // Only simple same sized fragments implemented.
+      
+      assert(fragmentDataLength == reassemblyBuffer->fragmentationSize);
+       
+      fragmentIndex = 
+         fragmentOffset / reassemblyBuffer->fragmentationSize;
+      
+      assert(fragmentIndex < MAX_IP_FRAGMENTS_SIMPLE_CASE);
+      
+      SetBit(reassemblyBuffer->fragmentIsHereBitTable, fragmentIndex);
+   }//if//   
+   
+   //
+   // Check to see if all fragments have arrived and the packet is complete.
+   //
+   
+   if ((reassemblyBuffer->endFragmentHasArrived) && 
+       (reassemblyBuffer->fragmentationSize != 0)) 
+   {
+      CheckForFragmentBufferCompletion(reassemblyBuffer, packetIsComplete);
+      if (*packetIsComplete) {
+         *completedPacket = reassemblyBuffer->packetUnderConstruction;
+         reassemblyBuffer->packetUnderConstruction = NULL;
+      }//if// 
+   }//if//
+}//AddFragmentToReassemblyBuffer//
+
+
+//
+// FUNCTION InitializeReassemblyBuffer() 
+//
+// PURPOSE  Initializes a new reassembly buffer with a packet fragment.
+//
+
+static
+void InitializeReassemblyBuffer(
+   GlomoNode* node,
+   IpReassemblyBufferType* reassemblyBuffer,
+   const Message* msg)
+{
+   int I;
+   BOOL NotUsed;
+   IpHeaderType* msgIpHeader = (IpHeaderType *) msg->packet;  
+   int ipHeaderSize = IpHeaderSize(msgIpHeader);
+   IpHeaderType* bufferIpHeader = NULL;
+   
+   //
+   // Allocate a message to act as a reassembly buffer.
+   //
+   reassemblyBuffer->sizeLimit = SMALL_REASSEMBLY_BUFFER_SIZE;
+   
+   reassemblyBuffer->packetUnderConstruction = GLOMO_MsgAlloc(node, 0, 0, 0);
+   GLOMO_MsgPacketAlloc(node, 
+      reassemblyBuffer->packetUnderConstruction,
+      reassemblyBuffer->sizeLimit);
+   
+   //
+   // Copy over the IP packet header and set the fields in the 
+   // reassembly buffer to initial values including setting the
+   // "fragment is here" bit table to all 0's.
+   //
+   memcpy(
+      reassemblyBuffer->packetUnderConstruction->packet, 
+      msg->packet, ipHeaderSize);
+      
+   bufferIpHeader = 
+      (IpHeaderType*)reassemblyBuffer->packetUnderConstruction->packet;
+   
+   bufferIpHeader->ip_len = 0;
+   SetFragmentOffset(bufferIpHeader, 0);
+   reassemblyBuffer->fragmentationSize = 0;
+   reassemblyBuffer->endFragmentHasArrived = FALSE;
+   reassemblyBuffer->endFragmentOffset = 0;
+                        
+   for(I = 0; I < (MAX_IP_FRAGMENTS_SIMPLE_CASE/8); I++) {
+      reassemblyBuffer->fragmentIsHereBitTable[I] = 0;
+   }
+   
+   // Add the fragment's data to the reassembly buffer.
+      
+   AddFragmentToReassemblyBuffer(node, reassemblyBuffer, msg, &NotUsed, 0);
+}
+
+
+//
+// FUNCTION ProcessFragmentAndMaybeBuildCompletePacket() 
+//
+// PURPOSE  Creates or finds an existing reassembly buffer and moves
+//          the data from the passed message fragment into the buffer.
+//          Then detects whether if all pieces of the packet has arrived
+//          and if it has it passes the completed packet out and
+//          deletes that reassembly buffer.  The routine also scans
+//          for expired reassembly buffers (only when creating a new
+//          buffer).
+//
+
+
+static
+void ProcessFragmentAndMaybeBuildCompletePacket(
+   GlomoNode* node, const Message* msg, 
+   BOOL* packetIsComplete, Message** completedPacket) 
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   IpReassemblyBufferType* reassemblyBuffer = NULL;
+   BOOL foundAnExistingBuffer;   
+   *packetIsComplete = FALSE;
+   
+   IpReassemblyBufferList_FindOrCreateNew(
+      &ipLayer->reassemblyBufferList, msg,
+      &reassemblyBuffer, &foundAnExistingBuffer);
+      
+   if (!foundAnExistingBuffer) {
+      InitializeReassemblyBuffer(node, reassemblyBuffer, msg);
+      RemoveExpiredIpReassemblyBuffers(
+         node, &ipLayer->reassemblyBufferList, simclock());
+   } else {
+      if (!ReassemblyBufferHasExpired(reassemblyBuffer, simclock())) {
+         AddFragmentToReassemblyBuffer(node, reassemblyBuffer, msg, 
+            packetIsComplete, completedPacket);
+         if (*packetIsComplete) {
+            IpReassemblyBufferList_Delete(
+               &ipLayer->reassemblyBufferList, &reassemblyBuffer);     
+         }//if//
+      }//if//
+   }//if//
+}//ProcessFragmentAndMaybeBuildCompletePacket//
+
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+
+//     ROUTING FUNCTIONS
+
+//
+//  Simple functions to look at and set the out of memory
+//  alignment addresses.
+//
+
+static
+NODE_ADDR ConvertRawAddressBytesToNodeAddress(char RawAddressBytes[]) {
+
+   // Done because the address bytes may be out of alignment
+   // on certain processors.
+   
+   NODE_ADDR nodeAddress;
+   memcpy(&nodeAddress, RawAddressBytes, sizeof(NODE_ADDR));
+   return nodeAddress;
+}
+
+static
+void SetRawAddressBytes(NODE_ADDR nodeAddress, char RawAddressBytes[]) 
+{
+   // Done because the address bytes may be out of alignment
+   // on certain processors.
+   
+   memcpy(RawAddressBytes, &nodeAddress, sizeof(NODE_ADDR));
+}
+
+
+//
+// FUNCTION  SourceRouteThePacket()
+//
+// PURPOSE   Find the next hop in the source route and send the
+//           packet.  
+// 
+
+static
+void SourceRouteThePacket(GlomoNode *node, Message *msg) 
+{
+   IpOptionsHeaderType* ipOptions = 
+      IpHeaderSourceRouteOptionField((IpHeaderType*)msg->packet);
+  
+   if (ipOptions->ptr < ipOptions->len) {
+     
+      // Extract Next Address 
+      // The definition of "ptr" seems to number 1 as the 
+      // first byte of the the options field.
+        
+      char* routeRawAddressBytes = (char*)ipOptions + ipOptions->ptr - 1;
+         
+      NODE_ADDR nextHop = 
+         ConvertRawAddressBytesToNodeAddress(routeRawAddressBytes);
+      
+      // Record Route (Replace next address with this node's address).
+      
+      ipOptions->ptr += sizeof(NODE_ADDR);
+
+      NetworkIpSendPacketToMacLayer(
+          node, msg, DEFAULT_INTERFACE, nextHop);
+   } else {
+      assert(FALSE); abort();
+      
+      /* Drop it, strange */
+      
+      GLOMO_MsgFree(node, msg);
+   }//if//
+}       
+
+
+//
+// FUNCTION  RouteThePacketUsingLookupTable()
+//
+// PURPOSE   Tries to route and send the packet using the "forwarding
+//           lookup table. 
+// 
+
+static
+void RouteThePacketUsingLookupTable(GlomoNode *node, Message *msg) {
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+
+   InterfaceIdType interfaceId;
+   NODE_ADDR nextHop;
+   NetworkGetInterfaceAndNextHopFromForwardingTable(node, ipHeader->ip_dst,
+      &interfaceId, &nextHop);
+
+   if (nextHop == NETWORK_UNREACHABLE) {
+      ipLayer->stats.numNetworkUnreachableDrops++;
+      GLOMO_MsgFree(node, msg);
+      return; 
+   }
+   NetworkIpSendPacketToMacLayer(node, msg, interfaceId, nextHop);
+}
+
+
+//
+// FUNCTION  RoutePacketAndSendToMac()
+//
+// PURPOSE   Figure out the next hop in the route and send the packet.
+//           First the "routing function" is checked and if that fails
+//           the default source route or lookup table route is used.
+// 
+
+static
+void RoutePacketAndSendToMac(GlomoNode *node, Message *msg) {
+   GlomoNetworkIp *ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+
+   //
+   // Check if its a broadcast.
+   //
+   
+   if (ipHeader->ip_dst == ANY_DEST) {
+      NetworkIpSendPacketToMacLayer(node, msg, DEFAULT_INTERFACE, ANY_DEST);
+   } else {
+      // First Try to route with the routing protocol supplied routing
+      // function.  If the function doesn't exists or
+      // fails to find a route, then try standard lookup table
+      // or source routing.
+      
+      BOOL PacketWasRouted = FALSE;   
+      if (ipLayer->routerFunction != NULL) {
+         (ipLayer->routerFunction)(
+            node, msg, ipHeader->ip_dst, &PacketWasRouted);
+      }//if//
+      
+      if (!PacketWasRouted) {
+         if (IpHeaderHasSourceRoute(ipHeader)) {
+            SourceRouteThePacket(node, msg);
+         } else {
+            RouteThePacketUsingLookupTable(node, msg);
+         }//if//
+      }//if//
+   }//if//
+}//RoutePacketAndSendToMac//
+
+
+
+
+
+
+//-----------------------------------------------------------------------------
+
+//       FRAGMENTATION ROUTINES
+
+//
+// FUNCTION    NetworkIpSendPacketToMacLayer()
+//
+// PURPOSE     Sends a IP packet to the MAC layer. If the packet is too
+//             large it is fragmented.  The next hop's node address
+//             is specified in "nextHop".
+
+     
+void NetworkIpSendPacketToMacLayer(     
+   GlomoNode* node, 
+   Message* msg, 
+   InterfaceIdType interfaceId, 
+   NODE_ADDR nextHop)
+{ 
+   GlomoNetworkIp *ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   IpHeaderType* ipHeader = (IpHeaderType *) msg->packet;  
+   
+   ipLayer->stats.numPacketsSentToMac++;
+                        
+   if (ipHeader->ip_len <= ipLayer->maxPacketLength) {
+      QueueUpIpFragmentForMacLayer(node, msg, interfaceId, nextHop);
+   } else {
+      int ipHeaderSize = IpHeaderSize(ipHeader);
+      int packetIndex = ipHeaderSize;
+      
+      //
+      // Send the packet by splitting it into fragments of 
+      // maximum IP fragment size.
+      //        
+              
+      while (packetIndex < ipHeader->ip_len) {
+         // 
+         // Figure out the packet fragment's size and create it.
+         
+         IpHeaderType* fragIpHeader = NULL;
+         Message* fragment = GLOMO_MsgAlloc(node, 0, 0, 0);
+         int lastIndex;
+         int fragmentSize;
+         int fragmentDataSize = ipLayer->maxPacketLength - ipHeaderSize;
+         
+         if ((packetIndex + fragmentDataSize) >= ipHeader->ip_len) {
+            //
+            // Its the last fragment.
+            //
+            lastIndex = ipHeader->ip_len - 1;
+            fragmentSize = ipHeaderSize + (lastIndex - packetIndex + 1);
+         } else {
+            //
+            // Shrink fragment data portion to be divisable by 8.
+            //
+            fragmentDataSize = ((fragmentDataSize/8) * 8);
+            fragmentSize = ipHeaderSize + fragmentDataSize;
+            lastIndex = packetIndex + fragmentDataSize - 1;
+         }//if//
+         
+         GLOMO_MsgPacketAlloc(node, fragment, fragmentSize);
+          
+         //
+         // Copy the header (same for all fragments) into the packet.
+         // Then the fragment's specific data.   The set the
+         // fragment's header to specify which part of the packet's
+         // data it contains.
+         //
+         
+         memcpy(fragment->packet, msg->packet, ipHeaderSize);
+         
+         memcpy(&(fragment->packet[ipHeaderSize]),
+                &(msg->packet[packetIndex]), 
+                (fragmentSize - ipHeaderSize));
+                
+         fragIpHeader = (IpHeaderType *) fragment->packet;
+         fragIpHeader->ip_len = fragmentSize;
+         SetFragmentOffset(fragIpHeader, (packetIndex - ipHeaderSize));
+         if (lastIndex == (ipHeader->ip_len - 1)) {
+            fragIpHeader->ip_more_fragments = FALSE; 
+         } else {
+            fragIpHeader->ip_more_fragments = TRUE; 
+         }//if//
+
+         QueueUpIpFragmentForMacLayer(node, fragment, interfaceId ,nextHop);
+         
+         packetIndex = lastIndex + 1;
+      }//while//
+   }//if//
+}//NetworkIpSendPacketToMacLayer//      
+
+
+//-----------------------------------------------------------------------------
+
+
+typedef struct {
+   InterfaceIdType interfaceId;
+   NODE_ADDR nextHop;
+} DelayedSendToMacLayerInfoType;
+
+
+//-----------------------------------------------------------------------------
+//
+// FUNCTION    NetworkIpSendPacketToMacLayerWithDelay()
+//
+// PURPOSE     Same as NetworkIpSendPacketToMacLayer but schedules it
+//             after a simulation delay.
+
+     
+void NetworkIpSendPacketToMacLayerWithDelay(     
+   GlomoNode* node, 
+   Message* msg, 
+   InterfaceIdType interfaceId, 
+   NODE_ADDR nextHop,
+   clocktype delay) 
+{
+   DelayedSendToMacLayerInfoType* info;
+   
+   GLOMO_MsgInfoAlloc(node, msg, sizeof(DelayedSendToMacLayerInfoType));
+   
+   info = (DelayedSendToMacLayerInfoType*)GLOMO_MsgReturnInfo(msg);
+   info->interfaceId = interfaceId;
+   info->nextHop = nextHop;
+   
+   GLOMO_MsgSetLayer(msg, GLOMO_NETWORK_LAYER, NETWORK_PROTOCOL_IP);
+   GLOMO_MsgSetEvent(msg, MSG_NETWORK_DelayedSendToMac);
+   GLOMO_MsgSend(node, msg, delay);
+}
+
+//-----------------------------------------------------------------------------
+
+
+void NetworkIpSendRawGlomoMessageToMacLayer(     
+   GlomoNode* node,
+   Message* rawMessage, 
+   NODE_ADDR destinationAddress,
+   NetworkQueueingPriorityType priority,
+   unsigned char protocol,
+   unsigned int ttl,
+   InterfaceIdType interfaceId,
+   NODE_ADDR nextHop) 
+{
+   AddIpHeader(node, rawMessage, destinationAddress, priority, protocol, ttl);
+   NetworkIpSendPacketToMacLayer(node, rawMessage, interfaceId, nextHop);
+}
+
+
+   
+void NetworkIpSendRawGlomoMessageToMacLayerWithDelay(     
+   GlomoNode* node,
+   Message* rawMessage, 
+   NODE_ADDR destinationAddress,
+   NetworkQueueingPriorityType priority,
+   unsigned char protocol,
+   unsigned int ttl,
+   InterfaceIdType interfaceId,
+   NODE_ADDR nextHop,
+   clocktype delay) 
+{
+   AddIpHeader(node, rawMessage, destinationAddress, priority, protocol, ttl);
+   NetworkIpSendPacketToMacLayerWithDelay(
+      node, rawMessage, interfaceId, nextHop, delay);
+}
+
+
+
+static
+void ProcessDelayedSendToMac(GlomoNode* node, Message* msg) {
+   DelayedSendToMacLayerInfoType* info = 
+      (DelayedSendToMacLayerInfoType*)GLOMO_MsgReturnInfo(msg);
+   NetworkIpSendPacketToMacLayer(node, msg, info->interfaceId, info->nextHop);
+}
+
+
+
+  
+//---------------------------------------------------------------------------
+
+//   SOURCE ROUTING ROUTINE
+
+      
+//
+// FUNCTION    NetworkIpSendPacketToMacLayerWithNewStrictSourceRoute()
+//
+// PURPOSE     Tacks on a new source route to an existing IP packet and
+//             then sends the packet to the MAC layer.
+//
+// PARAMETERS  msg - The message to add the new source route.
+//             nextHopAddress - The address of the next node on the route.
+//             newRouteAddresses[] - The source route, a list of addresses.
+//             numNewRouteAddress - The length of the new source route.
+//
+
+void NetworkIpSendPacketToMacLayerWithNewStrictSourceRoute(
+   GlomoNode *node,
+   Message *msg, 
+   NODE_ADDR newRouteAddresses[],
+   int numNewRouteAddresses,
+   BOOL removeExistingRecordedRoute)
+{
+   IpHeaderType* ipHeader = (IpHeaderType*)msg->packet;
+   char* NewRoutePositionPtr;
+
+   IpOptionsHeaderType* ipOption = IpHeaderSourceRouteOptionField(ipHeader);
+   
+   if (ipOption == NULL) {
+      // 
+      // Add a source route to a packet with no source route
+      // currently. The next equation uses the fact that this
+      // sum will always be divisable by 4.                                           
+      //  
+      AddIpOptionField(node, msg, IPOPT_SSRR, 
+         ((numNewRouteAddresses * sizeof(NODE_ADDR)) +
+         IP_SOURCE_ROUTE_OPTION_PADDING));
+         
+   } else {
+      //
+      // Replace a source route to already existing source routing option
+      // header.
+      //
+      if (removeExistingRecordedRoute) {
+         ipOption->ptr = IPOPT_MINOFF;
+      }//if//      
+
+      ExpandOrShrinkIpOptionField(node, msg, IPOPT_SSRR, 
+         ((ipOption->ptr - 1) + (numNewRouteAddresses * sizeof(NODE_ADDR)) +
+         IP_SOURCE_ROUTE_OPTION_PADDING));
+   }//if//
+ 
+   // Copy the new route into the option header. Must be
+   // byte copy because of alignment issues.
+
+   ipHeader = (IpHeaderType*)msg->packet;
+   ipOption = IpHeaderSourceRouteOptionField(ipHeader);
+   NewRoutePositionPtr = 
+      (char*)IpHeaderSourceRouteOptionField(ipHeader) + (ipOption->ptr - 1);
+    
+   memcpy(NewRoutePositionPtr, newRouteAddresses,  
+      (sizeof(NODE_ADDR)* numNewRouteAddresses));
+   
+   // Special case for DSR. Allows for new replacement source route
+   // whose first addresses is current node. It just moves the route
+   // pointer to the correct next hop.
+
+   if ((removeExistingRecordedRoute) && 
+       (newRouteAddresses[0] == node->nodeAddr))
+   {
+      ipOption->ptr = ipOption->ptr + sizeof(NODE_ADDR);
+   }//if//
+
+   SourceRouteThePacket(node, msg);
+   
+}//NetworkIpSendPacketToMacLayerWithNewStrictSourceRoute//
+
+
+//---------------------------------------------------------------------------
+
+//  CALLBACK FUNCTION SETUP ROUTINES FOR ROUTING PROTOCOLS
+
+
+//
+// FUNCTION   NetworkIpSetRouterFunction()
+//
+// PURPOSE    Allows a routing protocol to set the "routing function" 
+//            (one of its functions) which is called when a packet
+//            needs to be routed.
+//
+
+void NetworkIpSetRouterFunction(
+   GlomoNode *node, RouterFunctionType RouterFunctionPtr) 
+{
+   GlomoNetworkIp *ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+   assert(ipLayer->routerFunction == NULL);
+   ipLayer->routerFunction = RouterFunctionPtr;
+}
+
+
+//
+// FUNCTION   NetworkIpSetPromiscuousMessagePeekFunction()
+//
+// PURPOSE    Allows a routing protocol to set the "promiscuous mode
+//            MAC packet "Peek" function (one of its functions) 
+//            which lets the routing protocol to look at these MAC
+//            layer packets.
+//
+
+void NetworkIpSetPromiscuousMessagePeekFunction(
+   GlomoNode* node, 
+   PromiscuousMessagePeekFunctionType PeekFunctionPtr)
+{
+   GlomoNetworkIp *ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+   assert(ipLayer->promiscuousMessagePeekFunction == NULL);
+   ipLayer->promiscuousMessagePeekFunction = PeekFunctionPtr;
+}
+
+//
+// FUNCTION   NetworkIpSetPacketDropNotificationFunction
+//
+// PURPOSE    Allows a routing protocol to set the "packet drop 
+//            notification function" which allows the routing
+//            protocol process packets that are going to be dropped
+//            (for a broken link).
+//            
+//
+
+void NetworkIpSetPacketDropNotificationFunction(
+   GlomoNode* node, 
+   PacketDropNotificationFunctionType packetDropHandlerPtr)
+{
+   GlomoNetworkIp *ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+   assert(ipLayer->packetDropHandlerFunction == NULL);
+   ipLayer->packetDropHandlerFunction = packetDropHandlerPtr;
+}
+
+
+//---------------------------------------------------------------------------
+
+// INTERFACE ROUTINES FOR OTHER LAYERS AND SUBSYSTEMS
+
+
+//
+// FUNCTION    NetworkIpSneakPeekAtMacPacket()
+//
+// PURPOSE     Called Directly by the MAC layer, this allows a routing
+//             protocol to "sneak a peek" or "tap" messages it would not
+//             normally see from the MAC layer.  This function will
+//             possibly unfragment such packets and call the function
+//             registered by the routing protocol to do the "Peek".
+//
+// PARAMETERS  msg - The message being peeked at from the MAC layer.  Must
+//                   not be freed or modified!
+//
+
+
+void NetworkIpSneakPeekAtMacPacket(GlomoNode *node,  const Message *msg) 
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   
+   if (ipLayer->promiscuousMessagePeekFunction != NULL) {
+      IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+   
+      if (!IpPacketIsFragmented(ipHeader)) { 
+         (*ipLayer->promiscuousMessagePeekFunction)(node, msg);
+      } else {
+         BOOL packetIsComplete;
+         Message* completePacket;
+         
+         ProcessFragmentAndMaybeBuildCompletePacket(
+              node, msg, &packetIsComplete, &completePacket); 
+         if (packetIsComplete) {
+            (*ipLayer->promiscuousMessagePeekFunction)(node, completePacket);
+            GLOMO_MsgFree(node, completePacket);
+         }//if//
+     }//if//
+   }//if//
+
+// TBD   GLOMO_MsgFree(msg);
+}//NetworkIpSneakPeekAtMacPacket//
+
+
+//
+// FUNCTION    NetworkIpSendRawGlomoMessage()
+//
+// PURPOSE     Used by routing protocols in the network layer
+//             to send a new routing protocol packet to another node.
+//             The message sent is a raw GloMoSim WITHOUT an IP header.
+//             The packet follows the usual code path through the network
+//             layer where it is routed and possibly fragmented.
+//
+// PARAMETERS  destinationAddress - Where the packet is going.
+//             priority - priority of the packet.
+//             protocol - network protocol being used.
+//
+
+void NetworkIpSendRawGlomoMessage(
+   GlomoNode* node,
+   Message* rawMessage, 
+   NODE_ADDR destinationAddress,
+   NetworkQueueingPriorityType priority,
+   unsigned char protocol,
+   unsigned int ttl)
+{
+   AddIpHeader(node, rawMessage, destinationAddress, priority, protocol, ttl);
+
+   RoutePacketAndSendToMac(node, rawMessage);
+}
+
+
+//
+// FUNCTION    NetworkIpSendNewPacket()
+//
+// PURPOSE     Used by routing protocols in the network layer
+//             to send a new routing protocol packet to another node.
+//             If the routing protocol has a routing function, the
+//             it will quickly see it again to be routed.
+//
+// PARAMETERS  destinationAddress - Where the packet is going.
+//             payload, payloadSize - The payload to send.
+//             priority - priority of packet.
+//             protocol - IP protocol number.
+//
+
+void NetworkIpSendNewPacket(
+   GlomoNode* node, 
+   NODE_ADDR destinationAddress,
+   NetworkQueueingPriorityType priority,
+   unsigned char protocol,
+   unsigned int ttl,
+   char* payload, int payloadSize)
+{
+   Message* newMessage = GLOMO_MsgAlloc(node, 0, 0, 0);
+   GLOMO_MsgPacketAlloc(node, newMessage, payloadSize);
+   memcpy(newMessage->packet, payload, payloadSize);
+   
+   AddIpHeader(node, newMessage, destinationAddress, priority, protocol, ttl);
+   RoutePacketAndSendToMac(node, newMessage);
+}
+
+
+//
+// FUNCTION    NetworkIpSendRawGlomoMessageWithDelay()
+//
+// PURPOSE     Used by routing protocols in the network layer
+//             to send a new routing protocol packet to another node.
+//             The message sent is a raw GloMoSim WITHOUT an IP header.
+//             The routine simply slaps on an IP header and schedules a
+//             self message to process the packet.
+//             The packet follows the usual code path through the network
+//             layer where it is routed and possibly fragmented.
+//
+// PARAMETERS  destinationAddress - Where the packet is going.
+//             priority - priority of the packet.
+//             protocol - IP protocol number.
+//             delay - The delay until the packet is delivered to this
+//                     layer.
+//
+
+
+void NetworkIpSendRawGlomoMessageWithDelay(
+   GlomoNode* node, 
+   Message* msg, 
+   NODE_ADDR destinationAddress,
+   NetworkQueueingPriorityType priority,
+   unsigned char protocol,
+   unsigned int ttl,
+   clocktype delay) 
+{
+   AddIpHeader(node, msg, destinationAddress, priority, protocol, ttl);
+
+   GLOMO_MsgSetEvent(msg, MSG_NETWORK_FromTransportOrRoutingProtocol);
+   GLOMO_MsgSetLayer(msg, GLOMO_NETWORK_LAYER, NETWORK_PROTOCOL_IP);
+   GLOMO_MsgSend(node, msg, delay);
+}
+
+
+//
+// FUNCTION    NetworkIpSendNewPacketWithDelay()
+//
+// PURPOSE     Used by routing protocols in the network layer
+//             to send a new routing protocol packet to another node.
+//             If the routing protocol has a routing function, the
+//             it will quickly see it again to be routed.
+//
+// PARAMETERS  destinationAddress - Where the packet is going.
+//             payload, payloadSize - The payload to send.
+//             priority - priority of packet.
+//             protocol - IP protocol number.
+//             delay - The delay until the packet is delivered to this
+//                     layer.
+//
+
+
+void NetworkIpSendNewPacketWithDelay(
+   GlomoNode* node, 
+   NODE_ADDR destinationAddress,
+   NetworkQueueingPriorityType priority,
+   unsigned char protocol,
+   unsigned int ttl,
+   char* payload, int payloadSize,
+   clocktype delay)
+{
+   Message* newMessage = GLOMO_MsgAlloc(node, 0, 0, 0);
+   GLOMO_MsgPacketAlloc(node, newMessage, payloadSize);
+   memcpy(newMessage->packet, payload, payloadSize);
+   
+   NetworkIpSendRawGlomoMessageWithDelay(
+      node, newMessage, destinationAddress, priority, protocol, ttl, delay);
+}
+
+
+//
+// FUNCTION  NetworkIpReceivePacketFromTransportLayer()
+//
+// PURPOSE   Interface for packets from above. 
+//           Simply calls an another function with the exact
+//           same parameters..
+//
+// PARAMETERS  destinationAddress - Where the packet is going.
+//             priority - priority of the packet.
+//             protocol - The protocol code (like UDP).
+//             delay - The amount of layer simulation delay for the packet.
+//
+
+
+void NetworkIpReceivePacketFromTransportLayer(
+   GlomoNode* node,
+   Message* rawMessage, 
+   NODE_ADDR destinationAddress,
+   NetworkQueueingPriorityType priority,
+   unsigned char protocol,
+   clocktype delay)
+{
+   NetworkIpSendRawGlomoMessageWithDelay(
+      node, rawMessage, destinationAddress, priority, protocol, 0, delay);
+}
+
+
+//---------------------------------------------------------------------------
+
+//    EVENT HANDLING ROUTINES
+
+//
+// FUNCTION  ProcessPacketForMeFromMac()
+//
+// PURPOSE   Direct the packet either to the transport layer or
+//           to a routing protocol.
+//
+
+static
+void ProcessPacketForMeFromMac(GlomoNode *node,  Message *msg)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   NODE_ADDR sourceAddress;
+   NODE_ADDR destinationAddress;
+   unsigned char IpProtocol;
+   unsigned int ttl;
+   NetworkQueueingPriorityType priority;
+
+   if (ipLayer->routerFunction != NULL)
+   {
+      IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+      if (ipHeader->ip_dst != ANY_DEST) {
+         // 
+         // Let the routing protocol get a look at the original packet 
+         // before it is given to the transport layer or a
+         // routing protocol.
+         //
+         BOOL PacketWasRouted = FALSE;
+         (ipLayer->routerFunction)(node, msg, ipHeader->ip_dst, &PacketWasRouted);
+         assert(!PacketWasRouted);
+      }//if//
+   }//if//
+
+   
+   NetworkIpRemoveIpHeader(node, msg, &sourceAddress, &destinationAddress, 
+      &priority, &IpProtocol, &ttl);
+   
+   
+   switch(IpProtocol) {
+   
+   case IPPROTO_UDP: {
+      ipLayer->stats.numPacketsDeliveredToThisNode++;
+      ipLayer->stats.deliveredPacketTtlTotal += ttl;
+   
+      SendToUdp(node, msg, priority, sourceAddress, destinationAddress);
+      break;
+   } 
+   
+   case IPPROTO_TCP: {
+      ipLayer->stats.numPacketsDeliveredToThisNode++;
+      ipLayer->stats.deliveredPacketTtlTotal += ttl;
+
+      SendToTcp(node, msg, priority, sourceAddress, destinationAddress);
+      break;
+   } 
+   
+   case IPPROTO_ODMRP: {
+       RoutingOdmrpHandleProtocolPacket(node, msg, sourceAddress,
+                                        destinationAddress);
+       break;
+   }
+
+   case IPPROTO_AODV: {
+      RoutingAodvHandleProtocolPacket(node, msg, sourceAddress, 
+          destinationAddress, ttl);
+      break;
+   }
+
+   case IPPROTO_DSR: {
+      RoutingDsrHandleProtocolPacket(node, msg, sourceAddress,
+          destinationAddress, ttl);
+      break;
+   }
+
+   case IPPROTO_ZRP: {
+      RoutingZrpHandleProtocolPacket(node, msg, sourceAddress,
+          destinationAddress);
+      break;
+   }
+
+   case IPPROTO_LAR1: {
+      NetworkLar1HandleProtocolPacket(node, msg);
+      break;
+   }
+
+   //case IPPROTO_OSPF: {
+   //   OspfHandleRoutingProtocolPacket(node, msg, sourceAddress);
+   //   break;
+   //}
+   default:
+      NetworkIpUserHandleProtocolPacket(node, msg, IpProtocol, sourceAddress, 
+          destinationAddress, ttl);
+      break;
+   }//switch//   
+}//ProcessPacketForMeFromMac//
+
+
+
+//
+// FUNCTION    ProcessPacketForAnotherFromMac()
+//
+// PURPOSE     Figure out what to do with a packet for another node
+//             from the MAC Layer. It needs to be routed or dropped.
+// PARAMETERS  msg  - GloMoSim Message to handle from the MAC layer.
+//
+
+static
+void ProcessPacketForAnotherFromMac(GlomoNode *node, Message *msg) 
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;  
+
+   ipLayer->stats.numPacketsRoutedForOtherNodes++;
+   
+   if (ipHeader->ip_ttl == 0) {
+      // Has transversed max. number of hops so drop it.
+
+      ipLayer->stats.numTtlExpirationDrops++;
+      GLOMO_MsgFree(node, msg);
+   } else {
+      RoutePacketAndSendToMac(node, msg);
+   }//if//
+}//ProcessPacketForAnotherFromLowerLayer//   
+
+
+
+//
+// FUNCTION   GuiCrap()
+// PURPOSE     
+//
+
+static
+void GuiCrap(GlomoNode *node, Message* msg, NODE_ADDR lastHopAddress) {
+   IpHeaderType* ipHeader = (IpHeaderType *) msg->packet;  
+   
+   if ((node->networkData.guiOption == TRUE) && 
+       (ipHeader->ip_dst != ANY_DEST) &&
+       (ipHeader->ip_p != IPPROTO_ZRP))
+   {
+      //
+      // receive a packet from MAC, using VT to display */
+      //
+      char simTime[50];
+
+      ctoa(simclock(), simTime);
+      /*
+       *  JGUI_DrawThickLine(info->sourceAddr, node->nodeAddr,
+       *  5, simTime, JGUI_RED);
+       */
+      JGUI_DrawLine(lastHopAddress, node->nodeAddr, simTime, JGUI_RED);
+   }
+}
+
+
+//
+// FUNCTION    ProcessPacketFromMac()
+//
+// PURPOSE     Figure out what to do with a packet from the MAC Layer.
+// PARAMETERS  msg  - GloMoSim Message to handle from the MAC layer.
+//
+
+static
+void ProcessPacketFromMac(GlomoNode *node, Message* msg) 
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;  
+
+   ipHeader->ip_ttl = ipHeader->ip_ttl - 1;
+  
+   if (IsMyPacket(node, msg)) {
+      BOOL packetIsComplete = TRUE;
+      Message* completePacket = NULL;
+      IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+     
+     if (IpPacketIsFragmented(ipHeader)) { 
+        ProcessFragmentAndMaybeBuildCompletePacket(
+           node, msg, &packetIsComplete, &completePacket); 
+        GLOMO_MsgFree(node, msg);
+     } else {
+        completePacket = msg;
+     }//if// 
+     if (packetIsComplete) {
+        ProcessPacketForMeFromMac(node, completePacket);
+     }//if//
+     
+  } else {
+     ProcessPacketForAnotherFromMac(node, msg);
+  }//if//
+}
+
+
+void NetworkIpReceivePacketFromMacLayer(
+   GlomoNode* node, 
+   Message* msg, 
+   NODE_ADDR lastHopAddress)
+{
+   GuiCrap(node, msg, lastHopAddress);
+   ProcessPacketFromMac(node, msg);
+}
+
+void NetworkIpNotifyOfPacketDrop(
+   GlomoNode* node, 
+   Message* msg,
+   NODE_ADDR triedNextHop)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   if (ipLayer->packetDropHandlerFunction != NULL) {
+      ipLayer->packetDropHandlerFunction(node, msg, triedNextHop);
+   }//if//
+   GLOMO_MsgFree(node, msg);   
+}
+
+
+//
+// FUNCTION   NetworkIpLayer
+// PURPOSE    To handle Network IP layer events, incoming messages and
+//            messages sent to itself (timers,etc).
+// PARAMETERS 
+//    message - Abstract GloMoSim Message (Packet) to handle.
+//
+
+void NetworkIpLayer(GlomoNode *node, Message *msg) {
+   switch (msg->protocolType) {
+   
+   case NETWORK_PROTOCOL_IP: {
+      
+      switch(msg->eventType) {
+      
+      case MSG_NETWORK_FromTransportOrRoutingProtocol: {
+         
+         RoutePacketAndSendToMac(node, msg);
+         break;
+      }
+   
+      case MSG_NETWORK_DelayedSendToMac: {
+         ProcessDelayedSendToMac(node, msg);
+         break;
+      }    
+      default:
+         assert(FALSE); abort();
+      }//switch//
+      
+      break;
+   }
+   
+   case ROUTING_PROTOCOL_ODMRP: {
+       RoutingOdmrpHandleProtocolEvent(node, msg);
+       break;
+   }
+
+   case ROUTING_PROTOCOL_AODV: {
+      RoutingAodvHandleProtocolEvent(node, msg);
+      break;
+   }
+
+   case ROUTING_PROTOCOL_DSR: {
+      RoutingDsrHandleProtocolEvent(node, msg);
+      break;
+   }
+
+   case ROUTING_PROTOCOL_ZRP: {
+      RoutingZrpHandleProtocolEvent(node, msg);
+      break;
+   }
+
+   case ROUTING_PROTOCOL_LAR1: {
+      NetworkLar1HandleCheckTimeoutAlarm(node, msg);
+      break;
+   } 
+   
+   //case ROUTING_PROTOCOL_OSPF: {
+   //   OspfHandleRoutingProtocolEvent(node, msg);
+   //   break;
+   //}
+   
+   //case ROUTING_PROTOCOL_ALL: {
+   //   break;
+   //}
+ 
+   default: 
+      NetworkIpUserHandleProtocolEvent(node, msg);
+      break;
+   }//switch//
+}
+
+
+
+//
+// FUNCTION   NetworkIpInitStats
+// PURPOSE    Initialize Statistic variables.
+//
+
+
+static
+void NetworkIpInitStats(NetworkIpStatsType* stats)
+{
+   stats->numPacketsSentToMac = 0;
+   stats->numPacketsRoutedForOtherNodes = 0;
+   stats->numPacketsDeliveredToThisNode = 0;
+   stats->deliveredPacketTtlTotal = 0;
+   stats->numNetworkUnreachableDrops = 0;
+   stats->numTtlExpirationDrops = 0;
+} 
+
+
+void NetworkIpAddNewInterfaceWithOutputQueue(
+   GlomoNode* node,
+   InterfaceIdType interfaceId,
+   const GlomoNodeInput* nodeInput)
+{
+   char queueTypeName[GLOMO_MAX_STRING_LENGTH];
+   BOOL wasFound;
+   
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+   assert((interfaceId >= 0) && (interfaceId < MAX_NUM_INTERFACES));
+
+   if (ipLayer->interfaceQueues[interfaceId] != NULL) {
+         printf("GLOMO Error: Node %d : Conflict with interface %d .\n",
+                node->id, interfaceId);
+         abort();
+   }//if//
+   
+   ipLayer->interfaceQueues[interfaceId] = 
+      (IpOutputQueueType*)checked_pc_malloc(sizeof(IpOutputQueueType));
+
+   ipLayer->interfaceQueues[interfaceId]->packetsLostToOverflow = 0;
+   
+   GLOMO_ReadStringInstance(
+       node->nodeAddr, nodeInput, "NETWORK-QUEUE-TYPE", interfaceId,
+       TRUE, &wasFound, queueTypeName);
+
+   if ((!wasFound) || (strcmp(queueTypeName, "FIFO") == 0)) {
+      MultiFifoPacketQueue_Initialize(
+         ipLayer->interfaceQueues[interfaceId], 
+         node,
+         interfaceId,
+         nodeInput);
+   } else {
+      printf("GLOMO Error: Unknown Network layer queuing "
+             "type (%s).\n", queueTypeName);
+      assert(FALSE); abort();
+   }//if//
+}
+
+
+//
+// FUNCTION   NetworkIpPreInit
+// PURPOSE    Just create and initialize variables and 
+//            datastructures to 0 or NULL.
+//            init datastructures.  This routine is
+//            not dependent on any input or state and
+//            should be called before initializing lower
+//            layers.
+//
+
+void NetworkIpPreInit(GlomoNode* node) {
+   GlomoNetworkIp* ipLayer = 
+      (GlomoNetworkIp *)checked_pc_malloc(sizeof(GlomoNetworkIp));
+   int I;
+   
+   node->networkData.networkVar = (void *)ipLayer;
+
+   ipLayer->routingProtocolChoice = ROUTING_PROTOCOL_NONE;
+   ipLayer->routingProtocol = NULL;            
+   ipLayer->routerFunction = NULL;
+   ipLayer->packetDropHandlerFunction = NULL;
+   ipLayer->promiscuousMessagePeekFunction = NULL;
+   ipLayer->packetIdCounter = 0;
+   NetworkInitForwardingTable(node);
+   IpReassemblyBufferList_Init(&(ipLayer->reassemblyBufferList));
+   ipLayer->maxPacketLength = NETWORK_IP_FRAG_UNIT;
+   NetworkIpInitStats(&(ipLayer->stats));
+   for(I = 0; I < MAX_NUM_INTERFACES; I++) {
+      ipLayer->interfaceQueues[I] = NULL;
+   }//for//
+
+   assert(MAX_IP_FRAGMENTS_SIMPLE_CASE % 8 == 0);
+}
+
+
+
+//
+// FUNCTION   NetworkIpInit
+// PURPOSE    Initialize variables, being called once for each node 
+//            at the beginning.
+// PARAMETERS  
+//            nodeInput - 
+//
+
+void NetworkIpInit(GlomoNode* node, const GlomoNodeInput* nodeInput)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+
+   BOOL retVal;
+   char protocolString[GLOMO_MAX_STRING_LENGTH];
+   
+   
+
+   retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, 
+                             "ROUTING-PROTOCOL", protocolString);
+
+   if (retVal == FALSE) {
+      printf("CONFIG.IN Error: ROUTING-PROTOCOL not specified!\n");
+      assert(FALSE); abort();
+   }
+   
+   
+   if (strcmp(protocolString, "LAR1") == 0) {
+      ipLayer->routingProtocolChoice = ROUTING_PROTOCOL_LAR1;  
+      NetworkLar1Init(
+         node, (GlomoNetworkLar1**)&ipLayer->routingProtocol, nodeInput);
+   }
+   else if (strcmp(protocolString, "ODMRP") == 0) {
+      ipLayer->routingProtocolChoice = ROUTING_PROTOCOL_ODMRP;
+      RoutingOdmrpInit(
+          node, (GlomoRoutingOdmrp**)&ipLayer->routingProtocol,
+          nodeInput);
+   }
+   else if (strcmp(protocolString, "AODV") == 0) {
+      ipLayer->routingProtocolChoice = ROUTING_PROTOCOL_AODV;
+      RoutingAodvInit(
+         node, (GlomoRoutingAodv**)&ipLayer->routingProtocol, nodeInput);
+   }
+   else if (strcmp(protocolString, "DSR") == 0) {
+      ipLayer->routingProtocolChoice = ROUTING_PROTOCOL_DSR;
+      RoutingDsrInit(
+         node, (GlomoRoutingDsr**)&ipLayer->routingProtocol, nodeInput);
+   }
+   else if (strcmp(protocolString, "ZRP") == 0) {
+      ipLayer->routingProtocolChoice = ROUTING_PROTOCOL_ZRP;
+      RoutingZrpInit(
+         node, (GlomoRoutingZrp**)&ipLayer->routingProtocol, nodeInput);
+   }
+   //else if (strcmp(protocolString, "OSPF") == 0) {
+   //   ipLayer->routingProtocolChoice = ROUTING_PROTOCOL_OSPF;
+   //   OspfInit(node, (GlomoRoutingOspf**)&ipLayer->routingProtocol, nodeInput);
+   //} 
+   else if ((strcmp(protocolString, "BELLMANFORD") == 0) ||
+            (strcmp(protocolString, "WRP") == 0) ||
+            (strcmp(protocolString, "FISHEYE") == 0) ||
+            (strcmp(protocolString, "NS_DSDV") == 0) || 
+            (strcmp(protocolString, "STATIC") == 0))
+   {
+      // These routing protocols are in application layer.
+   }
+   else {
+      NetworkIpUserProtocolInit(
+         node, nodeInput, protocolString, 
+         &ipLayer->routingProtocolChoice, &ipLayer->routingProtocol);
+   }//if//
+   
+}
+
+
+
+//
+// FUNCTION   NetworkIpPrintStats()
+// PURPOSE    Print out IP network statistics.
+//
+
+
+void NetworkIpPrintStats(GlomoNode* node)
+{
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+   NetworkIpStatsType* stats = &ipLayer->stats;
+   int interface;
+   char buf[200];
+   float averageHopCount;
+   
+   sprintf(buf, "Number of Packet Attepted to be Sent to MAC: %d",      
+           stats->numPacketsSentToMac);
+   GLOMO_PrintStat(node, "NetworkIp", buf);
+   
+   sprintf(buf, "Number of Packets Routed For Another Node: %d",      
+           stats->numPacketsRoutedForOtherNodes);
+   GLOMO_PrintStat(node, "NetworkIp", buf);
+   
+   sprintf(buf, "Number of Packets Delivered To this Node: %d",      
+           stats->numPacketsDeliveredToThisNode);
+   GLOMO_PrintStat(node, "NetworkIp", buf);
+   
+   sprintf(buf, "Total of the TTL's of Delivered Packets: %d",      
+           stats->deliveredPacketTtlTotal);
+   GLOMO_PrintStat(node, "NetworkIp", buf);
+
+   if (stats->numPacketsDeliveredToThisNode > 0) {
+      averageHopCount = 
+         (((IPDEFTTL * stats->numPacketsDeliveredToThisNode) - 
+           stats->deliveredPacketTtlTotal) / 
+           stats->numPacketsDeliveredToThisNode);
+      sprintf(buf, "Average Hop Count Assuming %d Inital TTL %f",      
+           IPDEFTTL, averageHopCount);
+      GLOMO_PrintStat(node, "NetworkIp", buf);
+   }//if//
+   
+   sprintf(buf, 
+           "Number Fragments dropped because Node was Unreachable: %d",      
+           stats->numNetworkUnreachableDrops);
+   GLOMO_PrintStat(node, "NetworkIp", buf);
+   
+   sprintf(buf, 
+           "Number Fragments dropped because TTL expired: %d",      
+           stats->numTtlExpirationDrops);
+   GLOMO_PrintStat(node, "NetworkIp", buf);
+   
+   for(interface = 0; interface < node->numberInterfaces; interface++) {
+      if (ipLayer->interfaceQueues[interface] && 
+          ipLayer->interfaceQueues[interface]->packetsLostToOverflow != 0) {
+         sprintf(
+            buf, "Packets Lost to Overflow On Interface %d: %d.",      
+            interface, 
+            ipLayer->interfaceQueues[interface]->packetsLostToOverflow);
+         
+         GLOMO_PrintStat(node, "NetworkIp", buf);
+      }//if//
+   }
+}
+
+
+//
+// FUNCTION   NetworkIpFinalize()
+// PURPOSE    Print out statistics, being called at the end.
+//
+
+
+void NetworkIpFinalize(GlomoNode *node)
+{ 
+   GlomoNetworkIp* ipLayer = (GlomoNetworkIp*)node->networkData.networkVar;
+
+   switch (ipLayer->routingProtocolChoice) {
+   case ROUTING_PROTOCOL_LAR1:
+      NetworkLar1Finalize(node);
+      break;
+   //case ROUTING_PROTOCOL_OSPF:
+   //   OspfFinalize(node);
+   //   break;
+   case ROUTING_PROTOCOL_ODMRP:
+       RoutingOdmrpFinalize(node);
+       break;
+   case ROUTING_PROTOCOL_AODV:
+      RoutingAodvFinalize(node);
+      break;
+   case ROUTING_PROTOCOL_DSR:
+      RoutingDsrFinalize(node);
+      break;
+   case ROUTING_PROTOCOL_ZRP:
+      RoutingZrpFinalize(node);
+      break;
+   case ROUTING_PROTOCOL_NONE:
+      // No Network Level routing protocol.
+      break;
+   default:
+      NetworkIpUserProtocolFinalize(node, ipLayer->routingProtocolChoice);
+      break;
+   }/*switch*/   
+
+   if (node->networkData.networkStats == TRUE) {
+     NetworkIpPrintStats(node);
+   }
+}
+
+
+
+//-----------------------------------------------------------------------------
+// FUNCTION     NetworkIpQueueDeleteOutboundPacketsToANode()
+// PURPOSE      Deletes all packets in the queue going (probably broken),
+//              to the specified next hop address.   There is option
+//              to return all such packets back to the routing protocols.
+//              via the usual mechanism (callback).
+//
+//-----------------------------------------------------------------------------
+
+void NetworkIpDeleteOutboundPacketsToANode(
+   GlomoNode *node,
+   const NODE_ADDR nextHopAddress,
+   const NODE_ADDR destinationAddress,
+   const BOOL returnPacketsToRoutingProtocol)
+{
+   GlomoNetworkIp *ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+   NetworkQueueingPriorityType NotUsed = 0;
+   NetworkQueueingPriorityType priority;
+   int interfaceId; 
+   
+   for (interfaceId = 0; interfaceId < node->numberInterfaces; interfaceId++) 
+   {
+      IpOutputQueueType* queue = ipLayer->interfaceQueues[interfaceId];
+      int priority;
+      
+      for(priority = CONTROL; priority <= NON_REAL_TIME; priority++) {
+         NetworkQueueingPriorityType NotUsed;
+         NODE_ADDR currentNextHopAddress;
+         Message* msg;
+         int queueIterator;
+         
+         
+         // Nasty Hack: Don't blow away the first one (0), in the queue.
+         // it will confuse the MAC.  In Qualnet, the first one
+         // is removed and buffered in the mac.
+         
+         queueIterator = 1;
+         while (queueIterator < 
+                (*queue->numberInQueueFunction)(queue->queueUnion, priority))
+         {
+             IpHeaderType* ipHeader; 
+             (*queue->retrieveAndMaybeDequeueFunction)(
+                queue->queueUnion, TRUE, priority, queueIterator, 
+                &msg, &NotUsed, FALSE);
+        
+             assert(msg != NULL);
+             
+             ipHeader = (IpHeaderType *) msg->packet;
+             
+             currentNextHopAddress = 
+                ((TackedOnInfoWhileInNetworkQueueType*)(msg->info))
+                   ->nextHopAddress;
+             
+             if (((nextHopAddress == ANY_DEST) || 
+                  (currentNextHopAddress == nextHopAddress)) &&
+                 ((destinationAddress == ANY_DEST) ||
+                  (ipHeader->ip_dst == destinationAddress)))
+             {
+                (*queue->retrieveAndMaybeDequeueFunction)(
+                   queue->queueUnion, TRUE, priority, queueIterator, 
+                   &msg, &NotUsed, TRUE);
+      
+                assert(msg !=NULL);
+                
+                ipLayer->stats.numNetworkUnreachableDrops++;
+                 
+                if (returnPacketsToRoutingProtocol) {
+                    printf("Not Supported\n");
+                    abort();
+                } else {
+                    GLOMO_MsgFree(node, msg);
+                }//if//
+                
+             } else {
+                 queueIterator++;
+             }//if//
+         }//while//
+      }//for//
+   }//for//
+}
+
+
+
+
+
+

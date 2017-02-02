@@ -1,0 +1,447 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: app_util.pc,v 1.20 2001/02/15 03:17:26 mineo Exp $
+ * utilities used by application to send packet to transport layer
+ * and open a connection.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "message.h"
+#include "fileio.h"
+
+#include "transport.h"
+#include "ip.h"
+
+#define noDEBUG
+
+
+/* 
+ * FUNCTION: AppUdpSendNewData
+ * PURPOSE:    allocate a new GLOMO message and send to UDP.
+ * PARAMETERS: node - node that is sending the data.
+ *             appType - application type, to be used as destination port.
+ *             destAddr - the destination node Id data is sent to.             
+ *             payload  - pointer to the data.
+ *             payloadSize - size of the data in bytes.
+ *             delay - send the data after this delay.
+ */
+void
+AppUdpSendNewData(GlomoNode *node, APP_TYPE appType, NODE_ADDR destAddr,
+                  char *payload, int payloadSize, clocktype delay)
+                 
+{
+    Message *msg;
+    AppToUdpSend *info;
+
+    msg = GLOMO_MsgAlloc (node, GLOMO_TRANSPORT_LAYER,
+                          TRANSPORT_PROTOCOL_UDP, MSG_TRANSPORT_FromAppSend);
+
+    GLOMO_MsgPacketAlloc (node, msg, payloadSize);
+    memcpy(msg->packet, payload, payloadSize);
+ 
+    GLOMO_MsgInfoAlloc (node, msg, sizeof(AppToUdpSend));
+    info = (AppToUdpSend *) msg->info;
+    info->sourceAddr = node->nodeAddr;
+    info->sourcePort = appType;
+    info->destAddr = destAddr;
+    info->destPort = appType;
+    info->priority = NON_REAL_TIME;
+
+    GLOMO_MsgSend(node, msg, delay);
+}
+
+/* 
+ * FUNCTION: AppUdpSendNewDataWithPriority
+ * PURPOSE:    allocate a new GLOMO message and send to UDP.
+ * PARAMETERS: node - node that is sending the data.
+ *             appType - application type, to be used as destination port.
+ *             destAddr - the destination node Id data is sent to.             
+ *             payload  - pointer to the data.
+ *             payloadSize - size of the data in bytes.
+ *             priority - priority of data.
+ *             delay - send the data after this delay.
+ */
+void
+AppUdpSendNewDataWithPriority(GlomoNode *node, 
+                              APP_TYPE appType,
+                              NODE_ADDR destAddr, 
+                              char *payload, 
+                              int payloadSize, 
+                              NetworkQueueingPriorityType priority, 
+                              clocktype delay)
+{
+    Message *msg;
+    AppToUdpSend *info;
+
+    msg = GLOMO_MsgAlloc (node, GLOMO_TRANSPORT_LAYER,
+                          TRANSPORT_PROTOCOL_UDP, MSG_TRANSPORT_FromAppSend);
+
+    GLOMO_MsgPacketAlloc (node, msg, payloadSize);
+    memcpy(msg->packet, payload, payloadSize);
+ 
+    GLOMO_MsgInfoAlloc (node, msg, sizeof(AppToUdpSend));
+    info = (AppToUdpSend *) msg->info;
+    info->sourceAddr = node->nodeAddr;
+    info->sourcePort = appType;
+    info->destAddr = destAddr;
+    info->destPort = appType;
+    info->priority = priority;
+
+    GLOMO_MsgSend(node, msg, delay);
+}
+
+
+/* 
+ * FUNCTION: AppUdpSendNewHeaderData
+ * PURPOSE:    allocate a new GLOMO message and send to UDP.
+ * PARAMETERS: node - node that is sending the data.
+ *             appType - application type, to be used as destination port.
+ *             destAddr - the destination node Id data is sent to.
+ *             header - header of the payload.
+ *             headerSize - size of the header.q
+ *             payload  - pointer to the data.
+ *             payloadSize - size of the data in bytes.
+ *             delay - send the data after this delay.
+ */
+
+void
+AppUdpSendNewHeaderData(GlomoNode *node, APP_TYPE appType, NODE_ADDR destAddr,
+                        char *header, int headerSize, char *payload, 
+                        int payloadSize, clocktype delay)
+{
+    Message *msg;
+    AppToUdpSend *info;
+
+    msg = GLOMO_MsgAlloc (node, GLOMO_TRANSPORT_LAYER,
+                          TRANSPORT_PROTOCOL_UDP, MSG_TRANSPORT_FromAppSend);
+
+    GLOMO_MsgPacketAlloc (node, msg, payloadSize);
+    memcpy(msg->packet, payload, payloadSize);
+
+    GLOMO_MsgAddHeader(node, msg, headerSize);
+    memcpy(msg->packet, header, headerSize);
+ 
+    GLOMO_MsgInfoAlloc (node, msg, sizeof(AppToUdpSend));
+    info = (AppToUdpSend *) msg->info;
+    info->sourceAddr = node->nodeAddr;
+    info->sourcePort = appType;
+    info->destAddr = destAddr;
+    info->destPort = appType;
+    info->priority = NON_REAL_TIME;
+
+    GLOMO_MsgSend(node, msg, delay);
+}
+
+
+/* 
+ * FUNCTION: AppUdpSendNewHeaderDataWithPriority
+ * PURPOSE:    allocate a new GLOMO message and send to UDP.
+ * PARAMETERS: node - node that is sending the data.
+ *             appType - application type, to be used as destination port.
+ *             destAddr - the destination node Id data is sent to.
+ *             header - header of the payload.
+ *             headerSize - size of the header.q
+ *             payload  - pointer to the data.
+ *             payloadSize - size of the data in bytes.
+ *             priority - priority of data.
+ *             delay - send the data after this delay.
+ */
+void
+AppUdpSendNewHeaderDataWithPriority(GlomoNode *node, 
+                                    APP_TYPE appType, 
+                                    NODE_ADDR destAddr,
+                                    char *header, 
+                                    int headerSize, 
+                                    char *payload, 
+                                    int payloadSize, 
+                                    NetworkQueueingPriorityType priority, 
+                                    clocktype delay)
+{
+    Message *msg;
+    AppToUdpSend *info;
+
+    msg = GLOMO_MsgAlloc (node, GLOMO_TRANSPORT_LAYER,
+                          TRANSPORT_PROTOCOL_UDP, MSG_TRANSPORT_FromAppSend);
+
+    GLOMO_MsgPacketAlloc (node, msg, payloadSize);
+    memcpy(msg->packet, payload, payloadSize);
+
+    GLOMO_MsgAddHeader(node, msg, headerSize);
+    memcpy(msg->packet, header, headerSize);
+ 
+    GLOMO_MsgInfoAlloc (node, msg, sizeof(AppToUdpSend));
+    info = (AppToUdpSend *) msg->info;
+    info->sourceAddr = node->nodeAddr;
+    info->sourcePort = appType;
+    info->destAddr = destAddr;
+    info->destPort = appType;
+    info->priority = priority;
+
+    GLOMO_MsgSend(node, msg, delay);
+}
+
+
+/*
+ * NAME:        AppTcpServerListen. 
+ * PURPOSE:     listen on a server port. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              transProtocolType - which transport protocol to use.
+ *              appType - which application initiates this request. 
+ *              serverAddr - server address.
+ *              serverPort - server port number.
+ * RETURN:      none. 
+ */
+void
+AppTcpServerListen(GlomoNode *nodePtr, 
+                   TRANSPORT_PROTOCOL transProtocolType, 
+                   APP_TYPE appType, 
+                   NODE_ADDR serverAddr, 
+                   short serverPort)
+{
+    AppToTcpListen *listenRequest;
+    Message *msg;
+
+    #ifdef DEBUG
+        printf("Node %ld (TCP Server) starting to listen.\n", 
+                nodePtr->nodeAddr);
+    #endif
+
+    msg = GLOMO_MsgAlloc(nodePtr, GLOMO_TRANSPORT_LAYER,
+                         transProtocolType, MSG_TRANSPORT_FromAppListen);
+    GLOMO_MsgInfoAlloc(nodePtr, msg, sizeof(AppToTcpListen));
+    listenRequest = (AppToTcpListen *) msg->info; 
+    listenRequest->appType = appType; 
+    listenRequest->localAddr = serverAddr;
+    listenRequest->localPort = serverPort;
+    listenRequest->priority = NON_REAL_TIME;
+    GLOMO_MsgSend(nodePtr, msg, 0);
+}
+   
+ 
+/*
+ * NAME:        AppTcpServerListenWithPriority. 
+ * PURPOSE:     listen on a server port. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              transProtocolType - which transport protocol to use.
+ *              appType - which application initiates this request. 
+ *              serverAddr - server address.
+ *              serverPort - server port number.
+ *              priority - priority of this data for this session.
+ * RETURN:      none. 
+ */
+void
+AppTcpServerListenWithPriority(GlomoNode *nodePtr, 
+                               TRANSPORT_PROTOCOL transProtocolType, 
+                               APP_TYPE appType, 
+                               NODE_ADDR serverAddr, 
+                               short serverPort,
+                               NetworkQueueingPriorityType priority)
+{
+    AppToTcpListen *listenRequest;
+    Message *msg;
+
+    #ifdef DEBUG
+        printf("Node %ld (TCP Server) starting to listen.\n", 
+                nodePtr->nodeAddr);
+    #endif
+
+    msg = GLOMO_MsgAlloc(nodePtr, GLOMO_TRANSPORT_LAYER,
+                         transProtocolType, MSG_TRANSPORT_FromAppListen);
+    GLOMO_MsgInfoAlloc(nodePtr, msg, sizeof(AppToTcpListen));
+    listenRequest = (AppToTcpListen *) msg->info; 
+    listenRequest->appType = appType; 
+    listenRequest->localAddr = serverAddr;
+    listenRequest->localPort = serverPort;
+    listenRequest->priority = priority;
+    GLOMO_MsgSend(nodePtr, msg, 0);
+}
+    
+
+/*
+ * NAME:        AppTcpOpenConnection. 
+ * PURPOSE:     Open a connection. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              transProtocolType - which transport protocol to use.
+ *              appType - which application initiates this request. 
+ *              remoteAddr - address of the remote node.
+ *              remotePort - port number on the remote node (server port).
+ *              uniqueId - used to determine which client is requesting 
+ *                         connection.
+ *              waitTime - time until the session starts.
+ * RETURN:      none. 
+ */
+void
+AppTcpOpenConnection(GlomoNode *nodePtr, TRANSPORT_PROTOCOL transProtocolType, 
+                     APP_TYPE appType, NODE_ADDR remoteAddr, 
+                     short remotePort, int uniqueId, clocktype waitTime)
+{
+    AppToTcpOpen *openRequest;
+    Message *msg;
+
+    #ifdef DEBUG
+        printf("Node %ld (TCP Client) starting to open connection.\n", 
+               nodePtr->nodeAddr);
+    #endif
+
+    msg = GLOMO_MsgAlloc(nodePtr, GLOMO_TRANSPORT_LAYER,
+                         transProtocolType, MSG_TRANSPORT_FromAppOpen);
+
+    GLOMO_MsgInfoAlloc(nodePtr, msg, sizeof(AppToTcpOpen));
+    openRequest = (AppToTcpOpen *) msg->info;
+    openRequest->appType = appType;
+    openRequest->localAddr = nodePtr->nodeAddr;
+    openRequest->localPort = nodePtr->appData.nextPortNum;
+    nodePtr->appData.nextPortNum++;
+    openRequest->remoteAddr = remoteAddr;
+    openRequest->remotePort = remotePort;
+
+    openRequest->uniqueId = uniqueId;
+    openRequest->priority = NON_REAL_TIME;
+
+    GLOMO_MsgSend(nodePtr, msg, waitTime);
+}
+
+
+/*
+ * NAME:        AppTcpOpenConnectionWithPriority.
+ * PURPOSE:     Open a connection. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              transProtocolType - which transport protocol to use.
+ *              appType - which application initiates this request. 
+ *              remoteAddr - address of the remote node.
+ *              remotePort - port number on the remote node (server port).
+ *              uniqueId - used to determine which client is requesting 
+ *                         connection.
+ *              waitTime - time until the session starts.
+ *              priority - priority of the data.
+ * RETURN:      none. 
+ */
+void
+AppTcpOpenConnectionWithPriority(GlomoNode *nodePtr, 
+                                 TRANSPORT_PROTOCOL transProtocolType, 
+                                 APP_TYPE appType, 
+                                 NODE_ADDR remoteAddr, 
+                                 short remotePort, 
+                                 int uniqueId, 
+                                 clocktype waitTime,
+                                 NetworkQueueingPriorityType priority)
+{
+    AppToTcpOpen *openRequest;
+    Message *msg;
+
+    #ifdef DEBUG
+        printf("Node %ld (TCP Client) starting to open connection.\n", 
+               nodePtr->nodeAddr);
+    #endif
+
+    msg = GLOMO_MsgAlloc(nodePtr, GLOMO_TRANSPORT_LAYER,
+                         transProtocolType, MSG_TRANSPORT_FromAppOpen);
+
+    GLOMO_MsgInfoAlloc(nodePtr, msg, sizeof(AppToTcpOpen));
+    openRequest = (AppToTcpOpen *) msg->info;
+    openRequest->appType = appType;
+    openRequest->localAddr = nodePtr->nodeAddr;
+    openRequest->localPort = nodePtr->appData.nextPortNum;
+    nodePtr->appData.nextPortNum++;
+    openRequest->remoteAddr = remoteAddr;
+    openRequest->remotePort = remotePort;
+
+    openRequest->uniqueId = uniqueId;
+    openRequest->priority = priority;
+
+    GLOMO_MsgSend(nodePtr, msg, waitTime);
+}
+
+/*
+ * NAME:        AppTcpSendData.
+ * PURPOSE:     send an application data unit.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              protocolType - which transport protocol to use.
+ *              connId - connection id.
+ *              payload - data to send.
+ *              length - length of the data to send.
+ * RETRUN:      none. 
+ */
+void
+AppTcpSendData(GlomoNode *nodePtr, TRANSPORT_PROTOCOL protocolType, int connId,
+               char *payload, int length)
+{
+    Message *msg;
+    AppToTcpSend *sendRequest;
+    
+    msg = GLOMO_MsgAlloc(nodePtr, GLOMO_TRANSPORT_LAYER,
+                         protocolType, MSG_TRANSPORT_FromAppSend);
+    GLOMO_MsgInfoAlloc(nodePtr, msg, sizeof(AppToTcpSend));
+    sendRequest = (AppToTcpSend *) msg->info;
+    sendRequest->connectionId = connId;
+    GLOMO_MsgPacketAlloc(nodePtr, msg, length);
+    memcpy(msg->packet, payload, length);
+    GLOMO_MsgSend(nodePtr, msg, 0);
+}
+
+/*
+ * NAME:        AppTcpCloseConnection.
+ * PURPOSE:     close the connection. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              protocolType - which transport protocol to use.
+ *              connId - connection id.
+ * RETRUN:      none. 
+ */
+void
+AppTcpCloseConnection(GlomoNode *nodePtr, TRANSPORT_PROTOCOL protocolType, 
+                      int connId) 
+{
+    Message *msg;
+    AppToTcpClose *closeRequest;
+
+    msg = GLOMO_MsgAlloc(nodePtr, GLOMO_TRANSPORT_LAYER,
+                         protocolType, MSG_TRANSPORT_FromAppClose);
+    GLOMO_MsgInfoAlloc(nodePtr, msg, sizeof(AppToTcpClose));
+    closeRequest = (AppToTcpClose *) msg->info; 
+    closeRequest->connectionId = connId; 
+    GLOMO_MsgSend(nodePtr, msg, 0);
+}
+
+

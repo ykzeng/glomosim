@@ -1,0 +1,208 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: network.pc,v 1.10 2001/02/15 03:19:59 mineo Exp $
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+
+#include "fileio.h"
+#include "network.h"
+#include "nwip.h"
+
+
+/*
+ * FUNCTION    GLOMO_NetworkInit
+ * PURPOSE     Initialization function for the network layer.
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+
+void GLOMO_NetworkPreInit(GlomoNode *node, const GlomoNodeInput *nodeInput)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    BOOL retVal;
+
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "NETWORK-PROTOCOL", buf);
+
+    if (retVal == FALSE) {
+        printf("CONFIG.IN Error: NETWORK-PROTOCOL not specified!\n");
+        assert(FALSE); abort();
+    }
+
+    if (strcmp(buf, "IP") != 0) {
+        fprintf(stderr, "CONFIG.IN Error: Unknown Network Protocol %s.\n", buf);
+        assert(FALSE); abort();
+    }
+    
+    NetworkIpPreInit(node);
+}
+
+
+/*
+ * FUNCTION    GLOMO_NetworkInit
+ * PURPOSE     Initialization function for the network layer.
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+
+void GLOMO_NetworkInit(GlomoNode *node, const GlomoNodeInput *nodeInput)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    BOOL retVal;
+
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "NETWORK-PROTOCOL", buf);
+
+    if (retVal == FALSE) {
+        printf("CONFIG.IN Error: NETWORK-PROTOCOL not specified!\n");
+        assert(FALSE);
+    }
+
+    if (strcmp(buf, "IP") == 0) {
+        //node->networkData.networkProtocol = NETWORK_PROTOCOL_IP;
+    }
+    else {
+        fprintf(stderr, "CONFIG.IN Error: Unknown Network Protocol %s.\n", buf);
+        assert(FALSE);
+  
+    }
+
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "NETWORK-LAYER-STATISTICS", buf);
+            
+    if (retVal == FALSE) {
+        printf("GLOMO Error: NETWORK-LAYER-STATISTICS not specified!\n");
+        assert(FALSE);
+    }
+
+    if (strcmp(buf, "YES") == 0) { 
+        node->networkData.networkStats = TRUE;
+    }
+    else if (strcmp(buf, "NO") == 0) {
+        node->networkData.networkStats = FALSE;
+    }
+    else {
+        fprintf(stderr, "CONFIG.IN Error: %s is not a valid choice.\n", buf);
+        assert(FALSE);
+    }
+
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "GUI-ROUTING", buf);
+    if (retVal == TRUE) {
+        if (strcmp(buf, "YES") == 0) {
+            node->networkData.guiOption = TRUE;
+        }
+        else if (strcmp(buf, "NO") == 0) {
+            node->networkData.guiOption = FALSE;
+        }
+        else {
+            fprintf(stderr, "CONFIG.IN Error: %s is not a valid choice.\n", buf);
+            assert(FALSE);
+        }
+    }
+    else {
+        node->networkData.guiOption = FALSE;
+    }
+
+    NetworkIpInit(node, nodeInput);
+}
+
+
+/*
+ * FUNCTION    GLOMO_NetworkFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of 
+ *             the simulation of the Network Layer.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+void GLOMO_NetworkFinalize(GlomoNode *node)
+{
+    if (node->networkData.networkStats == TRUE) {
+        NetworkIpFinalize(node);
+    }
+
+    //switch (node->networkData.networkProtocol)
+    //{
+    //    case NETWORK_PROTOCOL_IP:
+    //    { 
+    //        NetworkIpFinalize(node);
+    //        break;
+    //    }
+    //    default: 
+    //        assert(FALSE);
+    //        break;
+    //}      
+}
+
+
+/*
+ * FUNCTION    GLOMO_NetworkLayer
+ * PURPOSE     Models the behaviour of the Network Layer on receiving the
+ *             message
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:      message received by the layer
+ */
+void GLOMO_NetworkLayer(GlomoNode *node, Message *msg)
+{
+    NetworkIpLayer(node, msg);
+
+    //switch (node->networkData.networkProtocol)
+    //{
+    //    case NETWORK_PROTOCOL_IP:
+    //    {
+    //        break;
+    //    }
+    //    default:
+    //       assert(FALSE);
+    //       break;
+    //}
+}
+

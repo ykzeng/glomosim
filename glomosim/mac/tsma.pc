@@ -1,0 +1,1438 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * TSMA Model in GloMoSim - version 2.0
+ *
+ * The TSMA model in GloMoSim is COPYRIGHTED software.  It is freely available
+ * without fee for education, or research, or to non-profit agencies. By
+ * obtaining copies of this and other files that comprise the TSMA model in
+ * GloMoSim, you, the Licensee, agree to abide by the following conditions
+ * and understandings with respect to the copyrighted software:
+ *
+ * 1. Permission to use, copy, and modify this software and its documentation
+ *    for education, research, and non-profit purposes is hereby granted to
+ *    Licensee, provided that the copyright notice, the original author's names
+ *    and unit identification, and this permission notice appear on all such
+ *    copies, and that no charge be made for such copies. Any entity desiring
+ *    permission to incorporate this software into commercial products or to
+ *    use it for commercial purposes should contact:
+ *
+ *    Professor Imrich Chlamtac
+ *    Distinguished Chair in Telecommunications
+ *    Director, Center for Advanced Telecommunications Systems and Services
+ *    Erik Jonsson School of Engineering and Computer Science
+ *    The University of Texas at Dallas
+ *    P.O. Box 830688, EC 33
+ *    Richardson, TX 75083-0688
+ *    e-mail: chlamtac@utdallas.edu
+ *
+ * 2. NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *    PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3. Neither the software developers, the Center for Advanced Tele-
+ *    communications Systems and Services (CATSS), UTD, or any affiliate
+ *    of the UT system shall be liable for any damages suffered by
+ *    Licensee from the use of this software.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "mac.h"
+#include "tsma.h"
+#include "radio.h"
+
+#define MONITOR_ID 0
+//#define TSMA_DEBUG 1
+
+
+/*
+ * NAME:        MacTsmaTransmit
+ *
+ * PURPOSE:     Determine if node has permission to transmit in current 
+ *              slot.
+ *
+ * PARAMETERS:  node, node which we are checking
+ *
+ * RETURN:      BOOL indicating whether node has permission
+ *
+ * ASSUMPTIONS: None
+ */
+
+static //inline//
+BOOL MacTsmaTransmit(GlomoNode *node, GlomoMacTsma* tsma)
+{
+  if (tsma->schedule[tsma->currentSlot] == '1')
+    {
+      assert(tsma->currentOutgoingFrame != NULL);
+      return TRUE;
+    }
+
+  return FALSE;
+}
+
+
+
+/*
+ * NAME:        MacTsmaChangeState
+ *
+ * PURPOSE:     Update state of TSMA protocol.
+ *
+ * PARAMETERS:  node, node for which state is being updated
+ *              newState, new state of TSMA protocol
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+static
+void MacTsmaChangeState(GlomoNode *node, GlomoMacTsma* tsma, int newState)
+{
+  #ifdef TSMA_DEBUG
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("time(%s) state change ", clockStr);
+
+      switch (tsma->currentState)
+        {
+        case MAC_TSMA_READY:
+          {
+            printf("READY ");
+            break;
+          }
+
+        case MAC_TSMA_WF_USLOT:
+          {
+            printf("WF_USLOT ");
+            break;
+          }
+
+        case MAC_TSMA_WF_BSLOT:
+          {
+            printf("WF_BSLOT ");
+            break;
+          }
+
+        case MAC_TSMA_XMT_UPKT:
+          {
+            printf("XMT_UPKT ");
+            break;
+          }
+
+        case MAC_TSMA_XMT_BPKT:
+          {
+            printf("XMT_BPKT ");
+            break;
+          }
+
+        case MAC_TSMA_XMT_UACK:
+          {
+            printf("XMT_UACK ");
+            break;
+          }
+
+        case MAC_TSMA_WF_UACK:
+          {
+            printf("WF_UACK ");
+            break;
+          }
+
+        default:
+          {
+            printf("invalid current state!\n");
+            assert(FALSE); abort();
+          }
+        }
+
+      printf("-->");
+
+      switch (newState)
+        {
+        case MAC_TSMA_READY:
+          {
+            printf("READY\n");
+            break;
+          }
+
+        case MAC_TSMA_WF_USLOT:
+          {
+            printf("WF_USLOT\n");
+            break;
+          }
+
+        case MAC_TSMA_WF_BSLOT:
+          {
+            printf("WF_BSLOT\n");
+            break;
+          }
+
+        case MAC_TSMA_XMT_UPKT:
+          {
+            printf("XMT_UPKT\n");
+            break;
+          }
+
+        case MAC_TSMA_XMT_BPKT:
+          {
+            printf("XMT_BPKT\n");
+            break;
+          }
+
+        case MAC_TSMA_XMT_UACK:
+          {
+            printf("XMT_UACK\n");
+            break;
+          }
+
+        case MAC_TSMA_WF_UACK:
+          {
+            printf("WF_UACK\n");
+            break;
+          }
+
+        default:
+          {
+            printf("invalid state change!\n");
+            assert(FALSE); abort();
+          }
+        }
+    }
+    #endif
+
+  /* Update tsma state. */
+  tsma->prevState = tsma->currentState;
+  tsma->currentState = newState;
+}
+
+
+
+/*
+ * NAME:        CheckForPacketToTransmit
+ *
+ * PURPOSE:     Checks for an outgoing packet from the network layer
+ *              and if it exists starts the TSMA transmission process.
+ *              Otherwise TSMA is set to "READY".
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: TSMA has no current frame that it is sending.
+ */
+      
+static    
+void CheckForPacketToTransmit(GlomoNode* node, GlomoMacTsma* tsma) 
+{
+  // If no current message and the network queue is not empty,
+  // remove a packet from the queue and make it the current 
+  // outgoing frame.
+  
+  if ((tsma->currentOutgoingFrame == NULL) &&
+      (!NetworkIpOutputQueueIsEmpty(node, tsma->myGlomoMac->interfaceIndex)))
+    {
+      NetworkQueueingPriorityType NotUsed;
+     
+      NetworkIpOutputQueueDequeuePacket(
+        node, 
+        tsma->myGlomoMac->interfaceIndex, 
+        &tsma->currentOutgoingFrame,
+        &tsma->currentOutgoingFrameNextHopAddress,
+        &NotUsed);
+      
+      tsma->pktsToSend++;
+    }  
+  
+  //
+  // Set the State based on the existance and type of the current
+  // outgoing frame.
+  //
+  if (tsma->currentOutgoingFrame != NULL)
+    {
+      if (tsma->currentOutgoingFrameNextHopAddress == ANY_DEST)
+        {
+          /* Network frame must be broadcast. */
+          MacTsmaChangeState(node, tsma, MAC_TSMA_WF_BSLOT);
+        }
+      else
+        {
+         /* Network frame must be unicast. */
+         MacTsmaChangeState(node, tsma, MAC_TSMA_WF_USLOT);
+        }
+    }
+  else
+    {
+      /* Queue is empty.  Transition to a ready state. */
+      MacTsmaChangeState(node, tsma, MAC_TSMA_READY);
+    }
+}
+
+
+
+
+
+/*
+ * NAME:        MacTsmaScheduleSlot
+ *
+ * PURPOSE:     Schedule next slot arrival
+ *
+ * PARAMETERS:  node, node to receive next slot
+ *              msg, contains interval for next slot arrival
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaScheduleSlot(GlomoNode *node, Message *msg)
+{
+  MacTsmaSynchPkt *synch = (MacTsmaSynchPkt *)msg->info;
+
+  GLOMO_MsgSend(node, msg, synch->slotInterval);
+}
+
+
+
+/*
+ * NAME:        MacTsmaPassPkt
+ *
+ * PURPOSE:     Pass radio frame up to network layer.
+ *
+ * PARAMETERS:  node, node to receive the frame
+ *              msg, contains the frame
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaPassPkt(GlomoNode *node, GlomoMacTsma *tsma, Message *msg)
+{
+  MacTsmaHeader* hdr = (MacTsmaHeader *)msg->packet;
+  NODE_ADDR lastHopAddress = hdr->sourceAddr; 
+  
+  hdr = NULL;
+  GLOMO_MsgRemoveHeader(node, msg, sizeof(MacTsmaHeader));
+  
+  NetworkIpReceivePacketFromMacLayer(node, msg, lastHopAddress);
+}
+
+/*
+ * NAME:        MacTsmaSendBroadcastPkt
+ *
+ * PURPOSE:     Transmit broadcast frame.
+ *
+ * PARAMETERS:  node, node sending broadcast frame
+ *              msg, contains the frame to be broadcast
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaSendBroadcastPkt(GlomoNode *node, GlomoMacTsma *tsma)
+{
+  Message* msg = GLOMO_MsgCopy(node, tsma->currentOutgoingFrame);
+  MacTsmaHeader *hdr;
+
+  #ifdef TSMA_DEBUG
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("Time(%s) sending broadcast frame [%d]\n", 
+             clockStr, tsma->pktReps);
+    }
+  #endif
+
+  /* Make sure queue is not empty. */
+  assert(msg != NULL);
+
+  /* Make sure this is a broadcast frame. */
+  assert(tsma->currentOutgoingFrameNextHopAddress == ANY_DEST);
+
+  /* Allocate space for TSMA header. */
+  GLOMO_MsgAddHeader(node, msg, sizeof(MacTsmaHeader));
+
+  /* Initialize TSMA header. */
+  hdr = (MacTsmaHeader *)msg->packet;
+  hdr->sourceAddr = node->nodeAddr;
+  hdr->destAddr = ANY_DEST;
+  hdr->type = TSMA_BPKT;
+  hdr->seqNum = tsma->seqNum;
+  
+  //hdr->priority = pkt->priority;  // Probably not needed. (Jay)
+
+  /* Change state. */
+  MacTsmaChangeState(node, tsma, MAC_TSMA_XMT_BPKT);
+  
+  /* Send message to radio layer. */
+  GLOMO_RadioStartTransmittingPacket(
+    node, tsma->myGlomoMac->interfaceIndex, 
+    msg, hdr->destAddr, FALSE, 0);
+}
+
+/*
+ * NAME:        MacTsmaSendUnicastPkt
+ *
+ * PURPOSE:     Transmit unicast frame.
+ *
+ * PARAMETERS:  node, node sending the unicast frame
+ *              msg, contains the unicast frame being sent
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaSendUnicastPkt(GlomoNode *node, GlomoMacTsma *tsma)
+{
+  Message* msg = GLOMO_MsgCopy(node, tsma->currentOutgoingFrame);
+  MacTsmaHeader *hdr;
+
+  #ifdef TSMA_DEBUG
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("Time(%s) sending unicast frame [%d]\n",
+             clockStr, tsma->pktReps);
+    }
+  #endif
+
+  /* Make sure this is a unicast frame. */
+
+  if (tsma->currentOutgoingFrameNextHopAddress == ANY_DEST)
+    {
+      assert(FALSE); abort(); // Can this really happen? (Jay).
+      GLOMO_MsgFree(node, msg);
+      MacTsmaSendBroadcastPkt(node, tsma);
+      return;
+    }
+
+  /* Allocate space for TSMA header. */
+  GLOMO_MsgAddHeader(node, msg, sizeof(MacTsmaHeader));
+
+  /* Initialize TSMA header. */
+  hdr = (MacTsmaHeader *)msg->packet;
+  hdr->sourceAddr = node->nodeAddr;
+  hdr->destAddr = tsma->currentOutgoingFrameNextHopAddress;
+  hdr->type = TSMA_UPKT;
+  hdr->seqNum = tsma->seqNum;
+  
+  // hdr->priority = pkt->priority; // Not Needed (Jay).
+
+  /* Change state. */
+  MacTsmaChangeState(node, tsma, MAC_TSMA_XMT_UPKT);
+
+  /* Send message to radio layer. */
+  GLOMO_RadioStartTransmittingPacket(
+    node, tsma->myGlomoMac->interfaceIndex,
+    msg, hdr->destAddr, FALSE, 0);
+
+}
+
+/*
+ * NAME:        MacTsmaSendAck
+ *
+ * PURPOSE:     Transmit acknowledgment frame.
+ *
+ * PARAMETERS:  node, node sending the acknowledgment
+ *              msg, contains the acknowledgment being sent
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaSendAck(GlomoNode *node, GlomoMacTsma *tsma, Message *msg)
+{
+  MacTsmaHeader *hdr = (MacTsmaHeader *)msg->packet;
+  MacTsmaHeader ack;
+  Message *radioMsg = GLOMO_MsgAlloc(node, 0, 0, 0);
+
+  /* Allocate space. */
+  GLOMO_MsgPacketAlloc(node, radioMsg, sizeof(MacTsmaHeader));
+
+  /* Initialize acknowledgment. */
+  ack.sourceAddr = node->nodeAddr;
+  ack.destAddr = hdr->sourceAddr;
+  ack.type = TSMA_ACK;
+  ack.seqNum = hdr->seqNum;
+
+  /* Copy acknowledgment into message. */
+  memcpy(radioMsg->packet, &(ack), sizeof(MacTsmaHeader));
+
+  /* Transition into proper state. */
+  MacTsmaChangeState(node, tsma, MAC_TSMA_XMT_UACK);
+  
+  /* Send message to radio layer. */
+  
+  GLOMO_RadioStartTransmittingPacket(
+    node, tsma->myGlomoMac->interfaceIndex,
+    radioMsg, ack.destAddr, FALSE, 0);
+}
+
+/*
+ * NAME:        MacTsmaPacketSent
+ *
+ * PURPOSE:     Determine type of frame that was sent, and take appropriate
+ *              actions.
+ *
+ * PARAMETERS:  node, node that sent a frame
+ *              msg, contains the frame sent event
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaPacketSent(GlomoNode *node, GlomoMacTsma *tsma)
+{
+  Message *newMsg;        
+  BOOL retval;
+
+  switch (tsma->currentState)
+    {
+    case MAC_TSMA_XMT_UACK:
+      {
+        /*
+         * ACKNOWLEDGMENT SENT:
+         */
+        #ifdef TSMA_DEBUG
+        if (node->nodeAddr == MONITOR_ID)
+          {
+            char clockStr[GLOMO_MAX_STRING_LENGTH];
+            ctoa(simclock(), clockStr);
+            printf("Time(%s) acknowledgment frame sent\n", clockStr);
+          }
+        #endif
+
+        /*
+         * After sending an acknowledgment, we must begin to
+         * service our own packets.
+         */
+        
+        /* Check to see if the queue is empty. */
+        
+        CheckForPacketToTransmit(node, tsma);
+        
+        break;
+      }
+
+    case MAC_TSMA_XMT_UPKT:
+      {
+        /*
+         * UNICAST PACKET SENT:
+         */
+        #ifdef TSMA_DEBUG
+        if (node->nodeAddr == MONITOR_ID)
+          {
+            char clockStr[GLOMO_MAX_STRING_LENGTH];
+            ctoa(simclock(), clockStr);
+            printf("Time(%s) unicast frame sent\n", clockStr);
+          }
+        #endif
+
+        /*
+         * Once a unicast frame is sent, we must wait for a
+         * corresponding acknowledgement from the destination.
+         */
+        MacTsmaChangeState(node, tsma, MAC_TSMA_WF_UACK);
+
+        /* Update the packet repetitions for the frame. */
+        ++tsma->pktReps;
+        break;
+      }
+
+    case MAC_TSMA_XMT_BPKT:
+      {
+        /*
+         * BROADCAST FRAME SENT:
+         */
+        #ifdef TSMA_DEBUG
+        if (node->nodeAddr == MONITOR_ID)
+          {
+            char clockStr[GLOMO_MAX_STRING_LENGTH];
+            ctoa(simclock(), clockStr);
+            printf("Time(%s) broadcast frame sent\n", clockStr);
+          }
+        #endif
+
+        /* 
+         * Once a broadcast frame has been transmitted maxRep times,
+         * we are ready to service the next network frame in the
+         * queue. 
+         */
+         
+        tsma->pktReps++;
+        
+        if (tsma->pktReps >= tsma->maxReps)
+          {
+            /* Remove current outgoing frame */
+            
+            assert(tsma->currentOutgoingFrame != NULL);
+            GLOMO_MsgFree(node, tsma->currentOutgoingFrame);
+            tsma->currentOutgoingFrame = NULL;
+
+            #ifdef TSMA_DEBUG
+            if (node->nodeAddr == MONITOR_ID)
+              {
+                char clockStr[GLOMO_MAX_STRING_LENGTH];
+                ctoa(simclock(), clockStr);
+                printf("Time(%s) finished with current broadcast frame\n", 
+                       clockStr);
+              }
+            #endif
+
+            /* Update broadcast counter. */
+            ++tsma->pktsSentBroadcast;
+            
+            /* Update sequence number. */
+            ++tsma->seqNum;
+            
+            /* Reset frame repetitions. */
+            tsma->pktReps = 0;
+            
+            /* Check to see if queue is now empty. */
+            CheckForPacketToTransmit(node, tsma);
+          }
+        else
+          {
+            /*
+             * This frame must be repeated again.  Wait for the
+             * next transmission slot.
+             */
+            MacTsmaChangeState(node, tsma, MAC_TSMA_WF_BSLOT);
+          }
+
+        break;
+      }
+
+    default:
+      {
+        char clockStr[GLOMO_MAX_STRING_LENGTH];
+        ctoa(simclock(), clockStr);
+        printf("Time(%s) node %d sent unknown packet type\n", 
+               clockStr, node->nodeAddr);
+        assert(FALSE); abort();
+      }
+    }
+}
+
+/*
+ * NAME:        MacTsmaHandlePromiscuousMode
+ *
+ * PURPOSE:     Supports promiscuous mode, sending remote frames to
+ *              upper layers.
+ *
+ * PARAMETERS:  node, node handling remote frame
+ *              msg, contains remote frame
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaHandlePromiscuousMode(
+  GlomoNode *node, GlomoMacTsma *tsma, Message *msg)
+{
+  GLOMO_MsgRemoveHeader(node, msg, sizeof(MacTsmaHeader));
+  NetworkIpSneakPeekAtMacPacket(node, msg);
+  GLOMO_MsgAddHeader(node, msg, sizeof(MacTsmaHeader));
+}
+
+/*
+ * NAME:        MacTsmaRetransmitPkt
+ *
+ * PURPOSE:     Retransmit unicast frame.
+ *
+ * PARAMETERS:  node, node sending retransmission
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaRetransmitPkt(GlomoNode *node, GlomoMacTsma *tsma)
+{
+
+  #ifdef TSMA_DEBUG
+
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("Time(%s) acknowledgment not received, ", clockStr);
+    }
+  #endif
+
+  /* Check to see if maximum repetitions has been reached. */
+  if (tsma->pktReps >= tsma->maxReps)
+    {
+      /* Drop current frame, and move on to the next. */
+      assert(tsma->currentOutgoingFrame != NULL);
+      GLOMO_MsgFree(node, tsma->currentOutgoingFrame);
+      tsma->currentOutgoingFrame = NULL;
+      
+      /* Reset frame repetitions. */
+      tsma->pktReps = 0;
+      
+      /* Check for Outgoing packets */
+      
+      CheckForPacketToTransmit(node, tsma);
+    }
+  else
+    {
+      /* Frame can be resent in the next transmission slot. */
+      #ifdef TSMA_DEBUG
+      if (node->nodeAddr == MONITOR_ID)
+        {
+          printf("retransmitting frame.\n");
+        }
+      #endif
+
+      MacTsmaChangeState(node, tsma, MAC_TSMA_WF_USLOT);
+    }
+}
+
+/*
+ * NAME:        MacTsmaPrintStats
+ *
+ * PURPOSE:     Print MAC layer statistics.
+ *
+ * PARAMETERS:  node, node for which stats are collected
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaPrintStats(GlomoNode *node, GlomoMacTsma *tsma)
+{
+  char buf[GLOMO_MAX_STRING_LENGTH];
+
+  sprintf(buf, "Number of packets from network: %d\n", 
+          tsma->pktsToSend);
+  GLOMO_PrintStat(node, "MacTSMA", buf);
+
+  sprintf(buf, "Number of packets lost due to buffer overflow: %d\n",
+          tsma->pktsLostOverflow);
+  GLOMO_PrintStat(node, "MacTSMA", buf);
+
+  sprintf(buf, "Number of UNICAST packets output to the channel: %d\n",
+          tsma->pktsSentUnicast);
+  GLOMO_PrintStat(node, "MacTSMA", buf);
+
+  sprintf(buf, "Number of BROADCAST packets output to the channel: %d\n",
+          tsma->pktsSentBroadcast);
+  GLOMO_PrintStat(node, "MacTSMA", buf);
+
+  sprintf(buf, "Number of UNICAST packets received clearly: %d\n",
+          tsma->pktsGotUnicast);
+  GLOMO_PrintStat(node, "MacTSMA", buf);
+
+  sprintf(buf, "Number of BROADCAST packets received clearly: %d\n",
+          tsma->pktsGotBroadcast);
+  GLOMO_PrintStat(node, "MacTSMA", buf);
+}
+
+
+
+/*
+ * NAME:        MacTsmaBeginSlot
+ *
+ * PURPOSE:     Simulate next slot
+ *
+ * PARAMETERS:  node, node handling next slot
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaBeginSlot(GlomoNode *node, GlomoMacTsma *tsma)
+{
+  BOOL retval;
+
+  /* Advance slot counter. */
+  tsma->currentSlot = (tsma->currentSlot+1) % tsma->frameLength;
+  
+  #ifdef TSMA_DEBUG
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("%d:Time(%s) new slot beginning %d %d\n", node->nodeAddr, clockStr, 
+        tsma->currentState, tsma->currentSlot);
+    }
+  #endif
+
+  switch (tsma->currentState)
+    {
+    case MAC_TSMA_READY:
+      {
+        /* Make sure that there are no packets in the queue. */
+        
+        if ((tsma->currentOutgoingFrame != NULL) ||
+            (!NetworkIpOutputQueueIsEmpty(
+                node, tsma->myGlomoMac->interfaceIndex)))
+          {
+            char clockStr[GLOMO_MAX_STRING_LENGTH];
+            ctoa(simclock(), clockStr);
+            printf("Time(%s) node %d in READY state with buffered frames!\n",
+                   clockStr, node->nodeAddr);
+            assert(FALSE); abort();
+          }
+
+        /* Nothing else to do. */
+        break;
+      }
+
+    case MAC_TSMA_WF_USLOT:
+      {
+        /* Determine if node has permission to transmit in this slot. */
+        retval = MacTsmaTransmit(node, tsma);
+
+        if (retval == TRUE)
+          {
+            /* Transmit unicast packet. */
+            MacTsmaSendUnicastPkt(node, tsma);
+          }
+
+        break;
+      }
+
+    case MAC_TSMA_WF_BSLOT:
+      {
+        /* Determine if node has permission to transmit in this slot. */
+        retval = MacTsmaTransmit(node, tsma);
+
+        if (retval == TRUE)
+          {
+            /* Transmit broadcast packet. */
+            MacTsmaSendBroadcastPkt(node, tsma);
+          }
+
+        break;
+      }
+
+    case MAC_TSMA_XMT_UPKT:
+    case MAC_TSMA_XMT_BPKT:
+    case MAC_TSMA_XMT_UACK:
+      {
+        /* The slot size is too small! */
+        char clockStr[GLOMO_MAX_STRING_LENGTH];
+        ctoa(simclock(), clockStr);
+        printf("Time(%s) node %d still transmitting at beginning of slot!\n",
+               clockStr, node->nodeAddr);
+        assert(FALSE); abort();
+        break;
+      }
+
+    case MAC_TSMA_WF_UACK:
+      {
+        /* No acknowledgment received.  Retransmit unicast packet. */
+        MacTsmaRetransmitPkt(node, tsma);
+        break;
+      }
+
+    default:
+      {
+        /* Illegal state! */
+        char clockStr[GLOMO_MAX_STRING_LENGTH];
+        ctoa(simclock(), clockStr);
+        printf("Time(%s) node %d in an unknown state!\n", 
+               clockStr, node->nodeAddr);
+        assert(FALSE); abort();
+      }
+    }
+}
+
+/*
+ * NAME:        MacTsmaProcBroadcastPkt
+ *
+ * PURPOSE:     Process incoming broadcast frame.
+ *
+ * PARAMETERS:  node, node receiving broadcast frame
+ *              msg, contains the broadcast frame
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaProcBroadcastPkt(GlomoNode *node, GlomoMacTsma *tsma, Message *msg)
+{
+  MacTsmaHeader *hdr = (MacTsmaHeader *)msg->packet;
+
+  #ifdef TSMA_DEBUG
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("Time(%s) received broadcast frame from node %d\n",
+             clockStr, hdr->sourceAddr);
+    }
+  #endif
+
+  /* Filter out duplicate broadcast packets. */
+  if (hdr->seqNum > tsma->pktIds[hdr->sourceAddr])
+    {
+      /* Register frame identifier. */
+      tsma->pktIds[hdr->sourceAddr] = hdr->seqNum;
+      /* Send frame to network layer. */
+      MacTsmaPassPkt(node, tsma, msg);
+      /* Update broadcast counter. */
+      ++tsma->pktsGotBroadcast;
+    }
+  else if (hdr->seqNum == tsma->pktIds[hdr->sourceAddr])
+    {
+      /* 
+       * This is a duplicate broadcast packet which 
+       * should be ignored. 
+       */
+      #ifdef TSMA_DEBUG
+      if (node->nodeAddr == MONITOR_ID)
+        {
+          printf("\tIgnoring duplicate broadcast frame.\n");
+        }
+      #endif
+      GLOMO_MsgFree(node, msg);
+    }
+  else
+    {
+      /* Invalid identifier. */
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("Time(%s) %d received frame from %d with invalid seqNum\n",
+             clockStr, node->nodeAddr, hdr->sourceAddr);
+      assert(FALSE); abort();
+    }
+}
+
+/*
+ * NAME:        MacTsmaProcUnicastPkt
+ *
+ * PURPOSE:     Process incoming unicast frame.
+ *
+ * PARAMETERS:  node, node receiving the unicast frame
+ *              msg, contains the unicast frame
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaProcUnicastPkt(GlomoNode *node, GlomoMacTsma *tsma, Message *msg)
+{
+  MacTsmaHeader *hdr = (MacTsmaHeader *)msg->packet;
+
+  #ifdef TSMA_DEBUG
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("Time(%s) received unicast frame from node %d\n",
+             clockStr, hdr->sourceAddr);
+    }
+  #endif
+
+  /* Check for valid frame indentifier. */
+  if (hdr->seqNum == tsma->pktIds[hdr->sourceAddr])
+    {
+     #ifdef TSMA_DEBUG
+     printf("Ack Was Hosed\n");
+     #endif
+    }
+  else if (hdr->seqNum < tsma->pktIds[hdr->sourceAddr])
+    {
+      /* Invalid identifier. */
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("Time(%s) %d received frame from %d with invalid seqNum\n",
+             clockStr, node->nodeAddr, hdr->sourceAddr);
+      assert(FALSE); abort();
+    }
+  else
+    {
+      /* Register frame identifier. */
+      tsma->pktIds[hdr->sourceAddr] = hdr->seqNum;
+    }
+
+  /* Construct and send unicast acknowledgment. */
+  MacTsmaSendAck(node, tsma, msg);
+  
+  /* Pass frame to network layer. */
+  MacTsmaPassPkt(node, tsma, msg);
+  
+  /* Update unicast counter. */
+  ++tsma->pktsGotUnicast;
+}
+
+/*
+ * NAME:        MacTsmaProcAckPkt
+ *
+ * PURPOSE:     Process incoming acknowledgment
+ *
+ * PARAMETERS:  node, node receiving the ack
+ *              msg, contains the ack
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaProcAckPkt(GlomoNode *node, GlomoMacTsma *tsma, Message *msg)
+{
+  MacTsmaHeader *hdr = (MacTsmaHeader *)msg->packet;
+  Message *newMsg;
+  BOOL retval;
+
+  /* Make sure we are ready for the acknowledgment. */
+  assert(tsma->currentState == MAC_TSMA_WF_UACK);
+
+  /* Check to see if sequence number is correct. */
+  if (hdr->seqNum == tsma->seqNum)
+    {
+      #ifdef TSMA_DEBUG
+      if (node->nodeAddr == MONITOR_ID)
+        {
+          char clockStr[GLOMO_MAX_STRING_LENGTH];
+          ctoa(simclock(), clockStr);
+          printf("Time(%s) received acknowledgment from node %d\n",
+                 clockStr, hdr->sourceAddr);
+        }
+      #endif
+      /* 
+       * Proper acknowledgment received.  Current frame has been
+       * send, begin processing next frame.
+       */
+      
+      assert(tsma->currentOutgoingFrame != NULL);
+      GLOMO_MsgFree(node, tsma->currentOutgoingFrame);
+      tsma->currentOutgoingFrame = NULL;
+      
+      /* Update unicast counter. */
+      ++tsma->pktsSentUnicast;
+      
+      /* Update sequence number. */
+      ++tsma->seqNum;
+      
+      /* Reset frame repetitions. */
+      tsma->pktReps = 0;
+      
+      /* Check to see if queue is now empty. */
+
+      CheckForPacketToTransmit(node, tsma);
+    }
+  else
+    {
+      char clockStr[GLOMO_MAX_STRING_LENGTH];
+      ctoa(simclock(), clockStr);
+      printf("Time(%s) bad acknowledgment received.\n", clockStr);
+      assert(FALSE); abort();
+    }
+}
+
+
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+//----------------------------------------------------------------------------
+
+
+
+/*
+ * NAME:        MacTsmaReceivePacketFromRadio
+ *              (Was:MacTsmaProcRadioPkt).
+ *
+ * PURPOSE:     Process frames sent up from radio layer.
+ *
+ * PARAMETERS:  node, node receiving radio frame
+ *              msg, contains radio frame
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaReceivePacketFromRadio(
+  GlomoNode *node, GlomoMacTsma *tsma, Message *msg)
+{
+  /* Retrieve TSMA frame. */
+  MacTsmaHeader *hdr = (MacTsmaHeader *)msg->packet;
+
+
+  if (hdr->destAddr == node->nodeAddr ||
+      hdr->destAddr == ANY_DEST)
+    {
+      /* 
+       * Frame addressed to this node.  Determine the frame type,
+       * and take the appropriate actions. 
+       */
+      switch (hdr->type)
+        {
+        case TSMA_BPKT:
+          {
+            /* Process broadcast frame. */
+            MacTsmaProcBroadcastPkt(node, tsma, msg);
+            break;
+          }
+
+        case TSMA_UPKT:
+          {
+            /* Process unicast frame. */
+            MacTsmaProcUnicastPkt(node, tsma, msg);
+            break;
+          }
+
+        case TSMA_ACK:
+          {
+            /* Process incoming acknowledgment. */
+            MacTsmaProcAckPkt(node, tsma, msg);
+            break;
+          }
+        }
+    }
+  else if ((tsma->myGlomoMac->promiscuousMode == TRUE) &&
+           ((hdr->type == TSMA_BPKT) || (hdr->type == TSMA_UPKT)))
+    {
+      /*
+       * The frame is not addressed to this node, but send it
+       * up to the network layer anyway.
+       */
+      MacTsmaHandlePromiscuousMode(node, tsma, msg);
+      GLOMO_MsgFree(node, msg);
+    }
+  else
+    {
+      /*
+       * Disregard this frame.
+       */
+      GLOMO_MsgFree(node, msg);
+    }
+}
+
+
+
+/*
+ * NAME:        MacTsmaReceiveRadioStatusChangeNotification
+ *
+ * PURPOSE:     Notifies TSMA when radio status has changed.
+ *              In this case, it cares only when the transistion
+ *              is from transmitting to non-transmitting.
+ *
+ */
+
+void MacTsmaReceiveRadioStatusChangeNotification(
+   GlomoNode* node,
+   GlomoMacTsma* tsma,
+   RadioStatusType oldRadioStatus,
+   RadioStatusType newRadioStatus)
+{
+   if (oldRadioStatus == RADIO_TRANSMITTING) {
+      assert(newRadioStatus != RADIO_TRANSMITTING);
+      MacTsmaPacketSent(node, tsma);
+   }//if//
+}
+
+
+
+/*
+ * NAME:        MacTsmaNetworkLayerHasPacketToSend
+ *
+ * PURPOSE:     Notifies TSMA that the network queue have gone from
+ *              empty to non-empty and should start the processes of
+ *              of sending the packet.
+ *
+ * PARAMETERS:  node, node receiving network frame
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+
+void MacTsmaNetworkLayerHasPacketToSend(GlomoNode* node, GlomoMacTsma* tsma)
+{
+  /* 
+   * If current state is READY, then determine frame type, and
+   * transition to the proper state.
+   */
+  if (tsma->currentState == MAC_TSMA_READY)
+    {
+       CheckForPacketToTransmit(node, tsma);
+    }
+}
+
+
+
+
+/*
+ * NAME:        MacTsmaInit
+ *
+ * PURPOSE:     Initialization function for the TSMA protocol.
+ *
+ * PARAMETERS:  node, node being initialized
+ *              input, structure containing contents of input file
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaInit(GlomoNode *node, int index, const GlomoNodeInput *input)
+{
+  MacTsmaSynchPkt synch;
+  clocktype interval;
+  Message *synchMsg;
+  char buf[GLOMO_MAX_STRING_LENGTH];
+  FILE *tsmaInput;
+  BOOL retval;
+  int degree, q, k;
+  int bandwidthBytesSec = node->macData[index]->bandwidth;
+  
+
+
+
+  /* Allocate space for TSMA structure. */
+  GlomoMacTsma *tsma = (GlomoMacTsma *)checked_pc_malloc(sizeof(GlomoMacTsma));
+  memset(tsma, 0, sizeof(GlomoMacTsma));
+
+  tsma->myGlomoMac = node->macData[index];
+  tsma->myGlomoMac->macVar = (void *)tsma;
+
+  /*
+   * Initialize TSMA parameters.
+   */
+
+  tsmaInput = fopen("tsmaparams.dat", "r");
+
+  if (tsmaInput == NULL)
+    {
+      GLOMO_ReadIntInstance(node->nodeAddr, input, "TSMA-MAX-NODE-DEGREE",
+                            index, TRUE, &retval, &degree);
+
+      if (retval == FALSE)
+        {
+          printf("TSMA Error: max node degree unspecified in config file\n");
+          assert(FALSE); abort();
+        }
+
+      if (degree < 2)
+        {
+          printf("TSMA Error: invalid max node degree specified in config file\n");
+          assert(FALSE); abort();
+        }
+
+      /* 
+       * Generate the proper TSMA parameters, q and k.  The acutal
+       * parameters will be stored in a file.
+       */
+      sprintf(buf, "tsma_param_gen %d %d > tsmaparams.dat", 
+              node->numNodes, degree);
+      printf("Running:%s\n",buf);
+      system(buf);
+
+      tsmaInput = fopen("tsmaparams.dat", "r");
+      assert(tsmaInput != NULL);
+    }
+
+  /* Get TSMA parameters, and generate TSMA transmission schedules. */
+  fscanf(tsmaInput, "%d", &q);
+  fscanf(tsmaInput, "%d", &k);
+
+  fclose(tsmaInput);
+
+  tsma->frameLength = q * q;
+  tsma->maxReps = q;
+
+  tsmaInput = fopen("tsmacodes.dat", "r");
+
+  if (tsmaInput == NULL)
+    {
+      sprintf(buf, "tsma_code_gen %d %d > tsmacodes.dat",
+              q, k);
+      system(buf);
+
+      tsmaInput = fopen("tsmacodes.dat", "r");
+      assert(tsmaInput != NULL);
+    }
+
+  tsma->schedule = (char *)pc_malloc(tsma->frameLength * sizeof(char) + 1);
+  assert(tsma->schedule != NULL);
+
+  /* Get proper TSMA transmission schedule. */
+  fseek(tsmaInput, tsma->frameLength * node->nodeAddr + node->nodeAddr, SEEK_SET);
+  fread(tsma->schedule, 1, tsma->frameLength, tsmaInput);
+  tsma->schedule[tsma->frameLength] = '\0';
+
+  fclose(tsmaInput);
+
+  #ifdef TSMA_DEBUG
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      printf("schedule(%s)\n", tsma->schedule);
+    }
+  #endif
+
+  tsma->pktIds = (int *)pc_malloc(node->numNodes * sizeof(int));
+  memset(tsma->pktIds, '\0', node->numNodes * sizeof(int));
+
+  tsma->currentState = MAC_TSMA_READY;
+  tsma->prevState = MAC_TSMA_READY;
+  tsma->seqNum = 1;
+  tsma->currentSlot = 0;
+  tsma->pktsToSend = 0;
+  tsma->pktsLostOverflow = 0;
+  tsma->pktsSentUnicast = 0;
+  tsma->pktsSentBroadcast = 0;
+  tsma->pktsGotUnicast = 0;
+  tsma->pktsGotBroadcast = 0;
+  tsma->currentOutgoingFrame = NULL;
+  
+
+  ///* Send synchronization packet. */
+  //interval = 
+  //  (2 * node->macData[index]->propDelay) +
+  //  (2 * MAC_DELAY) +
+  //  (2 * RADIO_PHY_DELAY) +
+  //  (2 * SYNCHRONIZATION_TIME) +
+  //  (((MAX_MAC_FRAME_SIZE * SECOND) +
+  //    (sizeof(MacTsmaHeader) * SECOND))
+  //   / channelBandwidthBytes) + 
+  //   /* WTF (Jay)*/ 10000000;
+
+  /* Send synchronization packet. */
+  interval = 
+    node->macData[index]->propDelay +
+    RADIO_PHY_DELAY + 
+    node->macData[index]->propDelay +
+    SYNCHRONIZATION_TIME +
+    (((MAX_NW_PKT_SIZE + sizeof(MacTsmaHeader)) * SECOND) / bandwidthBytesSec) + 
+    RADIO_PHY_DELAY + 
+    node->macData[index]->propDelay +
+    SYNCHRONIZATION_TIME +
+    ((sizeof(MacTsmaHeader) * SECOND) / bandwidthBytesSec);
+
+  #ifdef TSMA_DEBUG
+  if (node->nodeAddr == MONITOR_ID)
+    {
+      char Str[GLOMO_MAX_STRING_LENGTH];
+      ctoa(interval, Str);
+      printf("Slot Interval Time = %s\n", Str);
+    }
+  #endif
+  
+  synch.slotInterval = interval;
+
+  synchMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_SlotFront);
+
+  GLOMO_MsgInfoAlloc(node, synchMsg, sizeof(synch));
+  memcpy(synchMsg->info, &synch, sizeof(synch));
+  GLOMO_MsgSetInstanceId(synchMsg, tsma->myGlomoMac->interfaceIndex);
+
+  GLOMO_MsgSend(node, synchMsg, 0);
+}
+
+
+
+/*
+ * NAME:        MacTsmaLayer
+ *
+ * PURPOSE:     Models the behavior of the MAC layer with the TSMA protocol
+ *              on receiving a message.
+ *
+ * PARAMETERS:  node, node which received the message
+ *              msg, message received
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaLayer(GlomoNode *node, int index, Message *msg)
+{
+  GlomoMacTsma *tsma = (GlomoMacTsma *)node->macData[index]->macVar;
+
+  assert(msg->eventType == MSG_MAC_SlotFront);
+  /*
+   * The next slot is beginning.
+   */
+  MacTsmaBeginSlot(node, tsma);
+
+  /* Schedule the next slot. */
+  MacTsmaScheduleSlot(node, msg);
+}
+    
+
+
+/*
+ * NAME:        MacTsmaFinalize
+ * 
+ * PURPOSE:     Called at the end of simulation to collect statisitcs
+ *              associated with MAC layer performance.
+ *
+ * PARAMETERS:  node, node for which stats are to be collected
+ *
+ * RETURN:      None
+ *
+ * ASSUMPTIONS: None
+ */
+
+void MacTsmaFinalize(GlomoNode *node, int index)
+{
+  GlomoMacTsma *tsma = (GlomoMacTsma *)node->macData[index]->macVar;
+
+  rename("tsmaparams.dat", "tsmaparams.dat.bak");
+  rename("tsmacodes.dat", "tsmacodes.dat.bak");
+
+  if (node->macData[index]->macStats == TRUE)
+    {
+      MacTsmaPrintStats(node, tsma);
+    }
+}
+
+
+

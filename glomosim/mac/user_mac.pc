@@ -1,0 +1,131 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+//------------------------------------------------------------------------
+//
+// File: user_mac.pc
+// By: Jay Martin (jmartin@cs.ucla.edu) 
+// Objectives: Provide simple skeletion routines so that users can
+//             more easily hook their protocols into GloMoSim without
+//             modifying the changing "mac.pc" file itself.
+//             This file should not change in the GloMoSim distribution
+//             and should replaced by the user modified file after each
+//             GloMoSim update.
+//
+//------------------------------------------------------------------------
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "mac.h"
+
+
+// The GLOMOSIM protocol number is a "unsigned short" that must be
+// unique within the layers.  So pick a random one to get near zero
+// probability of conflict. 
+
+#define USER_DEFINED_MAC_PROTOCOL_NUMBER 123
+
+
+void MacInitUserMacProtocol(
+   GlomoNode* node,
+   const GlomoNodeInput* nodeInput,
+   const char* macProtocolName,
+   int interfaceIndex)
+{
+   if (strcmp(macProtocolName, "USER-DEFINED-PROTOCOL") == 0) {
+      
+      node->macData[interfaceIndex]->macProtocol = 
+         USER_DEFINED_MAC_PROTOCOL_NUMBER;
+      
+      // Put function to create your datastructures and 
+      // initialize your protocol here.  For Example,
+           
+      // YourMacProtocolInit(node, nodeInput, interfaceIndex, 
+      //    (YourMacDataType**)node->macData[interfaceIndex]->macVar);
+   }
+   else {
+      fprintf(stderr, "CONFIG.IN Error: Unknown Mac Protocol Type "
+              "%s.\n", macProtocolName);
+      assert(FALSE); abort();
+   }
+}
+
+
+void MacHandleUserMacProtocolEvent(
+   GlomoNode* node, int interfaceIndex, Message* msg) 
+{
+   switch (msg->protocolType) {
+   case USER_DEFINED_MAC_PROTOCOL_NUMBER: {
+   
+      // Put function to handle GlomoSim Events for your protocol here.  
+      // For Example,
+           
+      // YourRoutingProtocolEventHandler(
+      //    node, (YourMacDataType*)node->macData[interfaceIndex]->macVar, msg);
+   }
+   default:
+      printf("GloMoSim: Mac Protocol %d Not Handled\n", 
+             msg->protocolType);
+      assert(FALSE); abort();
+   }/*switch*/
+}
+
+
+void MacFinalizeUserMacProtocol(GlomoNode* node, int interfaceIndex)
+{
+   switch (node->macData[interfaceIndex]->macProtocol) {
+   case USER_DEFINED_MAC_PROTOCOL_NUMBER: {
+   
+      // Put function call to handle routing protocol finalization here:
+      // For Example,
+      
+      // YourFinalizationRoutine(
+      //    node, (YourMacDataType*)node->macData[interfaceIndex]->macVar);
+   }
+   default:
+      printf("Glomosim Mac Protocol %d Not Handled\n", 
+         node->macData[interfaceIndex]->macProtocol);
+      assert(FALSE); abort();
+   }/*switch*/
+}
+         
+
+

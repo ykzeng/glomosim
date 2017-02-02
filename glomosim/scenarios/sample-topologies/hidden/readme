@@ -1,0 +1,5 @@
+This directory demonstrates how to set up a hidden terminal environment of
+3 nodes with FTP traffic (from tcplib) from node 0 to node 1 and from 
+node 2 to node 1.
+
+

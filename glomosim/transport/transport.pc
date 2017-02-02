@@ -1,0 +1,119 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: transport.pc,v 1.20 2001/02/16 04:13:31 jmartin Exp $
+ *
+ * This files contains initialization function, message processing
+ * function, and finalize function used for transport layer.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+#include "fileio.h"
+
+#include "transport.h"
+#include "udp.h"
+#include "tcp.h"
+
+/*
+ * FUNCTION    GLOMO_TransportInit
+ * PURPOSE     Initialization function for the TRANSPORT layer.
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+void GLOMO_TransportInit(GlomoNode *node, const GlomoNodeInput *nodeInput)
+{
+    node->transportData.tcp = NULL;
+    node->transportData.udp = NULL;
+    
+    TransportTcpInit(node, nodeInput);
+    TransportUdpInit(node, nodeInput); 
+}
+
+
+/*
+ * FUNCTION    GLOMO_TransportFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of 
+ *             the simulation of the TRANSPORT Layer.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+void GLOMO_TransportFinalize(GlomoNode *node)
+{
+    TransportUdpFinalize(node); 
+    TransportTcpFinalize(node); 
+}
+
+
+/*
+ * FUNCTION    GLOMO_TransportLayer
+ * PURPOSE     Models the behaviour of the TRANSPORT Layer on receiving the
+ *             message
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:      message received by the layer
+ */
+void GLOMO_TransportLayer(GlomoNode *node, Message *msg)
+{
+    switch (GLOMO_MsgGetProtocol(msg))
+    {
+        case TRANSPORT_PROTOCOL_UDP:
+            TransportUdpLayer(node, msg);
+            break;
+       
+        case TRANSPORT_PROTOCOL_TCP: 
+            TransportTcpLayer(node, msg);
+            break;
+        
+        default:
+            assert(FALSE); abort();
+            break;
+    }
+}
+
+

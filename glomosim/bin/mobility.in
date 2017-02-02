@@ -1,0 +1,10 @@
+#
+# mobility trace format:
+# node-address simclock destination(x y z)
+# All lines for a node must be sorted in time increasing order.
+#
+10 100S (200.0, 150.0, 0.2)
+10 200S (200.0, 150.0, 0.2)
+10 500S (250.0, 250.0, 0.1)
+10 800S (200.0, 280.0, 0.5)
+10 900S (300.0, 310.0, 1.0)

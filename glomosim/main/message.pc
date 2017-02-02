@@ -1,0 +1,423 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: message.pc,v 1.35 2000/11/04 16:59:57 jmartin Exp $
+ *
+ * Functions used for message sending and retrieval
+ * in the simulation.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+#include "queue.h"
+#include "glomo.h"
+#include "splaytree.h"
+
+/* Keep the following field a multiple of 8. */
+#define MSG_MAX_HDR_SIZE 144
+/* Maximum amonut of messages that can be kept in the free list. */
+#define MSG_LIST_MAX 10000
+#define MSG_PAYLOAD_LIST_MAX 1000
+
+/*
+ * FUNCTION     GLOMO_MsgAlloc
+ * PURPOSE      Allocate a new Message structure. This is called when a new
+ *              message has to be sent through the system. The last three
+ *              parameters indicate the nodeId, layerType, and eventType
+ *              that will be set for this message.
+ *
+ * Parameters:
+ *    node:       node which is allocating message
+ *    layerType:  layer type to be set for this message
+ *    protocol:   Protocol to be set for this message
+ *    eventType:  event type to be set for this message
+ */
+Message* GLOMO_MsgAlloc (GlomoNode *node, int layerType,
+                         int protocol, int eventType)
+{
+    Message *newMsg;
+
+    if (node->partitionData->msgFreeList == NULL) {
+        MessageListCell* NewCell = (MessageListCell*)
+            pc_malloc(sizeof(MessageListCell));
+        newMsg = (Message *)&(NewCell->messageCell);
+    } else {
+        newMsg = (Message *)&(node->partitionData->msgFreeList->messageCell);
+        node->partitionData->msgFreeList = 
+            node->partitionData->msgFreeList->next;
+        (node->partitionData->msgFreeListNum)--;
+    }
+    assert(newMsg != NULL);
+
+    memset(newMsg, 0, sizeof(Message));
+    GLOMO_MsgSetLayer(newMsg, layerType, protocol);
+    newMsg->eventType = eventType;
+    return newMsg;
+}
+
+
+/*
+ * FUNCTION     GLOMO_MsgInfoAlloc
+ * PURPOSE      Allocate the "info" field for the message. This function
+ *              should be used only for delivery of data for messages which
+ *              are NOT packets in the simulation.  It can also be used for
+ *              the delivery of extra information for messages which are
+ *              packets.
+ *              Once this function has been called the "info" variable in
+ *              the message structure can be used to acces this space.
+ *
+ * Parameters:
+ *    node:         node which is allocating info
+ *    msg:          message for which data has to be allocated
+ *    infoSize:     size of the info to be allocated
+ */
+void GLOMO_MsgInfoAlloc(GlomoNode *node, Message *msg, int infoSize)
+{
+    if (msg->infoSize < infoSize) {
+        if (infoSize <= SMALL_INFO_SPACE_SIZE) {
+           msg->info = (char*)&(msg->smallInfoSpace[0]);
+        } else {
+           if (msg->infoSize > SMALL_INFO_SPACE_SIZE) {
+               pc_free(msg->info);
+           }
+           msg->info = (char *)pc_malloc(infoSize);
+           assert(msg->info != NULL);
+        }
+        msg->infoSize = infoSize;
+    } else if (infoSize == 0) {
+       if (msg->infoSize > SMALL_INFO_SPACE_SIZE) {
+           pc_free(msg->info);
+       }
+       msg->infoSize = 0;
+       msg->info = NULL;
+    }
+}
+
+
+/*
+ * FUNCTION     GLOMO_MsgPacketAlloc
+ * PURPOSE      Allocate the "payLoad" field for the packet to be delivered.
+ *              Add additional free space in front of the packet for header
+ *              that might be added to the packet.
+ *              This function can be called from the application layer or
+ *              anywhere else (e.g TCP, IP) that a packet may originiate from.
+ *              The "packetSize" variable will be set to the "packetSize"
+ *              parameter specified in the function call.
+ *              Once this function has been called the "packet" variable in
+ *              the message structure can be used to access this space.
+ *
+ * Parameters:
+ *    node:         node which is allocating message
+ *    msg:          message for which data has to be allocated
+ *    payLoadSize:  size of the payLoad to be allocated
+ */
+void GLOMO_MsgPacketAlloc(GlomoNode *node, Message *msg, int packetSize)
+{
+    assert(msg->payLoad == NULL);
+    assert(msg->payLoadSize == 0);
+    assert(msg->packetSize == 0);
+    assert(msg->packet == NULL);
+    
+    if ((packetSize + MSG_MAX_HDR_SIZE) > MAX_CACHED_PAYLOAD_SIZE) {
+       msg->payLoad = (char *) pc_malloc(packetSize + MSG_MAX_HDR_SIZE);
+    } else {
+       if (node->partitionData->msgPayloadFreeList == NULL) {
+          MessagePayloadListCell* NewCell = (MessagePayloadListCell*)
+              pc_malloc(sizeof(MessagePayloadListCell));
+          msg->payLoad = &(NewCell->payloadMemory[0]);
+       } else {
+          msg->payLoad = (char*)
+              &(node->partitionData->msgPayloadFreeList->payloadMemory[0]);
+          node->partitionData->msgPayloadFreeList = 
+              node->partitionData->msgPayloadFreeList->next;
+          (node->partitionData->msgPayloadFreeListNum)--;
+       }
+    }
+    assert(msg->payLoad != NULL);
+    msg->payLoadSize = packetSize + MSG_MAX_HDR_SIZE;
+    msg->packet = msg->payLoad + MSG_MAX_HDR_SIZE;
+    msg->packetSize = packetSize;
+    msg->packetCreationTime = simclock();
+}
+
+
+/*
+ * FUNCTION     GLOMO_MsgAddHeader
+ * PURPOSE      This function is called to reserve additional space for a
+ *              header of size "hdrSize" for the packet enclosed in the
+ *              message. The "packetSize" variable in the message structure
+ *              will be increased by "hdrSize".
+ *              After this function is called the "packet" variable in the
+ *              message structure will point the space occupied by this new
+ *              header.
+ *
+ * Parameters:
+ *    node:         node which is adding header
+ *    msg:          message for which header has to be added
+ *    hdrSize:      size of the header to be added
+ */
+void GLOMO_MsgAddHeader(GlomoNode *node, Message *msg, int hdrSize)
+{
+    msg->packet -= hdrSize;
+    msg->packetSize += hdrSize;
+
+    if (msg->packet < msg->payLoad) {
+        printf("GLOMO Error: Not enough space for headers.\n"
+               "Increae MSG_MAX_HDR_SIZE and try again.\n");
+        assert(FALSE);
+        exit(1);
+    }
+}
+
+
+/*
+ * FUNCTION     GLOMO_MsgRemoveHeader
+ * PURPOSE      This function is called to remove a header from the packet
+ *              enclosed in the message. The "packetSize" variable in the
+ *              message will be decreased by "hdrSize".
+ *
+ * Parameters:
+ *    node:         node which is removing the header
+ *    msg:          message for which header is being removed
+ *    hdrSize:      size of the header being removed
+ */
+void GLOMO_MsgRemoveHeader(GlomoNode *node, Message *msg, int hdrSize)
+{
+    msg->packet += hdrSize;
+    msg->packetSize -= hdrSize;
+
+    if (msg->packet >= (msg->payLoad + msg->payLoadSize)) {
+        printf("Glomo Error: Packet pointer going beyond allocated memory.\n");
+        assert(FALSE);
+        exit(1);
+    }
+}
+
+
+/*
+ * FUNCTION     GLOMO_MsgFree
+ * PURPOSE      When the message is no longer needed it can be freed. Firstly,
+ *              the data portion of the message is freed. Than the message
+ *              itself is freed. It is important to remember to free the
+ *              message. Otherwise there will nasty memory leaks in the
+ *              program.
+ *
+ * Parameters:
+ *    node:       node which is freeing the message
+ *    msg:        message which has to be freed
+ */
+void GLOMO_MsgFree(GlomoNode *node, Message *msg) {
+    if (msg->payLoadSize > 0) {
+        if ((node != NULL) &&
+            (msg->payLoadSize <= MAX_CACHED_PAYLOAD_SIZE) &&
+            (node->partitionData->msgPayloadFreeListNum < MSG_PAYLOAD_LIST_MAX))
+        {
+           MessagePayloadListCell* cellPtr =
+               (MessagePayloadListCell*)msg->payLoad;
+           cellPtr->next = node->partitionData->msgPayloadFreeList;
+           node->partitionData->msgPayloadFreeList = cellPtr;
+           (node->partitionData->msgPayloadFreeListNum)++;
+        } else {
+           pc_free(msg->payLoad);
+        }
+        msg->payLoad = 0;
+        msg->payLoadSize = 0;
+    }
+
+    if (msg->infoSize > SMALL_INFO_SPACE_SIZE) {
+        pc_free(msg->info);
+    }
+    msg->infoSize = 0;
+
+    if ((node != NULL) &&
+        (node->partitionData->msgFreeListNum < MSG_LIST_MAX))
+    {
+        MessageListCell* cellPtr = (MessageListCell*)msg;
+        cellPtr->next = node->partitionData->msgFreeList;
+        node->partitionData->msgFreeList = cellPtr;
+        (node->partitionData->msgFreeListNum)++;
+    } else {
+        pc_free(msg);
+    }
+}
+
+
+/*
+ * FUNCTION     GLOMO_MsgCopy
+ * PURPOSE      Create a new message which is an exact duplicate of the message
+ *              supplied as the parameter to the function and return the new
+ *              message.
+ *
+ * Parameters:
+ *    node:       node which is caling message copy
+ *    msg:        message for which duplicate has to be made
+ */
+Message *GLOMO_MsgCopy(GlomoNode *node, const Message *msg) {
+    Message *newMsg;
+
+    if (node->partitionData->msgFreeList == NULL) {
+        MessageListCell* NewCell = (MessageListCell*)
+            pc_malloc(sizeof(MessageListCell));
+        newMsg = (Message *)&(NewCell->messageCell);
+    } else {
+        newMsg = (Message *)&(node->partitionData->msgFreeList->messageCell);
+        node->partitionData->msgFreeList = 
+            node->partitionData->msgFreeList->next;
+        (node->partitionData->msgFreeListNum)--;
+    }
+
+    assert(newMsg != NULL);
+    memcpy(newMsg, msg, sizeof(Message));
+
+    if (newMsg->payLoadSize == 0) {
+        newMsg->payLoad = NULL;
+    }
+    else {
+        if (msg->payLoadSize <= MAX_CACHED_PAYLOAD_SIZE) {
+            if (node->partitionData->msgPayloadFreeList == NULL) {
+               MessagePayloadListCell* NewCell = (MessagePayloadListCell*)
+                   pc_malloc(sizeof(MessagePayloadListCell));
+               newMsg->payLoad = &(NewCell->payloadMemory[0]);
+            } else {
+               newMsg->payLoad = (char*)
+                  &(node->partitionData->msgPayloadFreeList->payloadMemory[0]);
+               node->partitionData->msgPayloadFreeList = 
+                  node->partitionData->msgPayloadFreeList->next;
+               (node->partitionData->msgPayloadFreeListNum)--;
+            }
+        } else {
+            newMsg->payLoad = (char *) pc_malloc(newMsg->payLoadSize);
+        }
+        assert(newMsg->payLoad != NULL);
+        memcpy(newMsg->payLoad, msg->payLoad, msg->payLoadSize);
+    }
+
+    if (msg->packet != NULL) {
+        newMsg->packet = newMsg->payLoad + (msg->packet - msg->payLoad);
+    }
+
+    if (msg->infoSize > SMALL_INFO_SPACE_SIZE) {
+        newMsg->info = (char *) pc_malloc(newMsg->infoSize);
+        assert(newMsg->info != NULL);
+        memcpy(newMsg->info, msg->info, msg->infoSize);
+    } else {
+        newMsg->info = (char*)&(newMsg->smallInfoSpace[0]);
+    }
+    
+    return newMsg;
+}
+
+
+
+
+/*
+ * FUNCTION     GLOMO_MsgSend
+ * PURPOSE      Function call used to send a message within GlomoSim. When
+ *              a message is sent using this mechanism, only the pointer to
+ *              the message is actually sent through the system. So the user
+ *              has to be careful not to do anything with the pointer to the
+ *              message once GLOMO_MsgSend has been called.
+ *
+ * Parameters:
+ *    node:       node which is sending message
+ *    msg:        message to be delivered
+ *    delay:      delay suffered by this message.
+ */
+void GLOMO_MsgSend(GlomoNode *node, Message *msg, clocktype delay) {
+    SplayNode *splayNodePtr;
+
+    /*
+     * If delay is zero, then call the appropriate layer directly from here.
+     */
+    if (delay == 0) {
+        GLOMO_CallLayer(node, msg);
+
+        return;
+    }
+    assert(delay > 0);
+
+    if (node->partitionData->splayNodeFreeList == NULL) {
+        SplayNodeListCell* NewCell = (SplayNodeListCell*)
+            pc_malloc(sizeof(SplayNodeListCell));
+        splayNodePtr = (SplayNode *)&(NewCell->splayNodeCell);
+    } else {
+        splayNodePtr = (SplayNode *)
+            &(node->partitionData->splayNodeFreeList->splayNodeCell);
+        node->partitionData->splayNodeFreeList = 
+            node->partitionData->splayNodeFreeList->next;
+        (node->partitionData->splayNodeFreeListNum)--;
+    }
+    assert(splayNodePtr != NULL);
+
+    memset(splayNodePtr, 0, sizeof(SplayNode));
+    splayNodePtr->timeValue = simclock() + delay;
+    splayNodePtr->msg = msg;
+
+    /*
+    send InternalMessage { splayNodePtr->timeValue, node->id }
+                         to self after delay;
+    */
+    GLOMO_SplayTreeInsert(node, splayNodePtr);
+    
+    
+}
+
+
+
+/*
+ * FUNCTION     GLOMO_MsgSendReal
+ * PURPOSE      Function call used to send a message within GlomoSim.
+ *
+ * Parameters:
+ *    node:       node which is sending message
+ *    msg:
+ *    dest:       ename of destination entity
+ *    delay:      delay suffered by this message.
+ */
+void GLOMO_MsgSendReal (GlomoNode *node, Message *msg,
+                        ename dest, clocktype delay)
+{
+    send RemoteMessage { node, msg } to dest after delay;
+}
+

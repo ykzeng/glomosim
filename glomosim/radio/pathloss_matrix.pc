@@ -1,0 +1,183 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.0 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-solutions.com  
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.0,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: pathloss_matrix.pc.stub,v 1.2 2001/09/13 07:58:23 jmartin Exp $
+ * pathloss_matrix.pc -- drive glomosim with pathloss matrix traces
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "main.h"
+#include "fileio.h"
+#include "message.h"
+#include "api.h"
+#include "structmsg.h"
+#include "glomo.h"
+
+#include "pathloss_matrix.h"
+
+
+static char rcsid[] = "$Id: pathloss_matrix.pc.stub,v 1.2 2001/09/13 07:58:23 jmartin Exp $";
+
+
+/*
+ * basic idea:
+ *
+ * A "masternode" uses the mobility timer to read in range/attenuation
+ * data from the trace file an splits the data into every node's local
+ * data structure.
+ *
+ * The "masternode" for each partition is determined by the first to
+ * call it's mobility init function.
+ */
+
+
+/* MITRE's pathloss format
+ *
+ * Time (nearest whole second)    Node A     Node B     Path Loss (dB) Range (meters)
+ *
+ * End of file is indicated by a -1 in the first column.  (And nothing
+ * else on the line.)  
+ */
+
+
+/*
+ * breaks:
+ *
+ * The 'channel.pc:ChannelSignalReachable' method of broadcasting
+ * won't work as we no longer know position. So this only works with
+ * single partitions.
+ *
+ * The GUI is broken for similar reasons.
+ * 
+ */
+
+
+/*
+ * GLOMO_MobilityPathlossMatrixInit() -- initialize pathloss matrix mobility
+ */
+void GLOMO_MobilityPathlossMatrixInit(GlomoNode *node, 
+                                      GlomoNodeInput *nodeInput)
+{
+    assert(FALSE); abort();
+} /* GlomoMobilityPathlossMatrixInit() */
+
+
+/*
+ * GlomoMobilityPathlossMatrixFinalize() -- finalize pathloss matrix mobility
+ */
+void GLOMO_MobilityPathlossMatrixFinalize(GlomoNode *node) {
+    assert(FALSE); abort();
+} /* GLOMO_MobilityPathlossMatrixFinalize() */
+
+
+
+/*
+ * GLOMO_MobilityPathlossMatrix() -- pathloss matrix mobility
+ */
+void GLOMO_MobilityPathlossMatrix(GlomoNode *node) {
+    assert(FALSE); abort();
+}
+
+/*
+ * PathlossMatrixInit() -- initialize pathloss propagation
+ */
+void PathlossMatrixInit(GlomoProp* prop,
+                        const GlomoNodeInput *nodeInput)
+{
+    assert(FALSE); abort();
+}
+
+double PathlossMatrix(NODE_ADDR txAddr,
+                      NODE_ADDR rxAddr,
+                      float txAntennaGain,
+                      float rxAntennaGain,
+                      GlomoPropPathlossMatrix *pathlossVar,
+                      double *distance)
+{
+    assert(FALSE); abort();
+    return 0.0;
+}
+
+/* Local Variables: */
+/* c-basic-offset: 4 */
+/* indent-tabs-mode: nil */
+/* End: */
+
+

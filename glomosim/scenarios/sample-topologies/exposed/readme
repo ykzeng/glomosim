@@ -1,0 +1,4 @@
+This directory demonstrates how to set up an exposed terminal environment of
+4 nodes with FTP traffic (from tcplib) from node 1 to node 0 and from 
+node 2 to node 3.
+

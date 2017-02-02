@@ -1,0 +1,656 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: http_server.pc,v 1.4 2001/02/15 03:17:26 mineo Exp $
+ *
+ * This file contains initialization function, message processing
+ * function, and finalize function used by each http server.
+ * This code is adapted from the work published by Bruce Mah.
+ *      B. Mah, "An Empirical Model of HTTP Network Traffic",
+ *      Proceedings of INFOCOM '97, Kobe, Japan, April 1997.
+ *      http://www.employees.org/~bmah/Papers/Http-Infocom.pdf
+ *
+ * Differences/Modifications to the above model:
+ * 1) 0 length request/response packets are changed to 1-byte packets
+ * 2) The addition of a threshhold parameter that limits the maximum
+ *    "think time" between page requests
+ * 3) The use of this maximum threshhold parameter to recover from
+ *    disconnections- the http client will re-initiate page requests if
+ *    it is waiting for a response from the server, and has not received
+ *    an update in {maximum threshhold} time.
+ *
+ * Send questions to Julian Hsu <gandy@cs.ucla.edu>
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h> 
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+
+#include "application.h"
+#include "app_util.h"
+#include "http_distribution.h"
+#include "http_server.h"
+#include "tcpapps.h"
+#include "tcp.h"
+
+#define noDEBUG
+
+
+/*
+ * NAME:        AppLayerHttpServer.
+ * PURPOSE:     Models the behaviour of Http Server on receiving the
+ *              message encapsulated in msg.
+ * PARAMETERS:  nodePtr - pointer to the node which received the message.
+ *              msg - message received by the layer
+ * RETURN:      none.
+ */
+void 
+AppLayerHttpServer(GlomoNode *nodePtr, Message *msg)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    GlomoAppHttpServer *serverPtr;
+
+    ctoa(simclock(), buf);
+
+    switch(msg->eventType) 
+    {  
+        case MSG_APP_FromTransListenResult: 
+        {
+            TransportToAppListenResult *listenResult;
+
+            listenResult = (TransportToAppListenResult *) msg->info;
+ 
+            #ifdef DEBUG
+                printf("HTTP Server: Node %ld at %s got listenResult\n",
+                        nodePtr->nodeAddr, buf);
+            #endif
+
+            if (listenResult->connectionId == -1)
+            {
+                nodePtr->appData.numAppTcpFailure++;
+            }
+
+            break;
+        }
+
+        case MSG_APP_FromTransOpenResult: 
+        {
+            TransportToAppOpenResult *openResult;
+            openResult = (TransportToAppOpenResult *) msg->info;
+ 
+            #ifdef DEBUG
+                printf("HTTP Server: Node %ld at %s got OpenResult\n", 
+                        nodePtr->nodeAddr, buf);
+            #endif
+
+            assert(openResult->type == TCP_CONN_PASSIVE_OPEN);
+
+            if (openResult->connectionId < 0)
+            {
+                nodePtr->appData.numAppTcpFailure++;
+            }
+            else 
+            {
+                GlomoAppHttpServer *serverPtr; 
+                serverPtr = AppHttpServerNewHttpServer(nodePtr, openResult);
+                assert(serverPtr != NULL);
+            }
+
+            break;
+        }
+
+        case MSG_APP_FromTransDataSent:
+        {
+            TransportToAppDataSent *dataSent;
+            char payload[MAX_APP_DATA_UNIT];
+            long sendSize;
+
+            dataSent = (TransportToAppDataSent *) msg->info;
+        
+            #ifdef DEBUG
+                printf("HTTP Server Node %ld at %s sent data %ld\n", 
+                        nodePtr->nodeAddr, buf, dataSent->length); 
+            #endif
+
+            serverPtr = AppHttpServerGetHttpServer(nodePtr, 
+                                     dataSent->connectionId);
+
+            assert(serverPtr != NULL);
+
+            serverPtr->numBytesSent += dataSent->length;
+
+            if (serverPtr->bytesRemaining > 0)
+            {
+                memset(payload, 0, MAX_APP_DATA_UNIT);
+#ifdef DEBUG
+                printf("#%d:   HTTPD - still %d bytes remaining...\n",
+                       nodePtr->nodeAddr, serverPtr->bytesRemaining);
+#endif
+                sendSize = MIN(serverPtr->bytesRemaining, MAX_APP_DATA_UNIT);
+                serverPtr->bytesRemaining -= sendSize;
+                if (serverPtr->bytesRemaining == 0)
+                {
+                    payload[sendSize-1] = 'd';
+                }
+                AppTcpSendData(nodePtr, TRANSPORT_PROTOCOL_TCP,
+                               serverPtr->connectionId, payload, sendSize);
+            }
+            break;
+        }
+
+        case MSG_APP_FromTransDataReceived: 
+        {
+            TransportToAppDataReceived *dataRecvd;
+            char *packet;
+
+            dataRecvd = (TransportToAppDataReceived *) GLOMO_MsgReturnInfo(msg);
+
+            packet = GLOMO_MsgReturnPacket(msg);
+
+            #ifdef DEBUG
+                printf("HTTP Server: Node %ld at %s received data size %d\n", 
+                        nodePtr->nodeAddr, buf, GLOMO_MsgReturnPacketSize(msg));
+            #endif
+
+            serverPtr = AppHttpServerGetHttpServer(nodePtr, 
+                                                 dataRecvd->connectionId);
+
+            assert(serverPtr != NULL);
+            assert(serverPtr->sessionIsClosed == FALSE);
+
+            serverPtr->numBytesRecvd += GLOMO_MsgReturnPacketSize(msg);
+
+            /* 
+             * Test if the received data contains the last byte 
+             * of an item.  If so, send a response packet back.
+             * If the data contains a 'c', close the connection.
+             */
+            if (packet[msg->packetSize - 1] == 0) 
+            {
+                /* Do nothing since item is not completely received yet. */
+                       
+            }
+            else if (packet[msg->packetSize - 1] == 'p') 
+            {
+                long primaryReplyLength = 
+                    AppHttpServerDeterminePrimaryReplyLength(nodePtr);
+
+                serverPtr->pagesSent++;
+                /* HTTP Primary Request  completely received, 
+                   now send Primary Reply */
+                AppHttpServerSendPrimaryReply(nodePtr, serverPtr,
+                                              primaryReplyLength); 
+            } 
+            else if (packet[msg->packetSize - 1] == 's')
+            {
+                long secondaryReplyLength =
+                    AppHttpServerDetermineSecondaryReplyLength(nodePtr);
+
+                /* HTTP Secondary Request  completely received,
+                   now send Secondary Reply */
+                AppHttpServerSendSecondaryReply(nodePtr, serverPtr,
+                                                secondaryReplyLength);
+
+            }
+            else if (packet[msg->packetSize - 1] == 'c') 
+            {
+                /* 
+                 * Client wants to close the session, so server also
+                 * initiates a close.
+                 */
+                AppTcpCloseConnection(nodePtr, TRANSPORT_PROTOCOL_TCP, 
+                                      serverPtr->connectionId);
+
+                serverPtr->sessionFinish = simclock();
+                serverPtr->sessionIsClosed = TRUE;
+            }
+            else
+            {
+               assert(0);
+            }
+
+            break;
+        }
+    
+        case MSG_APP_FromTransCloseResult:
+        {
+            TransportToAppCloseResult *closeResult;
+
+            closeResult = (TransportToAppCloseResult *) msg->info;
+
+            #ifdef DEBUG
+                printf("HTTP Server: Node %ld at %s got close result\n", 
+                        nodePtr->nodeAddr, buf);
+            #endif
+
+            serverPtr = AppHttpServerGetHttpServer(nodePtr, 
+                                                 closeResult->connectionId);
+            assert(serverPtr != NULL);
+
+            if (serverPtr->sessionIsClosed == FALSE) 
+            {
+                serverPtr->sessionIsClosed = TRUE;
+                serverPtr->sessionFinish = simclock();
+            }
+
+//            AppHttpServerRemoveHttpServer(nodePtr, closeResult);
+            break;
+        }
+    
+        default:
+            ctoa(simclock(), buf);
+            printf("HTTP Server: Node %u at time %s received "
+                   "message of unknown type"
+                   " %ld.\n", nodePtr->nodeAddr, buf, msg->eventType);
+            assert(FALSE);
+    }
+
+    GLOMO_MsgFree(nodePtr, msg);
+}
+
+
+/*
+ * NAME:        AppHttpServerInit. 
+ * PURPOSE:     listen on Http server port. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ * RETURN:      none. 
+ */
+void
+AppHttpServerInit(GlomoNode *nodePtr)
+{
+    AppTcpServerListen(nodePtr, 
+                       TRANSPORT_PROTOCOL_TCP, 
+                       APP_HTTP_SERVER,
+                       nodePtr->nodeAddr, 
+                       (short)APP_HTTP_SERVER);
+}
+
+
+/*
+ * NAME:        AppHttpServerPrintStats. 
+ * PURPOSE:     Prints statistics of a Http session. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              serverPtr - pointer to the http server data structure. 
+ * RETURN:      none. 
+ */
+static void
+AppHttpServerPrintStats(GlomoNode *nodePtr, GlomoAppHttpServer *serverPtr)
+{
+    clocktype throughput;
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    char timeStr[GLOMO_MAX_STRING_LENGTH];
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    char throughputStr[GLOMO_MAX_STRING_LENGTH];
+
+    ctoa((serverPtr->sessionFinish - serverPtr->sessionStart), timeStr);
+
+    if (serverPtr->sessionFinish <= serverPtr->sessionStart) 
+    {
+        throughput = 0; 
+    } 
+    else 
+    {
+        throughput = (serverPtr->numBytesRecvd * 8.0 * SECOND) /
+                     (serverPtr->sessionFinish - serverPtr->sessionStart);
+    }
+
+    ctoa(throughput, throughputStr);
+
+    sprintf(buf, "(%ld to %ld): conn length %s pages sent = %ld, "
+            "bytes sent = %ld B, bytes recvd = %ld B, throughput = %s bps",
+            serverPtr->localAddr, serverPtr->remoteAddr,
+            timeStr, serverPtr->pagesSent, serverPtr->numBytesSent,
+            serverPtr->numBytesRecvd, throughputStr);
+
+    GLOMO_PrintStat(nodePtr, "AppHttpServer", buf);
+}
+
+/*
+ * NAME:        AppHttpServerFinalize. 
+ * PURPOSE:     Collect statistics of a Http session. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              serverPtr - pointer to the http server data structure. 
+ * RETURN:      none. 
+ */
+void
+AppHttpServerFinalize(GlomoNode *nodePtr, GlomoAppHttpServer *serverPtr)
+{
+    if (nodePtr->appData.appStats == TRUE)
+    {
+        AppHttpServerPrintStats(nodePtr, serverPtr);
+    }
+}
+
+
+
+/*
+ * NAME:        AppHttpServerGetHttpServer.
+ * PURPOSE:     search for a http server data structure. 
+ * PARAMETERS:  appList - link list of applications, 
+ *              connId - connection ID of the http server. 
+ * RETURN:      the pointer to the http server data structure,
+ *              NULL if nothing found.
+ */
+static GlomoAppHttpServer *
+AppHttpServerGetHttpServer(GlomoNode *nodePtr, int connId)
+{
+    AppInfo *appList = nodePtr->appData.appPtr;
+    GlomoAppHttpServer *httpServer;
+    
+    for (; appList != NULL; appList = appList->appNext) 
+    {
+        if (appList->appType == APP_HTTP_SERVER)
+        {
+            httpServer = (GlomoAppHttpServer *) appList->appDetail;
+
+            if (httpServer->connectionId == connId)
+            {
+                return httpServer;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * NAME:        AppHttpServerRemoveHttpServer.
+ * PURPOSE:     Remove an HTTP server process that corresponds to the
+ *              given connectionId
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              closeRes - the close connection results from TCP
+ * RETURN:      none.
+ */
+static void AppHttpServerRemoveHttpServer(GlomoNode *nodePtr,
+                                          TransportToAppCloseResult *closeRes)
+{
+    AppInfo *curApp = nodePtr->appData.appPtr;
+    AppInfo *tempApp;
+    GlomoAppHttpServer *serverPtr;
+
+    if (curApp == NULL)
+        return;
+
+    if (curApp->appType == APP_HTTP_SERVER)
+    {
+        serverPtr = curApp->appDetail;
+        assert(serverPtr);
+        if (serverPtr->connectionId == closeRes->connectionId)
+        {
+#ifdef DEBUG
+            printf("  REMOVE 1st server.\n");
+#endif
+            pc_free(serverPtr);
+            tempApp = curApp->appNext;
+            pc_free(curApp);
+            nodePtr->appData.appPtr = tempApp;
+            return;
+        }
+    
+    }
+
+    tempApp = curApp;
+    curApp = curApp->appNext;
+    while (curApp != NULL)
+    {
+        if (curApp->appType == APP_HTTP_SERVER)
+        {
+            serverPtr = curApp->appDetail;
+            assert(serverPtr);
+            if (serverPtr->connectionId == closeRes->connectionId)
+            {
+#ifdef DEBUG
+                printf("    REMOVE intermediate server.\n");
+#endif
+                pc_free(serverPtr);
+                tempApp->appNext = curApp->appNext;
+                pc_free(curApp);
+                curApp = tempApp->appNext;
+            }
+            else
+            {
+                tempApp = curApp;
+                curApp = curApp->appNext;
+            }
+        }
+        else
+            curApp = curApp->appNext;
+    }
+}
+
+/*
+ * NAME:        AppHttpServerNewHttpServer.
+ * PURPOSE:     create a new http server data structure, place it
+ *              at the beginning of the application list. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              openResult - result of the open request. 
+ * RETRUN:      the pointer to the created http server data structure,
+ *              NULL if no data structure allocated. 
+ */
+static GlomoAppHttpServer *
+AppHttpServerNewHttpServer(GlomoNode *nodePtr, 
+                         TransportToAppOpenResult *openResult)
+{
+    AppInfo *newApp;
+    GlomoAppHttpServer *httpServer;
+
+    newApp = (AppInfo *) pc_malloc(sizeof(AppInfo));
+
+    if (newApp == NULL) 
+    {
+        assert(FALSE);
+    }
+
+    httpServer = (GlomoAppHttpServer *) pc_malloc(sizeof(GlomoAppHttpServer));
+
+    if (httpServer == NULL) 
+    {
+        printf("HTTP Server: Node %ld cannot allocate memory for http server\n",
+                nodePtr->nodeAddr);
+        assert(FALSE);
+    }
+
+    /*
+     * fill in connection id, etc.
+     */
+    newApp->appType = APP_HTTP_SERVER;
+    httpServer->connectionId = openResult->connectionId;
+    httpServer->localAddr = openResult->localAddr;
+    httpServer->remoteAddr = openResult->remoteAddr;
+    httpServer->sessionStart = simclock();
+    httpServer->sessionFinish = simclock(); 
+    httpServer->sessionIsClosed = FALSE; 
+    httpServer->numBytesSent = 0;
+    httpServer->numBytesRecvd = 0;
+    httpServer->pagesSent = 0;
+
+    newApp->appDetail = httpServer;
+    newApp->appNext = nodePtr->appData.appPtr; 
+    nodePtr->appData.appPtr = newApp;
+
+    return httpServer;
+}
+
+/*
+ * NAME:        AppHttpClientDeterminePrimaryReplyLength.
+ * PURPOSE:     Return the number of bytes in the primary reply
+ * PARAMETERS:  clientPtr - pointer to the client's data structure
+ * RETURN:      the number of bytes.
+ */
+long AppHttpServerDeterminePrimaryReplyLength(GlomoNode *node)
+{
+    extern const DoubleDistElement *HttpPrimaryReplyDistTable;
+    extern const int HttpPrimaryReplyDistLength;
+    double u = pc_erand(node->seed);
+    float value;
+    int midpoint = DoubleDistFindIndex(HttpPrimaryReplyDistTable,
+                                       HttpPrimaryReplyDistLength,
+                                       u);
+
+#ifdef DEBUG
+    printf("    u = %f\n", u);
+    printf("AppHttpClientDeterminePrimaryReplyLength(of %d) = %d\n",
+           HttpPrimaryReplyDistLength, midpoint);
+#endif
+
+    if (midpoint < 0)
+        value = HttpPrimaryReplyDistTable[0].value;
+    else
+        value = DoubleDistEmpiricalIntegralInterpolate(
+                HttpPrimaryReplyDistTable[midpoint].cdf,
+                HttpPrimaryReplyDistTable[midpoint+1].cdf,
+                HttpPrimaryReplyDistTable[midpoint].value,
+                HttpPrimaryReplyDistTable[midpoint+1].value, u);
+
+#ifdef DEBUG
+    printf("    midpoint = %d, value = %f\n", midpoint, value);
+#endif
+    return value;
+}
+
+/*
+ * NAME:        AppHttpClientDetermineSecondaryReplyLength.
+ * PURPOSE:     Return the number of bytes in the secondary reply
+ * PARAMETERS:  clientPtr - pointer to the client's data structure
+ * RETURN:      the number of bytes.
+ */
+long AppHttpServerDetermineSecondaryReplyLength(GlomoNode *node)
+{
+    extern const DoubleDistElement *HttpSecondaryReplyDistTable;
+    extern const int HttpSecondaryReplyDistLength;
+    double u = pc_erand(node->seed);
+    float value;
+    int midpoint = DoubleDistFindIndex(HttpSecondaryReplyDistTable,
+                                       HttpSecondaryReplyDistLength,
+                                       u);
+
+#ifdef DEBUG
+    printf("    u = %f\n", u);
+    printf("AppHttpClientDetermineSecondaryReplyLength(of %d) = %d\n",
+           HttpSecondaryReplyDistLength, midpoint);
+#endif
+
+    if (midpoint < 0)
+        value = HttpSecondaryReplyDistTable[0].value;
+    else
+        value = DoubleDistEmpiricalIntegralInterpolate(
+                HttpSecondaryReplyDistTable[midpoint].cdf,
+                HttpSecondaryReplyDistTable[midpoint+1].cdf,
+                HttpSecondaryReplyDistTable[midpoint].value,
+                HttpSecondaryReplyDistTable[midpoint+1].value, u);
+
+#ifdef DEBUG
+    printf("    midpoint = %d, value = %f\n", midpoint, value);
+#endif
+
+    return value;
+}
+
+/*
+ * NAME:        AppHttpServerSendPrimaryReply.
+ * PURPOSE:     Send the primary reply to the client.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              serverPtr - pointer to the server's data structure.
+ *              primaryReplyLength - the length in bytes of the reply.
+ * RETURN:      none.
+ */
+static void AppHttpServerSendPrimaryReply(GlomoNode *node, 
+                                          GlomoAppHttpServer *serverPtr,
+                                          long primaryReplyLength)
+{
+    char payload[MAX_APP_DATA_UNIT];
+    long sendSize;
+
+/*  Julian: added this because 0 length packets break the sim */
+    if (primaryReplyLength == 0)
+        primaryReplyLength = 1;
+
+    memset(payload, 0, MAX_APP_DATA_UNIT);
+
+    sendSize = MIN(primaryReplyLength, MAX_APP_DATA_UNIT);
+    primaryReplyLength -= sendSize;
+    serverPtr->bytesRemaining = primaryReplyLength;
+    if (primaryReplyLength == 0)
+    {
+        payload[sendSize-1] = 'd';
+    }
+    AppTcpSendData(node, TRANSPORT_PROTOCOL_TCP,
+                   serverPtr->connectionId, payload, sendSize);
+}
+
+/*
+ * NAME:        AppHttpServerSendSecondaryReply.
+ * PURPOSE:     Send the secondary reply to the client.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              serverPtr - pointer to the server's data structure.
+ *              secondaryReplyLength - the length in bytes of the reply.
+ * RETURN:      none.
+ */
+static void AppHttpServerSendSecondaryReply(GlomoNode *node,
+                                          GlomoAppHttpServer *serverPtr,
+                                          long secondaryReplyLength)
+{
+    char payload[MAX_APP_DATA_UNIT];
+    long sendSize;
+
+/*  Julian: added this because 0 length packets break the sim */
+    if (secondaryReplyLength == 0)
+        secondaryReplyLength = 1;
+
+    memset(payload, 0, MAX_APP_DATA_UNIT);
+
+    sendSize = MIN(secondaryReplyLength, MAX_APP_DATA_UNIT);
+    secondaryReplyLength -= sendSize;
+    serverPtr->bytesRemaining = secondaryReplyLength;
+    if (secondaryReplyLength == 0)
+    {
+        payload[sendSize-1] = 'd';
+    }
+    AppTcpSendData(node, TRANSPORT_PROTOCOL_TCP,
+                   serverPtr->connectionId, payload, sendSize);
+
+}
+
+

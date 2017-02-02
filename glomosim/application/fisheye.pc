@@ -1,0 +1,945 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * Fisheye Routing Protocol
+ *       file: fisheye.pc
+ *         by: Gary Guangyu Pei (pei@cs.ucla.edu)
+ * objectives: simulate networking routing protocol
+ *  reference: Scalable Routing Strategies for Ad-hoc 
+ *             Wireless Networks
+ *             JSAC special issue on Ad-hoc Aug '99 by UCLA
+ *
+ */
+
+
+/*
+ * $Id: fisheye.pc,v 1.10 2001/02/15 03:17:26 mineo Exp $
+ */
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "nwcommon.h"
+#include "app_util.h"
+#include "fisheye.h"
+
+/*
+ * FUNCTION   RoutingFisheyeInit
+ * PURPOSE    Initialize Fisheye variables, being called once for each node 
+ *            at the beginning.
+ * PARAMETERS  
+ *            node - information associated with the node.
+ *
+ * RETURN     None.                          
+ */
+void RoutingFisheyeInit(GlomoNode *node,const GlomoNodeInput *nodeInput)
+{
+  char buf[GLOMO_MAX_STRING_LENGTH];  
+  BOOL retVal;
+  FILE *fp;
+  short Scope;
+  char NeighborTOIntervalStr[GLOMO_MAX_STRING_LENGTH],
+       IntraUpdateIntervalStr[GLOMO_MAX_STRING_LENGTH],
+       InterUpdateIntervalStr[GLOMO_MAX_STRING_LENGTH];
+  clocktype randomTime;
+  GlomoRoutingFisheye *fisheye;
+  Message *newMsg;
+  
+  fisheye = (GlomoRoutingFisheye *) 
+            pc_malloc(sizeof(GlomoRoutingFisheye));
+  if (fisheye == NULL) {
+    fprintf(stderr, "Fisheye: Cannot alloc memory for Fisheye Routing!\n");
+    assert(FALSE);
+  }
+  
+  node->appData.routingVar = (void *)fisheye;
+
+  /* open config file of the fisheye*/
+  retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "FISHEYE-FILE", buf);
+  assert(retVal == TRUE);    
+  fp = fopen(buf, "r");
+  assert(fp != NULL);  
+
+  /* read the fisheye parameters and init the parameter*/
+  fscanf(fp,"%hd %s %s %s\n",&Scope,
+         NeighborTOIntervalStr,IntraUpdateIntervalStr,
+         InterUpdateIntervalStr);
+  fisheye->parameter.Scope               
+    = Scope ;
+  fisheye->parameter.NeighborTOInterval  
+    = GLOMO_ConvertToClock(NeighborTOIntervalStr);
+  fisheye->parameter.IntraUpdateInterval 
+    = GLOMO_ConvertToClock(IntraUpdateIntervalStr);
+  fisheye->parameter.InterUpdateInterval 
+    = GLOMO_ConvertToClock(InterUpdateIntervalStr);
+  fclose(fp);
+
+  /* Initialize the TT */
+  RoutingFisheyeInitTT(node,fisheye);
+
+  /* Initialize heard neighbor */
+  fisheye->heardNeighborInfo = NULL;
+
+  RoutingFisheyeInitStats(node,fisheye);
+ 
+  /* start TT exchange */
+  randomTime = (clocktype) (pc_nrand(node->seed)%FisheyeRandomTimer);
+  newMsg = GLOMO_MsgAlloc(node,
+                          GLOMO_APP_LAYER,
+                          ROUTING_PROTOCOL_FISHEYE,
+                          MSG_APP_FisheyeNeighborTimeout);
+  GLOMO_MsgSend(node,newMsg,randomTime + 
+                fisheye->parameter.NeighborTOInterval);
+                
+  randomTime = (clocktype) (pc_nrand(node->seed)%FisheyeRandomTimer);
+  newMsg = GLOMO_MsgAlloc(node,
+                          GLOMO_APP_LAYER,
+                          ROUTING_PROTOCOL_FISHEYE,
+                          MSG_APP_FisheyeIntraUpdate);
+  GLOMO_MsgSend(node,newMsg,randomTime);
+
+  randomTime = (clocktype) (pc_nrand(node->seed)%FisheyeRandomTimer);
+  newMsg = GLOMO_MsgAlloc(node,
+                          GLOMO_APP_LAYER,
+                          ROUTING_PROTOCOL_FISHEYE,
+                          MSG_APP_FisheyeInterUpdate);
+  GLOMO_MsgSend(node,newMsg,randomTime);
+
+}
+/*
+ * FUNCTION   RoutingFisheyeFinalize
+ * PURPOSE    Print out statistics, being called at the end.
+ * PARAMETERS 
+ *            node - information associated with the node.
+ *
+ * RETURN     None. 
+ */
+void RoutingFisheyeFinalize(GlomoNode *node)
+{ 
+  if (node->appData.routingStats == TRUE) 
+    RoutingFisheyePrintRoutingStats(node);
+
+}
+/*
+ * FUNCTION   RoutingFisheyeLayer
+ * PURPOSE    Simulate Fisheye protocol, being called whenever a message is
+ *            for Fisheye routing layer.
+ * PARAMETERS 
+ *            node - information associated with the node.
+ *            message - message header indentifying type of message.
+ *
+ * RETURN     None.
+ */
+void RoutingFisheyeLayer(GlomoNode *node, Message *msg)
+{ 
+  GlomoRoutingFisheye *fisheye;
+  char clockStr[GLOMO_MAX_STRING_LENGTH],*payload;
+  ctoa(simclock(), clockStr);
+
+  fisheye = (GlomoRoutingFisheye *) node->appData.routingVar;
+  assert (fisheye != NULL);
+
+  switch(msg->eventType) {
+  case  MSG_APP_FromTransport: 
+    {
+      RoutingFisheyeHeader *header;
+      fisheye->stats.pktNumFromUdp ++ ;
+
+      header = (RoutingFisheyeHeader *) msg->packet;
+      GLOMO_MsgRemoveHeader(node,msg,sizeof(RoutingFisheyeHeader));
+      payload = msg->packet;
+
+      RoutingFisheyeHandleControlPacket(node,fisheye,header,payload);
+      GLOMO_MsgFree(node,msg);
+
+      break;
+    }
+  case MSG_APP_FisheyeNeighborTimeout:
+    {
+      RoutingFisheyeHandleNeighborTOMsg(node,fisheye);
+      GLOMO_MsgFree(node,msg);
+      
+      break;
+    }
+  case MSG_APP_FisheyeIntraUpdate:
+    {
+      fisheye->stats.intraScopeUpdate ++ ;
+      RoutingFisheyeHandleIntraUpdateMsg(node,fisheye);
+      GLOMO_MsgFree(node,msg);
+ 
+      break;
+    }
+  case MSG_APP_FisheyeInterUpdate:
+    {
+      fisheye->stats.interScopeUpdate ++ ; 
+      RoutingFisheyeHandleInterUpdateMsg(node,fisheye);
+      GLOMO_MsgFree(node,msg);
+
+      break;
+    }
+  default:
+    assert(FALSE);
+  }
+}
+
+/* Initialize the Topology table (indexed by nodeAddr)
+ * Input parameter: node
+ * Assumption NONE
+ * RETURN NONE
+ */
+void RoutingFisheyeInitTT(GlomoNode *node,GlomoRoutingFisheye *fisheye)
+{
+   int i;
+
+   NetworkEmptyForwardingTable(node);
+
+   /* zero out the routing table*/
+   memset((void*)&(fisheye->topologyTable),0,
+          sizeof(FisheyeTT));
+   /* locate one extra for the Dijkstra's SP */
+   fisheye->topologyTable.row =
+     (FisheyeTTRow *) pc_malloc((node->numNodes+1) * sizeof(FisheyeTTRow));
+
+   /* Initialize the TT */
+   for (i=0;i < (node->numNodes+1); i++){
+     fisheye->topologyTable.row[i].lastModifyTime
+       = simclock();
+     fisheye->topologyTable.row[i].sequenceNumber
+       = -1;
+     fisheye->topologyTable.row[i].neighborNumber
+       = 0;
+     fisheye->topologyTable.row[i].neighborInfo
+       = NULL;
+     if ( i != node->nodeAddr) {
+       fisheye->topologyTable.row[i].nextHop 
+         = -1;
+       fisheye->topologyTable.row[i].prevHop 
+         = -1;
+       fisheye->topologyTable.row[i].distance 
+         = FisheyeInfinity;
+     }
+     else {
+       fisheye->topologyTable.row[i].nextHop 
+         = node->nodeAddr;
+       fisheye->topologyTable.row[i].prevHop 
+         = node->nodeAddr;
+       fisheye->topologyTable.row[i].distance 
+         = 0;
+     }
+     if ( i < node->numNodes) {
+       if (fisheye->topologyTable.row[i].nextHop > 0 )
+         NetworkUpdateForwardingTable(node, i, DEFAULT_INTERFACE,
+                                      fisheye->topologyTable.row[i].nextHop);
+       else
+         NetworkUpdateForwardingTable(
+           node, i, DEFAULT_INTERFACE, NETWORK_UNREACHABLE);
+     }  
+   }
+}
+
+/* Initialize the Stats variable
+ * RETURN: NONE
+ */
+void RoutingFisheyeInitStats(GlomoNode *node,GlomoRoutingFisheye *fisheye)
+{
+  /* Total number of TT updates In the scope */
+  fisheye->stats.intraScopeUpdate = 0;
+
+  /* Total number of TT updates out the scope*/
+  fisheye->stats.interScopeUpdate = 0;
+  
+  /* Total Control OH in bytes */
+  fisheye->stats.controlOH = 0;
+  
+}
+
+
+/* Name      : RoutingFisheyeCreateHeader
+ * Purpose   : Funtion to Create the network data unit
+ * Parameters: sourceAddr, source sending the packet
+ *             destinationAddr, destination of the packet to be sent
+ *             pktLength, length of the packet
+ * Return    : FisheyeRoutingPktDataUnit
+ * Assumption: None
+ */
+RoutingFisheyeHeader
+RoutingFisheyeCreateHeader(NODE_ADDR sourceAddr,
+                           NODE_ADDR destinationAddr,
+                           int payloadSize)
+{
+  RoutingFisheyeHeader header;
+
+  header.sourceAddr          =  sourceAddr;
+  header.destinationAddr     =  destinationAddr;
+  header.payloadSize         =  MIN(payloadSize,MAX_TT_SIZE);
+
+  return header;
+}
+
+/* Name     :   RoutingFisheyeSendScopeTT
+ * Purpose  :   Function to send update TT packets from lower to upper
+ *              distance
+ * Parameter:   node
+ * Return   :   none
+ */
+void RoutingFisheyeSendScopeTT(GlomoNode *node, 
+                               GlomoRoutingFisheye *fisheye,
+                               short lower,short upper)
+{
+  RoutingFisheyeHeader header;
+  int i,TTindex,max,maxEntrySize,broadcastTTsize;
+  FisheyeTTRow *row;
+  char payload[MAX_TT_SIZE];
+  FisheyeNeighborInfo *tmp;
+  clocktype delay = 0;
+  
+  TTindex = 0;
+  max = -1;
+  row = fisheye->topologyTable.row;
+  
+  /* Find out the max number of a node in the scope entries */
+  for (i = 0; i< node->numNodes;i++) {
+    if(row[i].distance >= lower && row[i].distance < upper) {
+      if (row[i].neighborNumber > max) 
+        max = row[i].neighborNumber;
+    }
+  }
+  
+  maxEntrySize = sizeof(TTindex)               +
+                 sizeof(row[0].sequenceNumber) + 
+                 sizeof(row[0].neighborNumber) +
+                 sizeof(NODE_ADDR)*max;
+  
+  /* packet the entries to nwDU, multiple nwDUs are sent
+     in the case of size exceeds one packet */
+  while ( TTindex < node->numNodes) {
+    
+    broadcastTTsize = 0;
+    while ( ((broadcastTTsize + maxEntrySize) <= MAX_TT_SIZE) &&
+            (TTindex < node->numNodes) ){
+      if(row[TTindex].distance >= lower && row[TTindex].distance < upper){
+        /* Entry index */
+        memcpy(&(payload[broadcastTTsize]),&TTindex,sizeof(TTindex));
+        broadcastTTsize += sizeof(TTindex);
+        /* Sequence number */
+        memcpy(&(payload[broadcastTTsize]),&(row[TTindex].sequenceNumber),
+               sizeof(row[TTindex].sequenceNumber));
+        broadcastTTsize += sizeof(row[TTindex].sequenceNumber);
+        /* number of neighbors */
+        memcpy(&(payload[broadcastTTsize]),&(row[TTindex].neighborNumber),
+               sizeof(row[TTindex].neighborNumber));
+        broadcastTTsize += sizeof(row[TTindex].neighborNumber);
+        /* the neighbor IDs */
+        tmp = row[TTindex].neighborInfo;
+        while ( tmp != NULL) {
+          memcpy(&(payload[broadcastTTsize]),&(tmp->nodeAddr),
+                 sizeof(tmp->nodeAddr));
+          broadcastTTsize += sizeof(tmp->nodeAddr);
+          tmp = tmp->next;
+        }
+      }
+      
+      TTindex ++;
+    }
+    
+    if (broadcastTTsize > 0 ) {
+      /* create header and send TT to UDP */
+      
+      header = RoutingFisheyeCreateHeader(node->nodeAddr,
+                                          ANY_DEST,
+                                          broadcastTTsize);
+
+      /* Send to neighbors*/
+      AppUdpSendNewHeaderDataWithPriority(node,
+                                                     ROUTING_PROTOCOL_FISHEYE,
+                                                     ANY_DEST,
+                                                     (char *)&header,
+                                                     sizeof(RoutingFisheyeHeader),
+                                                     payload,
+                                                     broadcastTTsize,
+                                                     CONTROL,
+                                                     delay);
+
+      fisheye->stats.controlOH += broadcastTTsize;
+    }
+  }
+
+
+  
+  
+}
+
+/* Name      :  RoutingFisheyeUpdateNeighbor
+ * Purpose   :  Update Neighbor Information based on the 
+ *              control packet received
+ * Papramers :  node and packet
+ * Return    :  None
+ */
+void RoutingFisheyeUpdateNeighborInfo(GlomoNode *node,
+                                      GlomoRoutingFisheye *fisheye,
+                                      RoutingFisheyeHeader *header)
+{
+  int index;
+  FisheyeHeardNeighborInfo *tmp;
+
+  index = node->nodeAddr;
+
+  if(fisheye->heardNeighborInfo
+     == NULL) {
+    /* I don't have any neighbour yet */
+    assert(fisheye->topologyTable.row[index].neighborNumber == 0 );
+    tmp = (FisheyeHeardNeighborInfo *) 
+      pc_malloc(sizeof(FisheyeHeardNeighborInfo));
+    assert(tmp != NULL);
+    tmp->nodeAddr = header->sourceAddr;
+    tmp->lastHeardTime = simclock();
+    tmp->next = fisheye->heardNeighborInfo;
+    fisheye->heardNeighborInfo = tmp;
+    fisheye->topologyTable.row[index].neighborNumber ++;
+    RoutingFisheyeCopyHeardToTable(node,fisheye);
+    RoutingFisheyeFindSP(node);
+  }
+  else {
+    /* Update neighbor info if header->sourceAddr in the list
+       otherwise insert it */
+    int Find = 0;
+    FisheyeHeardNeighborInfo *prev;
+
+    tmp =fisheye->heardNeighborInfo ;
+    while ( !Find && tmp != NULL) {
+      if (tmp->nodeAddr == header->sourceAddr) {
+        Find = 1;
+        tmp->lastHeardTime = simclock();
+      }
+      prev = tmp;
+      tmp = tmp->next;
+    }
+    if (!Find) {
+      tmp = (FisheyeHeardNeighborInfo *) 
+        pc_malloc(sizeof(FisheyeHeardNeighborInfo));
+      assert(tmp != NULL);
+      tmp->nodeAddr = header->sourceAddr;
+      tmp->lastHeardTime = simclock();
+      tmp->next = prev->next;
+      prev->next = tmp ;
+      fisheye->topologyTable.row[index].neighborNumber ++;
+      RoutingFisheyeCopyHeardToTable(node,fisheye);
+      RoutingFisheyeFindSP(node);
+    }
+  }
+}
+
+/* Name      :  RoutingFisheyePrintNeighborInfo
+ * Purpose   :  Print Neighbor Information of the node
+ * Papramers :  node 
+ * Return    :  None
+ */
+
+void RoutingFisheyePrintNeighborInfo(GlomoNode *node,
+                                     GlomoRoutingFisheye *fisheye)
+{
+  char clockStr[GLOMO_MAX_STRING_LENGTH];
+  FisheyeHeardNeighborInfo *tmp;
+  ctoa(simclock(), clockStr);
+
+  printf("At time %s node %ld's NeighorInfo\n",clockStr,node->nodeAddr);
+  printf("Total number of neighbor %d\n",
+         fisheye->topologyTable.row[node->nodeAddr].neighborNumber);
+  
+  tmp = fisheye->heardNeighborInfo ;
+  while ( tmp != NULL) {
+    ctoa(tmp->lastHeardTime,clockStr);
+    printf("Neighbor ID %d LastHeard Time %s\n",tmp->nodeAddr,clockStr);
+    tmp = tmp->next;
+  }
+  printf("----------------------------------------\n");
+}
+
+/* Name     :   RoutingFisheyeHandleIntraUpdateMsg
+ * Purpose  :   Function to handle the intra update message
+ * Parameter:   node
+ * Return   :   none
+ */
+void RoutingFisheyeHandleIntraUpdateMsg(GlomoNode *node,
+                                        GlomoRoutingFisheye *fisheye)
+{
+  clocktype randomTime;
+  Message *newMsg;
+
+   /* increase the sequence number of its own neighbor list */
+   fisheye->topologyTable.row[node->nodeAddr].sequenceNumber ++ ;
+  
+   RoutingFisheyeSendScopeTT(node, fisheye, 0,
+                             fisheye->parameter.Scope);
+   /* Invoke next intra update  */
+  randomTime = (clocktype)(pc_nrand(node->seed)%FisheyeRandomTimer
+                           -FisheyeRandomTimer/2);
+  newMsg = GLOMO_MsgAlloc(node,
+                          GLOMO_APP_LAYER,
+                          ROUTING_PROTOCOL_FISHEYE,
+                          MSG_APP_FisheyeIntraUpdate);
+  GLOMO_MsgSend(node,newMsg, randomTime+
+                fisheye->parameter.IntraUpdateInterval);
+  
+}
+
+/* Name     :   RoutingFisheyeHandleInterUpdateMsg
+ * Purpose  :   Function to handle the inter update message
+ * Parameter:   node
+ * Return   :   none
+ */
+void RoutingFisheyeHandleInterUpdateMsg(GlomoNode *node,
+                                        GlomoRoutingFisheye *fisheye)
+{
+  clocktype randomTime;
+  Message *newMsg;
+
+  RoutingFisheyeSendScopeTT(node,fisheye, 
+                            fisheye->parameter.Scope,FisheyeInfinity);
+
+  /* Invoke next inter update  */
+  randomTime = (clocktype)(pc_nrand(node->seed)%FisheyeRandomTimer
+                           -FisheyeRandomTimer/2);
+  newMsg = GLOMO_MsgAlloc(node,
+                          GLOMO_APP_LAYER,
+                          ROUTING_PROTOCOL_FISHEYE,
+                          MSG_APP_FisheyeInterUpdate);
+  GLOMO_MsgSend(node,newMsg, randomTime+
+                fisheye->parameter.InterUpdateInterval);
+}
+
+
+/* Name      :  RoutingFisheyeUpdateTT
+ * Purpose   :  Update Topology Table based on the 
+ *              TTupdate Message Received
+ * Papramers :  node and packet header and payload
+ * Return    :  None
+ */
+void RoutingFisheyeUpdateTT(GlomoNode *node,
+                            GlomoRoutingFisheye *fisheye,
+                            RoutingFisheyeHeader *header,
+                            char *payload)
+{
+  int TTsize;
+  int TTindex,sequenceNumber,i;
+  short neighborNumber;
+  NODE_ADDR *linkList;
+  FisheyeTTRow *row;
+  FisheyeNeighborInfo *tmp,*next;
+
+  TTsize = 0;
+  row = fisheye->topologyTable.row;
+
+  while (TTsize < header->payloadSize) {
+         /* Entry index */
+         memcpy(&TTindex,&(payload[TTsize]),sizeof(TTindex));
+         TTsize += sizeof(TTindex);      
+         /* Sequence number */
+         memcpy(&sequenceNumber,&(payload[TTsize]),
+                sizeof(sequenceNumber));
+         TTsize += sizeof(sequenceNumber);
+         /* number of neighbors */
+         memcpy(&neighborNumber,&(payload[TTsize]),
+                sizeof(neighborNumber));
+         TTsize += sizeof(neighborNumber);
+         /* the neighbor IDs */
+         linkList = (NODE_ADDR *) pc_malloc(neighborNumber*sizeof(NODE_ADDR));
+         assert(linkList != NULL);
+         for (i = 0; i < neighborNumber; i++) {
+           memcpy(&(linkList[i]),&(payload[TTsize]),
+                  sizeof(NODE_ADDR));
+           TTsize += sizeof(NODE_ADDR);
+         }
+         /* update correspond TT database if the sequence number is bigger */
+         if (sequenceNumber > row[TTindex].sequenceNumber){
+           tmp = row[TTindex].neighborInfo;
+           row[TTindex].sequenceNumber = sequenceNumber;
+           row[TTindex].neighborNumber = neighborNumber;
+           /* free the old memory */
+           while ( tmp != NULL) {
+             next = tmp->next;
+             pc_free(tmp);
+             tmp = next ;
+           }
+           row[TTindex].neighborInfo = NULL;
+
+           for ( i = 0; i< neighborNumber;i++) {
+             next = tmp;
+             tmp =(FisheyeNeighborInfo *)pc_malloc(sizeof(FisheyeNeighborInfo));
+             tmp->nodeAddr = linkList[neighborNumber -1-i];
+             tmp->next = next;
+           }
+           row[TTindex].neighborInfo = tmp;
+         } /* end of if (sequenceNumber > row[TTindex].sequenceNumber) */
+         pc_free(linkList);
+         linkList = NULL;
+  } /*end of while(TTsize < header->payloadSize) */
+  RoutingFisheyeFindSP(node);
+}
+
+/* Name      :  RoutingFisheyeFindSP
+ * Purpose   :  Calculate shortest path base  
+ *              on the current link state table
+ *              using Dijkstra's algorithm
+ * Papramers :  node
+ * Return    :  None
+ */
+void RoutingFisheyeFindSP(GlomoNode *node)
+{
+  int i,j;
+  int **connectionTable;
+  GlomoRoutingFisheye *fisheye;
+  FisheyeTTRow *row;
+
+   
+  int NODES = node->numNodes;
+  int UNSEEN = 99999, priority ;
+  int k,min,t;
+  int iid;
+
+  fisheye = (GlomoRoutingFisheye *) node->appData.routingVar;
+  row = fisheye->topologyTable.row;
+  
+  connectionTable = (int **) 
+    pc_malloc(sizeof(int *) *node->numNodes);
+  
+  for(i=0;i<node->numNodes;i++) 
+    connectionTable[i] = 
+      (int *) pc_malloc(sizeof(int)*node->numNodes);
+
+  for (i=0;i<node->numNodes;i++) 
+    for (j=0;j<node->numNodes;j++) 
+      connectionTable[i][j] = 0 ;
+ 
+  for(i=0;i<node->numNodes;i++) {
+    FisheyeNeighborInfo *tmp;
+    tmp = row[i].neighborInfo;
+    while ( tmp != NULL ) {
+      connectionTable[i][tmp->nodeAddr] = 
+        connectionTable[tmp->nodeAddr][i] = 1 ;
+      tmp = tmp->next;
+    }
+  }
+
+  for (k=0; k<NODES; k++) {
+    row[k].distance = -UNSEEN;
+    row[k].prevHop  = NODES;
+    row[k].nextHop  = -k;
+  }
+
+  row[NODES].distance = -(UNSEEN + 1);
+  min = NODES;
+  iid = node->nodeAddr;
+  row[iid].nextHop  = iid;
+  row[iid].distance = 0;
+
+  for (k=iid; k!=NODES; k=min, min=NODES) {
+    row[k].distance = -row[k].distance;
+
+    for (t=0; t<NODES; t++) {
+      if (row[t].distance < 0) {
+        priority = row[k].distance+connectionTable[k][t];
+        if (connectionTable[k][t] && (row[t].distance < -priority)){
+          row[t].distance = -priority;
+          row[t].prevHop   = k;
+          
+          if (row[t].prevHop == iid) {
+            row[t].nextHop=t;
+          } else {
+            row[t].nextHop=row[k].nextHop;
+          }
+        }
+        if (row[t].distance > row[min].distance) min = t;
+      }
+    }
+  }
+  
+  for (k=0; k<NODES; k++) {
+    NetworkUpdateForwardingTable(node, k, DEFAULT_INTERFACE, row[k].nextHop);
+    if ( (int) row[k].nextHop < 0){
+      row[k].nextHop=-1;
+      row[k].distance=FisheyeInfinity;
+      NetworkUpdateForwardingTable(
+        node, k, DEFAULT_INTERFACE, NETWORK_UNREACHABLE);
+    }
+  }
+
+  if (row[0].distance >= FisheyeInfinity) {
+    row[0].nextHop  = -1 ;
+    row[0].distance = FisheyeInfinity;
+    NetworkUpdateForwardingTable(
+      node, 0, DEFAULT_INTERFACE, NETWORK_UNREACHABLE);
+  }
+
+  for (i = 0;i< node->numNodes;i++) {
+    pc_free(connectionTable[i]);
+    connectionTable[i] = NULL;
+  }
+  pc_free(connectionTable);
+  connectionTable = NULL;
+
+}
+
+/* Name      :  RoutingFisheyePrintTT
+ * Purpose   :  Print the topology table of a node  
+ * Papramers :  node
+ * Return    :  None
+ */
+void RoutingFisheyePrintTT(GlomoNode *node,GlomoRoutingFisheye *fisheye)
+{
+  char clockStr[GLOMO_MAX_STRING_LENGTH];
+  FisheyeNeighborInfo *tmp;
+  FisheyeTTRow *row;
+  int i;
+  
+  ctoa(simclock(), clockStr);
+  row = fisheye->topologyTable.row;
+
+  printf("At %s, the topoplogy table of node %d:\n",clockStr,node->nodeAddr);
+  printf("----------------------------------------------\n");
+  for (i=0;i< node->numNodes; i++) {
+    ctoa(row[i].lastModifyTime,clockStr);
+    printf("%d %d %d %hd %s %d %hd:(",
+           i,row[i].nextHop,row[i].prevHop,row[i].distance,clockStr,
+           row[i].sequenceNumber,row[i].neighborNumber);
+    tmp = row[i].neighborInfo;
+    while(tmp != NULL) {
+      printf("%d ",tmp->nodeAddr);
+      tmp = tmp->next;
+    }
+    printf(")\n");
+  }
+  printf("----------------------------------------------\n");
+  fflush(stdout);
+}
+
+/* Name      :  RoutingFisheyePrintTTPkt
+ * Purpose   :  Print the topology info from a TT pkt  
+ * Papramers :  pkt
+ * Return    :  None
+ */
+void RoutingFisheyePrintTTPkt(RoutingFisheyeHeader *header, char *payload)
+{
+  int TTsize;
+  int TTindex,sequenceNumber,i;
+  short neighborNumber;
+  NODE_ADDR neighbor;
+  
+  printf("receive from %d payload size=%d\n",header->sourceAddr,
+         header->payloadSize);
+
+  TTsize = 0;  
+  while (TTsize < header->payloadSize) {
+    /* Entry index */
+    memcpy(&TTindex,&(payload[TTsize]),sizeof(TTindex));
+    TTsize += sizeof(TTindex);   
+    printf("TTindex %d ",TTindex);
+    /* Sequence number */
+    memcpy(&sequenceNumber,&(payload[TTsize]),
+           sizeof(sequenceNumber));
+    TTsize += sizeof(sequenceNumber);
+    printf("sequenceNumber %d ",sequenceNumber);
+    /* number of neighbors */
+    memcpy(&neighborNumber,&(payload[TTsize]),
+           sizeof(neighborNumber));
+    TTsize += sizeof(neighborNumber);
+    printf("neighborNumber %d ", neighborNumber);
+    /* the neighbor IDs */
+    for (i = 0; i < neighborNumber; i++) {
+      memcpy(&(neighbor),&(payload[TTsize]),
+             sizeof(NODE_ADDR));
+      TTsize += sizeof(NODE_ADDR);
+      printf("%d ",neighbor);
+    }
+    printf("\n");
+  }
+  printf("\n");
+  fflush(stdout);
+}
+
+
+/* Name      :  RoutingFisheyeHandleNeighborTOMsg
+ * Purpose   :  Timeout stale neighbors
+ * Papramers :  node, routing
+ * Return    :  none
+ */
+void RoutingFisheyeHandleNeighborTOMsg(GlomoNode *node,
+                                       GlomoRoutingFisheye *fisheye)
+{
+  FisheyeTTRow *row;
+  FisheyeHeardNeighborInfo *trash,*prev,*current;
+  clocktype randomTime;
+  BOOL change;
+  Message *newMsg;
+
+  row = fisheye->topologyTable.row;
+  current = prev = fisheye->heardNeighborInfo;
+
+  change = FALSE;
+  while ( current != NULL ) {
+    trash = NULL;
+    if ( (simclock()- current->lastHeardTime) >  
+         fisheye->parameter.NeighborTOInterval) {
+      change = TRUE;
+      /* stale neighbor and should be removed */      
+      if (current == fisheye->heardNeighborInfo) {
+        fisheye->heardNeighborInfo 
+          = fisheye->heardNeighborInfo->next;
+        prev = fisheye->heardNeighborInfo;
+      }
+      else {
+        prev->next = current->next;
+      }
+      trash = current ;
+      current = current->next ;
+      pc_free(trash) ;
+      trash = NULL;
+      row[node->nodeAddr].neighborNumber -- ;
+    }
+    else {        
+      prev = current ;
+      current = current->next ;
+    }   
+  }
+  
+  if(change) { 
+    RoutingFisheyeCopyHeardToTable(node,fisheye);
+    RoutingFisheyeFindSP(node);
+  }
+
+  /* schedule next TO check */
+  randomTime = (clocktype)(pc_nrand(node->seed)%FisheyeRandomTimer
+                           -FisheyeRandomTimer/2);
+  newMsg = GLOMO_MsgAlloc(node,
+                          GLOMO_APP_LAYER,
+                          ROUTING_PROTOCOL_FISHEYE,
+                          MSG_APP_FisheyeNeighborTimeout);
+
+  GLOMO_MsgSend(node,newMsg,randomTime + 
+                fisheye->parameter.NeighborTOInterval);  
+
+}
+
+
+/* Name      :  RoutingFisheyeCopyHeardToTable
+ * Purpose   :  copy heard list to table list
+ * Papramers :  node
+ * Return    :  none
+ */
+void RoutingFisheyeCopyHeardToTable(GlomoNode *node,
+                                    GlomoRoutingFisheye *fisheye)
+{
+  FisheyeNeighborInfo *tableTmp,*tableNext;
+  FisheyeHeardNeighborInfo *heardTmp;
+  tableTmp = fisheye->topologyTable.row[node->nodeAddr].neighborInfo;
+  /* delete old list */
+  while ( tableTmp != NULL ) {
+    tableNext = tableTmp->next;
+    pc_free(tableTmp);
+    tableTmp = tableNext;
+  }
+  /* copy over Heard List to neighbor list */
+  heardTmp = fisheye->heardNeighborInfo;
+  while ( heardTmp != NULL) {
+    tableNext = tableTmp;
+    tableTmp =(FisheyeNeighborInfo *)
+      pc_malloc(sizeof(FisheyeNeighborInfo));
+    tableTmp->nodeAddr = heardTmp->nodeAddr;
+    tableTmp->next = tableNext;
+    heardTmp = heardTmp->next;
+  }
+  fisheye->topologyTable.row[node->nodeAddr].neighborInfo = tableTmp;
+}
+
+
+/* Name      :  RoutingFisheyeHandleControlPacket
+ * Purpose   :  handle the control packet received from UDP
+ * Papramers :  node, header, payload
+ * Return    :  none
+ */
+void RoutingFisheyeHandleControlPacket(GlomoNode *node, 
+                                       GlomoRoutingFisheye *fisheye,
+                                       RoutingFisheyeHeader *header,
+                                       char *payload)
+{    
+    RoutingFisheyeUpdateNeighborInfo(node,fisheye,header);
+    RoutingFisheyeUpdateTT(node,fisheye,header,payload);     
+}
+
+
+/* Name      :  RoutingFisheyePrintRoutingStats
+ * Purpose   :  Print Network Protocol Stats
+ * Papramers :  node
+ * Return    :  none
+ */
+
+void RoutingFisheyePrintRoutingStats(GlomoNode *node)
+{
+  char buf[GLOMO_MAX_STRING_LENGTH];
+  GlomoRoutingFisheye *fisheye;
+  
+  fisheye = (GlomoRoutingFisheye *) node->appData.routingVar;
+
+  sprintf(buf, "The number of Intra Scope Updates = %d\n", 
+          fisheye->stats.intraScopeUpdate);
+  GLOMO_PrintStat(node,"RoutingFisheye",buf);
+
+  sprintf(buf, "The number of Inter Scope Updates = %d\n", 
+          fisheye->stats.interScopeUpdate);
+  GLOMO_PrintStat(node,"RoutingFisheye",buf);
+  
+  sprintf(buf, "The number of packets received from UDP = %d\n", 
+          fisheye->stats.pktNumFromUdp);
+  GLOMO_PrintStat(node,"RoutingFisheye",buf);
+
+  sprintf(buf, "Control OH in bytes = %d\n", 
+          fisheye->stats.controlOH);
+  GLOMO_PrintStat(node,"RoutingFisheye",buf); 
+
+}
+
+

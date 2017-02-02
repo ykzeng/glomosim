@@ -1,0 +1,449 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: tcp.pc,v 1.20 2001/04/27 23:59:45 jmartin Exp $
+ *
+ * This file contains message processing for TCP.
+ * TCP follows Internet RFC 793.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "tcp.h"
+#include "tcp_proto.h"
+#include "network.h"
+
+
+
+/*
+ * FUNCTION    TransportTcpInit
+ * PURPOSE     Initialization function for TCP.
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+void
+TransportTcpInit(GlomoNode *node, const GlomoNodeInput *nodeInput)
+{
+    GlomoTransportTcp* tcpLayer = 
+       (GlomoTransportTcp*)checked_pc_malloc(sizeof(GlomoTransportTcp));
+    
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    BOOL retVal;
+
+    assert(sizeof(IpHeaderType) == sizeof(struct ipovly));
+    
+    node->transportData.tcp = tcpLayer;
+    tcpLayer->tcpIsStarted = FALSE;
+    
+    /*
+     * Initialize head.
+     */
+    tcpLayer->head.inp_next = &(tcpLayer->head);
+    tcpLayer->head.inp_prev = &(tcpLayer->head);
+    tcpLayer->head.inp_head = &(tcpLayer->head);
+    tcpLayer->head.con_id = 0;
+
+    /*
+     * Initialize tcpIss and tcpNow.
+     */
+    tcpLayer->tcpIss = 1;
+    tcpLayer->tcpNow = 0;
+
+    /*
+     * Initialize tcpStatsEnabled and tcpStat.
+     */
+    retVal = GLOMO_ReadString(node->nodeAddr, nodeInput, "TCP-STATISTICS", buf);
+    assert(retVal == TRUE);
+
+    if (strcmp(buf, "YES") == 0) {
+
+        tcpLayer->tcpStatsEnabled = TRUE;
+        /*
+         * Allocate a tcpstat structure.
+         */
+        tcpLayer->tcpStat = (struct tcpstat *)pc_malloc(sizeof(struct tcpstat));
+        assert(tcpLayer->tcpStat != NULL);
+        memset ((char *)(tcpLayer->tcpStat), 0, sizeof(struct tcpstat));
+    }
+    else if (strcmp(buf, "NO") == 0) {
+        tcpLayer->tcpStatsEnabled = FALSE;
+        tcpLayer->tcpStat = NULL;
+    }
+    else {
+        fprintf(stderr, "TCP: Unknown command (%s) in configuration file.\n",
+                buf);
+        assert(FALSE);
+    }
+
+}
+
+#define TCP_TIMER_JITTER (1 * MILLI_SECOND)
+#define TCP_FAST_TIMER_INTERVAL (200 * MILLI_SECOND)
+#define TCP_SLOW_TIMER_INTERVAL (500 * MILLI_SECOND)
+
+static //inline//
+void StartTimer(
+    GlomoNode* node, 
+    Message* reusedMsg,
+    int timerType,
+    clocktype timerDelay) 
+{
+    clocktype ExtraJitterDelay;
+    
+    Message* msg = reusedMsg;
+    if (msg == NULL) {
+       msg = GLOMO_MsgAlloc(node, 
+           GLOMO_TRANSPORT_LAYER, TRANSPORT_PROTOCOL_TCP, timerType);
+    }//if//
+
+    ExtraJitterDelay  = (clocktype) (pc_erand(node->seed) * TCP_TIMER_JITTER);
+    
+    GLOMO_MsgSend(node, msg,  (timerDelay + ExtraJitterDelay));
+}
+
+
+
+
+static //inline//
+void StartTcpFastTimer(
+    GlomoNode* node, 
+    Message* reusedMsg)
+{
+    StartTimer(
+        node, 
+        reusedMsg, 
+        MSG_TRANSPORT_TCP_TIMER_FAST, 
+        TCP_FAST_TIMER_INTERVAL);
+}
+
+static //inline//
+void StartTcpSlowTimer(
+    GlomoNode* node, 
+    Message* reusedMsg)
+{
+    StartTimer(
+        node, 
+        reusedMsg, 
+        MSG_TRANSPORT_TCP_TIMER_SLOW, 
+        TCP_SLOW_TIMER_INTERVAL);
+}
+
+
+
+/*
+ * FUNCTION    TransportTcpTurnTcpOn
+ * PURPOSE     Called the first time a simulation actually uses the TCP
+ *             model.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+
+static
+void TransportTcpStart(GlomoNode* node) {
+    GlomoTransportTcp* tcpLayer = node->transportData.tcp;
+    
+    tcpLayer->tcpIsStarted = TRUE;
+    
+    /*
+     * Initialize system timeouts.
+     */
+    StartTimer(
+        node, 
+        NULL, 
+        MSG_TRANSPORT_TCP_TIMER_FAST, 
+        (clocktype)(TCP_FAST_TIMER_INTERVAL * pc_erand(node->seed)));
+    
+    StartTimer(
+        node, 
+        NULL,
+        MSG_TRANSPORT_TCP_TIMER_SLOW, 
+        (clocktype)(TCP_SLOW_TIMER_INTERVAL * pc_erand(node->seed)));
+}
+
+
+
+/*
+ * FUNCTION    TransportTcpLayer. 
+ * PURPOSE     Models the behaviour of TCP on receiving the
+ *             message encapsulated in msgHdr
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:   message received by the layer
+ */
+
+void TransportTcpLayer(GlomoNode *node, Message *msg)
+{
+    /*
+     * Retrieve the pointer to the data portion which relates
+     * to the TCP protocol.
+     */
+    GlomoTransportTcp* tcpLayer = node->transportData.tcp;
+    
+    if (!tcpLayer->tcpIsStarted) {
+       TransportTcpStart(node);
+    }//if//
+    
+
+    switch (msg->eventType) {
+    case MSG_TRANSPORT_FromNetwork: {
+        struct ipovly* ipPseudoheader = NULL;
+        
+        NODE_ADDR sourceAddr = 
+           ((NetworkToTransportInfo *)msg->info)->sourceAddr;
+        NODE_ADDR destinationAddr = 
+           ((NetworkToTransportInfo *)msg->info)->destinationAddr;
+        NetworkQueueingPriorityType priority =
+           ((NetworkToTransportInfo *)msg->info)->priority;
+        
+        /*
+         * GloMoSim: Put the conceptual IP pseudo header back 
+         * on the packet so that it can be used as a linked list cell
+         * header by the NetBSD code and call tcp_input() to 
+         * process the packet.
+         *
+         */
+         
+        GLOMO_MsgAddHeader(node, msg, sizeof(struct ipovly));
+        ipPseudoheader = (struct ipovly*)msg->packet;
+        
+        ipPseudoheader->ih_len = msg->packetSize;
+        ipPseudoheader->ih_src = sourceAddr;
+        ipPseudoheader->ih_dst = destinationAddr;
+         
+        tcp_input(node, (unsigned char *) msg->packet, msg->packetSize,
+                  priority, 
+                  &(tcpLayer->head), &(tcpLayer->tcpIss), tcpLayer->tcpNow,
+                  tcpLayer->tcpStat); 
+        GLOMO_MsgFree(node, msg);
+        break;
+    }
+    case MSG_TRANSPORT_FromAppListen: {
+        AppToTcpListen *appListen;
+
+        /*
+         * Call tcp_listen() to listen on the specified interface and port.
+         */
+        appListen = (AppToTcpListen *) msg->info;
+
+        tcp_listen(node, &(tcpLayer->head), appListen->appType, 
+                   appListen->localAddr, appListen->localPort,
+                   appListen->priority);
+
+        GLOMO_MsgFree(node, msg);
+        break;
+    } 
+    case MSG_TRANSPORT_FromAppOpen: {
+        AppToTcpOpen *appOpen;
+
+        /*
+         * Call tcp_connect() to set up a connection.
+         */
+        appOpen = (AppToTcpOpen *) msg->info;
+
+        tcp_connect(node, &(tcpLayer->head), appOpen->appType,
+                    appOpen->localAddr, appOpen->localPort,
+                    appOpen->remoteAddr, appOpen->remotePort,
+                    tcpLayer->tcpNow, &(tcpLayer->tcpIss),
+                    tcpLayer->tcpStat, appOpen->uniqueId,
+                    appOpen->priority);
+
+        GLOMO_MsgFree(node, msg);
+        break; 
+    }
+    case MSG_TRANSPORT_FromAppSend: {
+        AppToTcpSend *appSend; 
+
+        /*
+         * Call tcp_send() to put the data in send buffer and
+         * possibly send some data.
+         */
+        appSend = (AppToTcpSend *) msg->info; 
+        tcp_send(node, &(tcpLayer->head), appSend->connectionId,
+                 (unsigned char *) msg->packet, msg->packetSize,
+                 tcpLayer->tcpNow, tcpLayer->tcpStat);
+        GLOMO_MsgFree(node, msg);
+        break; 
+    }
+    case MSG_TRANSPORT_FromAppClose: {
+        AppToTcpClose *appClose;
+
+        /*
+         * Call tcp_disconnect() to close the connection.
+         */
+        appClose = (AppToTcpClose *) msg->info;
+        tcp_disconnect(node, &(tcpLayer->head), appClose->connectionId,
+                       tcpLayer->tcpNow, tcpLayer->tcpStat);
+        GLOMO_MsgFree(node, msg);
+        break;
+    }
+    case MSG_TRANSPORT_TCP_TIMER_FAST: 
+        /* fast timeout */
+        tcp_fasttimo(node, &(tcpLayer->head), tcpLayer->tcpNow,
+                     tcpLayer->tcpStat);
+        
+        StartTcpFastTimer(node, msg);
+        
+        break;
+        
+    case MSG_TRANSPORT_TCP_TIMER_SLOW:
+        /* slow timeout */
+        tcp_slowtimo(node, &(tcpLayer->head), &(tcpLayer->tcpIss),
+                     &(tcpLayer->tcpNow), tcpLayer->tcpStat);
+        
+        StartTcpSlowTimer(node, msg);
+        
+        break;  
+
+
+    case MSG_TRANSPORT_Tcp_CheckTcpOutputTimer:
+        tcp_output(node, tcpLayer->tp, tcpLayer->tcpNow, tcpLayer->tcpStat);
+        GLOMO_MsgFree(node, msg);
+        break;
+    
+    default: {
+        char clockStr[GLOMO_MAX_STRING_LENGTH];
+        ctoa(simclock(), clockStr);
+        fprintf(stderr, "Time %s: Node %u received message of unknown type"
+                " %ld.\n", clockStr, node->nodeAddr, msg->eventType);
+        GLOMO_MsgFree(node, msg);
+        assert(FALSE); abort();
+    }
+    }/*switch*/
+}
+
+
+
+/*
+ * FUNCTION    TransportTcpFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of
+ *             the simulation of the TCP protocol of Transport Layer.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+void TransportTcpFinalize(GlomoNode *node)
+{
+    GlomoTransportTcp* tcpLayer = node->transportData.tcp;
+    struct tcpstat *statPtr;
+    char buf[100];
+
+    if ((!tcpLayer->tcpIsStarted) || (!tcpLayer->tcpStatsEnabled)) {
+        return;
+    }
+    
+    statPtr = tcpLayer->tcpStat;
+    /*
+     * Print number of packets sent to and received from network.
+     */ 
+    sprintf(buf, "total packets sent to nw = %lu", statPtr->tcps_sndtotal);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "data packets sent = %lu",
+            statPtr->tcps_sndpack + statPtr->tcps_sndrexmitpack);
+    GLOMO_PrintStat(node, "TransportTcp", buf); 
+    sprintf(buf, "data packets in sequence = %lu",
+            statPtr->tcps_sndpack);  
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "data packets retransmitted = %lu",
+            statPtr->tcps_sndrexmitpack);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "ack-only packets sent = %lu", statPtr->tcps_sndacks);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "pure control (SYN|FIN|RST) packets sent = %lu\n",
+            statPtr->tcps_sndctrl);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "window update-only packets sent = %lu",
+            statPtr->tcps_sndwinup);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "window probes sent = %lu", statPtr->tcps_sndprobe);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "total packets received from nw = %lu",
+            statPtr->tcps_rcvtotal);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "data packets received = %lu", statPtr->tcps_rcvpack);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "in sequence ack packets received = %lu",
+            statPtr->tcps_rcvackpack);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "duplicate ack packets received = %lu",
+            statPtr->tcps_rcvdupack);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "pure control (SYN|FIN|RST) packets received = %lu",
+            statPtr->tcps_rcvctrl);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "window update-only packets received = %lu",
+            statPtr->tcps_rcvwinupd);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "window probes received = %lu",
+            statPtr->tcps_rcvwinprobe);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+
+    /*
+     * Print packet error information.
+     */     
+    sprintf(buf, "total packets with error = %lu", statPtr->tcps_rcvbadsum 
+            + statPtr->tcps_rcvbadoff + statPtr->tcps_rcvshort);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "packets received with ccksum errs = %lu",
+            statPtr->tcps_rcvbadsum);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "packets received with bad offset = %lu",
+            statPtr->tcps_rcvbadoff);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+    sprintf(buf, "packets received too short = %lu",
+            statPtr->tcps_rcvshort);
+    GLOMO_PrintStat(node, "TransportTcp", buf);
+
+    /*
+     * More data can be printed here.
+     */
+
+    pc_free(statPtr);
+    pc_free(tcpLayer);
+}
+

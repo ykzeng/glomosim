@@ -1,0 +1,2361 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/* 
+ * Name: aodv.pc
+ *
+ * Implemented by SJ Lee (sjlee@cs.ucla.edu) 
+ */
+
+/*
+ NOTE: - Followed the specification of AODV Internet Draft
+         (draft-ietf-manet-aodv-03.txt)
+       - This implements only unicast functionality of AODV.
+       - Assumes the MAC protocol sends a signal to the routing protocol
+         when it detects link breaks. MAC protocols such as IEEE 802.11
+         and MACAW has this functionality. In IEEE 802.11, when no CTS
+         is received after RTS, and no ACK is received after retransmissions
+         of unicasted packet, it sends the signal to the routing protocol
+       - If users want to use MAC protocols other than IEEE 802.11, they
+         must implement schemes to detect link breaks. A way to do this is,
+         for example, using HELLO packets, as specified in AODV documents.
+       - No Precursors (Implemented other mechanism so that the protocol can
+         still function the same as when precursors are used)
+       - Unsolicited RREPs are broadcasted and forwarded only if the node
+         is part of the broken route and not the source of that route
+       - If more than one route uses the broken link, send RREP multiple times
+         (this should be fixed based on new specification by C. Perkins, 
+         E. Royer, and S. Das)
+       - Rev route of RREQ overwrites the one in the route table
+       - May need slight modifications when draft-ietf-manet-aodv-04.txt
+         comes out
+*/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "aodv.h"
+#include "ip.h"
+#include "nwip.h"
+#include "nwcommon.h"
+#include "application.h"
+#include "transport.h"
+#include "java_gui.h"
+
+#define max(a,b)        a > b ? a : b
+
+
+
+
+
+/*
+ * RoutingAodvReplaceInsertRouteTable
+ *
+ * Insert/Update an entry into the route table
+ */
+
+static void
+RoutingAodvReplaceInsertRouteTable(
+    NODE_ADDR destAddr,
+    int destSeq,
+    int hopCount,
+    NODE_ADDR nextHop,
+    clocktype lifetime,
+    BOOL activated,
+    BOOL source,
+    AODV_RT* routeTable)
+{
+    AODV_RT_Node* theNode = NULL;
+    AODV_RT_Node* current;
+    AODV_RT_Node* previous;
+    
+    // Find Insertion point. 
+    
+    previous = NULL;
+    current = routeTable->head;
+    while ((current != NULL) && (current->destAddr < destAddr)) {
+        previous = current;
+        current = current->next;
+    }//while//
+    
+    
+    if ((current == NULL) || (current->destAddr != destAddr)) {
+        ++(routeTable->size);
+       
+        theNode = (AODV_RT_Node *)checked_pc_malloc(sizeof(AODV_RT_Node));
+        theNode->lifetime = lifetime;
+        theNode->activated = activated;
+        theNode->source = source;
+        theNode->destAddr = destAddr;
+       
+        if (previous == NULL) {
+           theNode->next = routeTable->head;
+           routeTable->head = theNode;
+        } else {
+           theNode->next = previous->next;
+           previous->next = theNode;
+        }//if//
+       
+       
+    } else {
+        assert(current->destAddr == destAddr);
+        
+        current->lifetime = max(lifetime, current->lifetime);
+        if (!current->activated) {
+            current->activated = activated;
+        }//if//
+        
+        if (!current->source) {
+            current->source = source;
+        }//if//
+        
+        theNode = current;
+    }//if//
+    
+    theNode->destSeq = destSeq;
+    theNode->hopCount = hopCount;
+    theNode->lastHopCount = hopCount;
+    theNode->nextHop = nextHop;
+    
+}//RoutingAodvReplaceInsertRouteTable//   
+
+
+
+static 
+void RoutingAodvInsertNbrTable(NODE_ADDR destAddr, AODV_NT* nbrTable)
+{
+    AODV_NT_Node* current;
+    AODV_NT_Node* previous;
+    
+    AODV_NT_Node* newNode = 
+       (AODV_NT_Node *)checked_pc_malloc(sizeof(AODV_NT_Node));
+    
+    newNode->destAddr = destAddr;
+    newNode->next = NULL;
+    
+    ++(nbrTable->size);
+    
+    // Find Insertion point.  Insert after all address matches.
+    
+    previous = NULL;
+    current = nbrTable->head;
+    while ((current != NULL) && (current->destAddr <= destAddr)) {
+        previous = current;
+        current = current->next;
+    }//while//
+    
+    
+    if (previous == NULL) {
+        newNode->next = nbrTable->head;
+        nbrTable->head = newNode;
+    } else {
+        newNode->next = previous->next;
+        previous->next = newNode;
+    }//if//
+} /* RoutingAodvInsertNbrTable */
+
+
+/*
+ * RoutingAodvInsertSeenTable
+ *
+ * Insert an entry into the seen table
+ */
+
+static void
+RoutingAodvInsertSeenTable(
+    GlomoNode *node,
+    NODE_ADDR srcAddr,
+    int bcastId,
+    AODV_RST *seenTable)
+{
+    if (seenTable->size == 0)
+    {
+        seenTable->rear = (AODV_RST_Node *) pc_malloc(sizeof(AODV_RST_Node));
+        assert(seenTable->rear != NULL);
+        seenTable->front = seenTable->rear;
+    }
+    else
+    {
+        seenTable->rear->next = (AODV_RST_Node *)
+                                pc_malloc(sizeof(AODV_RST_Node));
+        assert(seenTable->rear->next != NULL);
+        seenTable->rear = seenTable->rear->next;
+    }
+
+    seenTable->rear->srcAddr = srcAddr;
+    seenTable->rear->bcastId = bcastId;
+    seenTable->rear->next = NULL;
+
+    ++(seenTable->size);
+
+    RoutingAodvSetTimer(
+        node, MSG_NETWORK_FlushTables, ANY_DEST, (clocktype)BCAST_ID_SAVE);
+
+} /* RoutingAodvInsertSeenTable */
+
+/*
+ * RoutingAodvInsertBuffer
+ *
+ * Insert a packet into the buffer if no route is available
+ */
+static 
+void RoutingAodvInsertBuffer(
+    Message* msg,
+    NODE_ADDR destAddr,
+    AODV_BUFFER* buffer)
+{
+    AODV_BUFFER_Node* current;
+    AODV_BUFFER_Node* previous;
+    
+    AODV_BUFFER_Node* newNode = 
+       (AODV_BUFFER_Node *)checked_pc_malloc(sizeof(AODV_BUFFER_Node));
+
+    newNode->destAddr = destAddr;
+    newNode->msg = msg;
+    newNode->timestamp = simclock();
+    newNode->next = NULL;
+    
+    ++(buffer->size);
+    
+    // Find Insertion point.  Insert after all address matches.
+    
+    previous = NULL;
+    current = buffer->head;
+    while ((current != NULL) && (current->destAddr <= destAddr)) {
+        previous = current;
+        current = current->next;
+    }//while//
+    
+    
+    if (previous == NULL) {
+        newNode->next = buffer->head;
+        buffer->head = newNode;
+    } else {
+        newNode->next = previous->next;
+        previous->next = newNode;
+    }//if//
+} /* RoutingAodvInsertBuffer */
+
+
+
+/*
+ * RoutingAodvInsertSent
+ *
+ * Insert an entry into the sent table if RREQ is sent
+ */
+static void
+RoutingAodvInsertSent(
+    NODE_ADDR destAddr,
+    int ttl,
+    AODV_SENT *sent)
+{
+    AODV_SENT_Node* current;
+    AODV_SENT_Node* previous;
+    
+    AODV_SENT_Node* newNode = 
+       (AODV_SENT_Node *)checked_pc_malloc(sizeof(AODV_SENT_Node));
+
+    newNode->destAddr = destAddr;
+    newNode->ttl = ttl;
+    newNode->times = 0;
+    newNode->next = NULL;
+    
+    (sent->size)++;
+    
+    // Find Insertion point.  Insert after all address matches.
+    
+    previous = NULL;
+    current = sent->head;
+    while ((current != NULL) && (current->destAddr <= destAddr)) {
+        previous = current;
+        current = current->next;
+    }//while//
+    
+    
+    if (previous == NULL) {
+        newNode->next = sent->head;
+        sent->head = newNode;
+    } else {
+        newNode->next = previous->next;
+        previous->next = newNode;
+    }//if//
+} /* RoutingAodvInsertSent */
+
+
+/*
+ * RoutingAodvDeleteRouteTable
+ *
+ * Remove an entry from the route table
+ */
+void RoutingAodvDeleteRouteTable(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *toFree;
+    AODV_RT_Node *current;
+
+    if (routeTable->size == 0 || routeTable->head == NULL)
+    {
+        return;
+    }
+    else if (routeTable->head->destAddr == destAddr)
+    {
+        if (routeTable->head->lifetime <= simclock())
+        {
+            toFree = routeTable->head;
+            routeTable->head = toFree->next;
+            pc_free(toFree);
+            --(routeTable->size);
+        }
+    }
+    else
+    {
+        for (current = routeTable->head; 
+             current->next != NULL && current->next->destAddr < destAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->destAddr == destAddr &&
+            current->next->lifetime <= simclock())
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(routeTable->size);
+        }
+    }
+
+} /* RoutingAodvDeleteRouteTable */
+
+/*
+ * RoutingAodvDeleteNbrTable
+ *
+ * Remove an entry from the neighbor table
+ */
+void RoutingAodvDeleteNbrTable(NODE_ADDR destAddr, AODV_NT *nbrTable)
+{
+    AODV_NT_Node *toFree;
+    AODV_NT_Node *current;
+
+    if (nbrTable->size == 0)
+    {
+        return;
+    } 
+    else if (nbrTable->head->destAddr == destAddr)
+    {
+        toFree = nbrTable->head;
+        nbrTable->head = toFree->next;
+        pc_free(toFree);
+        --(nbrTable->size);
+    }
+    else
+    {
+        for (current = nbrTable->head;
+             ((current->next != NULL) && (current->next->destAddr < destAddr));
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->destAddr == destAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(nbrTable->size);
+        }
+    }
+
+} /* RoutingAodvDeleteNbrTable */
+
+/*
+ * RoutingAodvDeleteSeenTable
+ *
+ * Remove an entry from the seen table
+ */
+void RoutingAodvDeleteSeenTable(AODV_RST *seenTable)
+{
+    AODV_RST_Node *toFree;
+
+    toFree = seenTable->front;
+    seenTable->front = toFree->next;
+    pc_free(toFree);
+    --(seenTable->size);
+
+    if (seenTable->size == 0)
+    {
+        seenTable->rear = NULL;
+    }
+
+} /* RoutingAodvDeleteSeenTable */
+
+/*
+ * RoutingAodvDeleteBuffer
+ *
+ * Remove a packet from the buffer; Return TRUE if deleted
+ */
+BOOL RoutingAodvDeleteBuffer(NODE_ADDR destAddr, AODV_BUFFER *buffer)
+{
+    AODV_BUFFER_Node *toFree;
+    AODV_BUFFER_Node *current;
+    BOOL deleted;
+
+    if (buffer->size == 0)
+    {
+        deleted = FALSE;
+    }
+    else if (buffer->head->destAddr == destAddr)
+    {
+        toFree = buffer->head;
+        buffer->head = toFree->next;
+        pc_free(toFree);
+        --(buffer->size);
+        deleted = TRUE;
+    }
+    else
+    {
+        for (current = buffer->head;
+             current->next != NULL && current->next->destAddr < destAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->destAddr == destAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(buffer->size);
+            deleted = TRUE;
+        }
+        else
+        {
+            deleted = FALSE;
+        }
+    }
+
+    return (deleted);
+
+} /* RoutingAodvDeleteBuffer */
+
+/*
+ * RoutingAodvDeleteSent
+ *
+ * Remove an entry from the sent table
+ */
+void RoutingAodvDeleteSent(NODE_ADDR destAddr, AODV_SENT *sent)
+{
+    AODV_SENT_Node *toFree;
+    AODV_SENT_Node *current;
+
+    if (sent->size == 0)
+    {
+        return;
+    }
+    else if (sent->head->destAddr == destAddr)
+    {
+        toFree = sent->head;
+        sent->head = toFree->next;
+        pc_free(toFree);
+        --(sent->size);
+    }
+    else
+    {
+        for (current = sent->head;
+             current->next != NULL && current->next->destAddr < destAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->destAddr == destAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(sent->size);
+        }
+    }
+
+} /* RoutingAodvDeleteSent */
+
+
+/*
+ * RoutingAodvUpdateLifetime
+ *
+ * Update the lifetime field of the destination entry in the route table
+ */
+void RoutingAodvUpdateLifetime(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            current->lifetime = simclock() + ACTIVE_ROUTE_TO;
+            return;
+        }
+    }
+
+} /* RoutingAodvUpdateLifetime */
+
+/*
+ * RoutingAodvIncreaseSeq
+ *
+ * Increase the sequence number
+ */
+void RoutingAodvIncreaseSeq(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+
+    aodv->seqNumber++;
+
+} /* RoutingAodvIncreaseSeq */
+
+/*
+ * RoutingAodvIncreaseTtl
+ *
+ * Increase the TTL value
+ */
+void RoutingAodvIncreaseTtl(NODE_ADDR destAddr, AODV_SENT *sent)
+{
+    AODV_SENT_Node *current;
+
+    for (current = sent->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            current->ttl += TTL_INCREMENT;
+
+            if (current->ttl > TTL_THRESHOLD)
+            {
+                current->ttl = NET_DIAMETER;
+            }
+
+            return;
+        }
+
+    }
+
+} /* RoutingAodvIncreaseTtl */
+
+/*
+ * RoutingAodvUpdateTtl
+ *
+ * Update the ttl value
+ */
+void RoutingAodvUpdateTtl(NODE_ADDR destAddr, int ttl, AODV_SENT *sent)
+{
+    AODV_SENT_Node *current;
+
+    for (current = sent->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            current->ttl = ttl;
+            return;
+        }
+    }
+
+} /* RoutingAodvUpdateTtl */
+
+/*
+ * RoutingAodvIncreaseTimes
+ *
+ * Increase the number of times RREQ sent in TTL = NET_DIAMETER
+ */
+void RoutingAodvIncreaseTimes(NODE_ADDR destAddr, AODV_SENT *sent)
+{
+    AODV_SENT_Node *current;
+
+    for (current = sent->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            current->times++;
+            return;
+        }
+    }
+
+} /* RoutingAodvIncreaseTimes */
+
+/*
+ * RoutingAodvActivateRoute
+ *
+ * Activate a route in the route table
+ */
+void RoutingAodvActivateRoute(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            current->activated = TRUE;
+            current->lifetime = simclock() + ACTIVE_ROUTE_TO;
+            return;
+        }
+    }
+
+} /* RoutingAodvActivateRoute */
+
+/*
+ * RoutingAodvInactivateRoutesAndGetDestinations
+ *
+ * Inactivate routes that use the broken link
+ * Returns the destAddr and whether the node must relay the RREP
+ */
+
+void RoutingAodvInactivateRoutesAndGetDestinations(
+    GlomoNode* node,
+    AODV_RT* routeTable,
+    NODE_ADDR nextHop,
+    AODV_AddressSequenceNumberPairType destinationPairs[],
+    int maxNumberDestinationPairs,
+    int* numberDestinations)
+{
+    AODV_RT_Node *current;
+    
+    int numDests = 0;
+    
+    for (current = routeTable->head;
+         current != NULL;
+         current = current->next)
+    {
+        if ((current->nextHop == nextHop) && (current->activated == TRUE))
+        {
+            current->activated = FALSE;
+            current->hopCount = AODV_INFINITY;
+            current->lifetime = simclock() + BAD_LINK_LIFETIME;
+            current->destSeq++;
+
+            RoutingAodvSetTimer(
+                node, MSG_NETWORK_CheckRouteTimeout, current->destAddr,
+                (clocktype)BAD_LINK_LIFETIME);
+
+            if (!current->source) {
+                destinationPairs[numDests].destinationAddress = 
+                   current->destAddr;
+                destinationPairs[numDests].destinationSequenceNumber = 
+                   current->destSeq;
+                numDests++;
+            }//if//
+        }//if//
+    }//for//
+    
+    *numberDestinations = numDests;
+
+} /* RoutingAodvInactivateRoute */
+
+
+
+
+/*
+ * RoutingAodvMarkRouteBroken
+ *
+ * Mark the route with destAddr broken; returns TRUE if relay is required
+ */
+BOOL RoutingAodvMarkRouteBroken(GlomoNode *node,
+                                NODE_ADDR destAddr, 
+                                AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+    BOOL relay = FALSE;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr && current->activated == TRUE)
+        {
+            current->activated = FALSE;
+            current->hopCount = AODV_INFINITY;
+            current->lifetime = simclock() + BAD_LINK_LIFETIME;
+            current->destSeq++;
+
+            RoutingAodvSetTimer(
+                node, MSG_NETWORK_CheckRouteTimeout, current->destAddr,
+                (clocktype)BAD_LINK_LIFETIME);
+
+            if (current->source == FALSE)
+            {
+                relay = TRUE;
+            }
+
+            return (relay);
+        }
+    }
+
+    return (relay);
+
+} /* RoutingAodvMarkRouteBroken */
+
+
+
+
+
+/*
+ * RoutingAodvUpdateSeq
+ *
+ * Update the sequence number of a certain destination
+ */
+void RoutingAodvUpdateSeq(NODE_ADDR destAddr, int seq, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            current->destSeq = seq;
+            return;
+        }
+    }
+
+} /* RoutingAodvUpdateSeq */
+
+
+
+
+
+
+static //inline//                         
+void SendRouteErrorPacket(
+    GlomoNode* node, 
+    const AODV_RERR_Packet* rerrPacket)
+{
+    Message* newMsg = GLOMO_MsgAlloc(node, 0, 0, 0);
+    int packetSize = AODV_RERR_PacketSize(rerrPacket);
+    
+    assert(rerrPacket->pktType == (unsigned short)AODV_RERR);
+    assert(rerrPacket->destinationCount >= 1);
+        
+    GLOMO_MsgPacketAlloc(node, newMsg, packetSize);
+    memcpy(GLOMO_MsgReturnPacket(newMsg), rerrPacket, packetSize);
+    NetworkIpSendRawGlomoMessage(
+        node, newMsg, ANY_DEST, CONTROL, IPPROTO_AODV, 1);
+}
+
+
+
+/*
+ * RoutingAodvInit
+ *
+ * Initialization function for AODV protocol
+ */
+void RoutingAodvInit(
+    GlomoNode *node,
+    GlomoRoutingAodv **aodvPtr,
+    const GlomoNodeInput *nodeInput)
+{
+    GlomoRoutingAodv *aodv = 
+        (GlomoRoutingAodv *)checked_pc_malloc (sizeof(GlomoRoutingAodv));
+
+    (*aodvPtr) = aodv;
+
+    if (aodv == NULL)
+    {
+        fprintf(stderr, "AODV: Cannot alloc memory for AODV struct!\n");
+        assert (FALSE);
+    }
+
+    RoutingAodvInitStats(node);
+    RoutingAodvInitRouteTable(&aodv->routeTable);
+    RoutingAodvInitNbrTable(&aodv->nbrTable);
+    RoutingAodvInitSeenTable(&aodv->seenTable);
+    RoutingAodvInitBuffer(&aodv->buffer);
+    RoutingAodvInitSent(&aodv->sent);
+    RoutingAodvInitSeq(node);
+    RoutingAodvInitBcastId(node);
+
+    NetworkIpSetPacketDropNotificationFunction(
+        node, &RoutingAodvPacketDropNotificationHandler);
+
+    NetworkIpSetRouterFunction(node, &RoutingAodvRouterFunction);
+
+} /* RoutingAodvInit */
+
+/*
+ * RoutingAodvFinalize 
+ *
+ * Called at the end of the simulation to collect the results
+ */
+void RoutingAodvFinalize(GlomoNode *node)
+{
+    GlomoNetworkIp *ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingAodv *aodv = (GlomoRoutingAodv *)ipLayer->routingProtocol;
+    FILE *statOut;
+    float avgHopCnt;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+    sprintf(buf, "Number of Route Requests Txed = %d", 
+                 aodv->stats.numRequestSent);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    
+    sprintf(buf, "Number of Replies Txed = %d", 
+                 aodv->stats.numReplySent);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    
+    sprintf(buf, "Number of Route Errors (RERR) Txed = %d", 
+                 aodv->stats.numRerrSent);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    
+    sprintf(buf, "Number of Route Errors (RERR) Re-sent = %d", 
+                 aodv->stats.numRerrResent);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+                             
+                             
+    sprintf(buf, "Number of CTRL Packets Txed = %d", 
+                 aodv->stats.numRequestSent + aodv->stats.numReplySent);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+
+    sprintf(buf, "Number of Routes Selected = %d", aodv->stats.numRoutes);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    sprintf(buf, "Number of Hop Counts = %d", aodv->stats.numHops);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+
+    sprintf(buf, "Number of Data Txed = %d", 
+                 aodv->stats.numDataTxed);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    sprintf(buf, "Number of Data Packets Originated = %d", 
+                 aodv->stats.numDataSent);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    sprintf(buf, "Number of Data Packets Received = %d", 
+                 aodv->stats.numDataReceived);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    
+    sprintf(buf, "Number of Packets Dropped or Left waiting for Route = %d",
+                 (aodv->stats.numPacketsDropped + aodv->buffer.size));
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    
+    sprintf(buf, "Number of Broken Links = %d", aodv->stats.numBrokenLinks);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    sprintf(buf, "Number of Broken Link Retries = %d", aodv->stats.numBrokenLinkRetries);
+    GLOMO_PrintStat(node, "RoutingAodv", buf);
+    
+
+} /* RoutingAodvFinalize */
+
+/*
+ * RoutingAodvHandleData
+ *
+ * Processing procedure when data is received
+ */
+void RoutingAodvHandleData(GlomoNode *node, Message *msg, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    IpHeaderType *ipHeader = (IpHeaderType *)GLOMO_MsgReturnPacket(msg);
+    NODE_ADDR sourceAddress = ipHeader->ip_src;
+ 
+    assert(sourceAddress  != node->nodeAddr);
+    
+    /* the node is the destination of the route */
+    if (destAddr == node->nodeAddr)
+    {
+        aodv->stats.numDataReceived++;
+
+        RoutingAodvUpdateLifetime(sourceAddress, &aodv->routeTable);
+
+        RoutingAodvSetTimer(node, MSG_NETWORK_CheckRouteTimeout, 
+                            sourceAddress, (clocktype)ACTIVE_ROUTE_TO);
+    } 
+    else if (destAddr != ANY_DEST) 
+    {
+        // The node is an intermediate node of the route.
+        // Relay the packet to the next hop of the route 
+        
+        if (RoutingAodvCheckRouteExist(destAddr, &aodv->routeTable)) {
+            RoutingAodvTransmitData(node, msg, destAddr);
+        } else {
+            // Broken Route.  Drop Packet, send RERR again to make them stop
+            // sending more.
+            AODV_RERR_Packet newRerrPacket;
+            newRerrPacket.pktType = AODV_RERR;
+            newRerrPacket.destinationCount = 1;
+            newRerrPacket.destinationPairArray[0].destinationAddress = destAddr;
+            newRerrPacket.destinationPairArray[0].destinationSequenceNumber
+              = RoutingAodvGetSeq(destAddr, &aodv->routeTable);
+            
+            SendRouteErrorPacket(node, &newRerrPacket);
+            aodv->stats.numRerrResent++;
+            
+            aodv->stats.numPacketsDropped++;
+            GLOMO_MsgFree(node,msg);
+            
+        }//if//
+    }//if//
+
+} /* RoutingAodvHandleData */
+
+/*
+ * RoutingAodvHandleRequest
+ *
+ * Processing procedure when RREQ is received
+ */
+void RoutingAodvHandleRequest(GlomoNode *node, Message *msg, int ttl)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    AODV_RREQ_Packet *rreqPkt = (AODV_RREQ_Packet *)GLOMO_MsgReturnPacket(msg);
+
+    /* Process only if the packet is not a duplicate */
+    if (!RoutingAodvLookupSeenTable(
+                rreqPkt->srcAddr, rreqPkt->bcastId, &aodv->seenTable))
+    {
+        RoutingAodvInsertSeenTable(
+                node, rreqPkt->srcAddr, rreqPkt->bcastId, &aodv->seenTable);
+
+        /* Update the neighbor table if the upstream is new */
+        if (!RoutingAodvCheckNbrExist(rreqPkt->lastAddr, &aodv->nbrTable))
+        {
+            RoutingAodvInsertNbrTable(rreqPkt->lastAddr, &aodv->nbrTable);
+            RoutingAodvIncreaseSeq(node);
+        }
+
+        /* The node is the destination of the route */
+        if (node->nodeAddr == rreqPkt->destAddr)
+        {
+            RoutingAodvReplaceInsertRouteTable(
+                rreqPkt->srcAddr, rreqPkt->srcSeq, rreqPkt->hopCount, 
+                rreqPkt->lastAddr, simclock() + ACTIVE_ROUTE_TO, TRUE, TRUE,
+                &aodv->routeTable);
+
+            RoutingAodvSetTimer(
+                node, MSG_NETWORK_CheckRouteTimeout, rreqPkt->srcAddr, 
+                (clocktype)ACTIVE_ROUTE_TO);
+
+            /* Send a Route Reply */
+            RoutingAodvInitiateRREP(node, msg);
+
+        } /* if dest */
+
+        else
+        {
+            /* No route to destination is known */
+            if (!RoutingAodvCheckRouteExist(rreqPkt->destAddr, 
+                                            &aodv->routeTable))
+            {
+                RoutingAodvReplaceInsertRouteTable(
+                    rreqPkt->srcAddr, rreqPkt->srcSeq, rreqPkt->hopCount, 
+                    rreqPkt->lastAddr, simclock() + REV_ROUTE_LIFE, FALSE,
+                    FALSE, &aodv->routeTable);
+
+                RoutingAodvSetTimer(
+                    node, MSG_NETWORK_CheckRouteTimeout, rreqPkt->srcAddr,
+                    (clocktype)REV_ROUTE_LIFE);
+
+                if (ttl > 0)
+                {
+                    /* Relay the packet only if TTL is not zero */
+                    RoutingAodvRelayRREQ(node, msg, ttl);
+                } /* if ttl > 0 */
+                else
+                {
+                    GLOMO_MsgFree(node, msg);
+                }
+            } /* if no route */
+
+            /* Knows a route to the destination */
+            else
+            {
+                /* However, the known route is not a fresh one */
+                if (RoutingAodvGetSeq(rreqPkt->destAddr, &aodv->routeTable) <
+                    rreqPkt->destSeq)
+                {
+                    RoutingAodvReplaceInsertRouteTable(
+                        rreqPkt->srcAddr, rreqPkt->srcSeq, rreqPkt->hopCount,
+                        rreqPkt->lastAddr, simclock() + REV_ROUTE_LIFE,
+                        FALSE, FALSE,
+                        &aodv->routeTable);
+
+                    RoutingAodvSetTimer(
+                        node, MSG_NETWORK_CheckRouteTimeout, rreqPkt->srcAddr,
+                        (clocktype)REV_ROUTE_LIFE);
+
+                    if (ttl > 0)
+                    {
+                        /* Relay the packet only if TTL is not zero */
+                        RoutingAodvRelayRREQ(node, msg, ttl);
+                    } /* if ttl > 0 */
+                    else
+                    {
+                        GLOMO_MsgFree(node, msg);
+                    }
+                } /* if seq no is not fresh */
+
+                /* has a fresh route to the destination */
+                else
+                {
+                    RoutingAodvReplaceInsertRouteTable(
+                        rreqPkt->srcAddr, rreqPkt->srcSeq, rreqPkt->hopCount,
+                        rreqPkt->lastAddr, simclock() + ACTIVE_ROUTE_TO,
+                        TRUE, FALSE,
+                        &aodv->routeTable);
+
+                    RoutingAodvSetTimer(
+                        node, MSG_NETWORK_CheckRouteTimeout, rreqPkt->srcAddr,
+                        (clocktype)ACTIVE_ROUTE_TO);
+
+                    /* Send a Route Reply */
+                    RoutingAodvInitiateRREPbyIN(node, msg);
+
+                } /* else */
+            } /* else */
+        } /* else (not dest) */
+    } /* if new pkt */
+
+    else
+    {
+        GLOMO_MsgFree(node, msg);
+    }
+} /* RoutingAodvHandleRequest */
+
+
+
+/*
+ * RoutingAodvHandleReply
+ *
+ * Processing procedure when RREP is received
+ */
+void RoutingAodvHandleReply(
+    GlomoNode *node, Message *msg, NODE_ADDR srcAddr, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    Message *newMsg;
+    AODV_RREP_Packet *rrepPkt = (AODV_RREP_Packet *)GLOMO_MsgReturnPacket(msg);
+    BOOL relay;
+    clocktype lifetime;
+
+    /* clocktype must be copied to access the field of that type */
+    memmove(&lifetime, &rrepPkt->lifetime, sizeof(clocktype));
+
+    /* Source of the route */
+    
+    if (rrepPkt->srcAddr == node->nodeAddr)
+    {
+        /* The packet is the first reply received */
+        if (!RoutingAodvCheckRouteExist(rrepPkt->destAddr, 
+                                        &aodv->routeTable))
+        {
+            RoutingAodvReplaceInsertRouteTable(
+                rrepPkt->destAddr, rrepPkt->destSeq, rrepPkt->hopCount,
+                srcAddr, simclock() + lifetime, TRUE,
+                TRUE, &aodv->routeTable);
+
+            aodv->stats.numRoutes++;
+            aodv->stats.numHops += rrepPkt->hopCount;
+
+            RoutingAodvDeleteSent(rrepPkt->destAddr, &aodv->sent);
+
+            /* Send any buffered packets to the destination */
+            while (RoutingAodvLookupBuffer(
+                       rrepPkt->destAddr, &aodv->buffer))
+            {
+                newMsg = RoutingAodvGetBufferedPacket(
+                                 rrepPkt->destAddr, &aodv->buffer);
+ 
+                RoutingAodvTransmitData(node, newMsg, rrepPkt->destAddr);
+
+                aodv->stats.numDataSent++;
+
+                RoutingAodvDeleteBuffer(rrepPkt->destAddr, &aodv->buffer);
+
+            } /* while */    
+        } /* if no route */
+
+        /* The packet contains a better route compared to the one already
+           known */
+        else if ((RoutingAodvGetSeq(rrepPkt->destAddr, &aodv->routeTable) <
+                  rrepPkt->destSeq) ||
+                 ((RoutingAodvGetSeq(rrepPkt->destAddr, &aodv->routeTable)
+                  == rrepPkt->destSeq) &&
+                  (RoutingAodvGetHopCount(rrepPkt->destAddr, 
+                                          &aodv->routeTable) >
+                   rrepPkt->hopCount)))
+        {
+            RoutingAodvReplaceInsertRouteTable(
+                rrepPkt->destAddr, rrepPkt->destSeq, rrepPkt->hopCount,
+                srcAddr, simclock() + lifetime, TRUE, 
+                TRUE, &aodv->routeTable);
+
+            /* Send any buffered packet to the destination */
+            while (RoutingAodvLookupBuffer(
+                       rrepPkt->destAddr, &aodv->buffer))
+            {
+                newMsg = RoutingAodvGetBufferedPacket(
+                             rrepPkt->destAddr, &aodv->buffer);
+
+                RoutingAodvTransmitData(node, newMsg, rrepPkt->destAddr);
+
+                aodv->stats.numDataSent++;
+
+                RoutingAodvDeleteBuffer(rrepPkt->destAddr, &aodv->buffer);
+
+            } /* while */
+        } /* else if */
+
+        GLOMO_MsgFree(node, msg);
+    } /* if source */
+
+    /* Intermediate node of the route */
+    else
+    {
+        /* the packet is the first reply received */
+        if (!RoutingAodvCheckRouteExist(
+                 rrepPkt->destAddr, &aodv->routeTable))
+        {
+            RoutingAodvReplaceInsertRouteTable(
+                rrepPkt->destAddr, rrepPkt->destSeq, rrepPkt->hopCount,
+                srcAddr, simclock() + lifetime, TRUE, FALSE,
+                &aodv->routeTable);
+
+            RoutingAodvSetTimer(
+                node, MSG_NETWORK_CheckRouteTimeout, rrepPkt->destAddr,
+                (clocktype)lifetime);
+
+            RoutingAodvActivateRoute(rrepPkt->srcAddr, &aodv->routeTable);
+
+            RoutingAodvSetTimer(
+                node, MSG_NETWORK_CheckRouteTimeout, rrepPkt->srcAddr,
+                (clocktype)ACTIVE_ROUTE_TO);
+
+            /* Forward the packet to the upstream of the route */
+            RoutingAodvRelayRREP(node, msg, destAddr);
+
+        } /* if new route */
+
+        /* the packet carries a better route compared to the one already
+           known */
+        else if ((RoutingAodvGetSeq(rrepPkt->destAddr, &aodv->routeTable) <                       
+                    rrepPkt->destSeq) ||
+                  ((RoutingAodvGetSeq(rrepPkt->destAddr, &aodv->routeTable)
+                    == rrepPkt->destSeq) &&
+                   (RoutingAodvGetHopCount(rrepPkt->destAddr, 
+                                           &aodv->routeTable) >  
+                    rrepPkt->hopCount)))
+        {
+            RoutingAodvReplaceInsertRouteTable(
+                rrepPkt->destAddr, rrepPkt->destSeq, rrepPkt->hopCount,
+                srcAddr, simclock() + lifetime, TRUE,
+                FALSE, &aodv->routeTable);
+
+            RoutingAodvSetTimer(
+                node, MSG_NETWORK_CheckRouteTimeout, rrepPkt->destAddr,
+                (clocktype)lifetime);
+
+            RoutingAodvActivateRoute(rrepPkt->srcAddr, &aodv->routeTable);
+
+            RoutingAodvSetTimer(
+                node, MSG_NETWORK_CheckRouteTimeout, rrepPkt->srcAddr,
+                (clocktype)ACTIVE_ROUTE_TO);
+
+            /* Forward the packet to the upstream of the route */
+            RoutingAodvRelayRREP(node, msg, destAddr);
+
+        } /* else if newer route or shorter route */
+ 
+        else
+        {
+            GLOMO_MsgFree(node, msg);
+        }//if//
+    }//if// 
+
+} /* RoutingAodvHandleReply */
+
+
+
+
+
+
+//
+// RoutingAodvHandleRouteError
+//
+// Processing procedure when RERR is received
+//
+ 
+void RoutingAodvHandleRouteError(
+    GlomoNode *node, Message *msg, NODE_ADDR srcAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    AODV_RERR_Packet* rerrPkt = 
+       (AODV_RERR_Packet*)GLOMO_MsgReturnPacket(msg);
+    AODV_RERR_Packet newRerrPacket;
+    int I;
+    
+    newRerrPacket.pktType = (unsigned short)AODV_RERR;
+    newRerrPacket.destinationCount = 0;
+    
+    for(I = 0; I < rerrPkt->destinationCount; I++) {
+        // Mark the route inactive in the route table; Must not remove it
+        // right away since the last hop count known is needed for future use 
+        // Remove destination from packet if it doesn't need to be forwarded
+        // further.
+        
+        NODE_ADDR destination = 
+            rerrPkt->destinationPairArray[I].destinationAddress; 
+        int sequenceNum = 
+            rerrPkt->destinationPairArray[I].destinationSequenceNumber; 
+        
+        BOOL mustRelay = 
+           RoutingAodvMarkRouteBroken(
+               node, 
+               destination, 
+               &aodv->routeTable);
+        
+        RoutingAodvUpdateSeq(destination,
+                             sequenceNum, 
+                             &aodv->routeTable);
+        
+        NetworkIpDeleteOutboundPacketsToANode(
+            node, srcAddr, destination, FALSE); 
+
+                             
+        if (mustRelay) {
+           newRerrPacket.destinationPairArray[newRerrPacket.destinationCount] =
+              rerrPkt->destinationPairArray[I];   
+           newRerrPacket.destinationCount++;   
+        }//if//
+                             
+    }//while//
+    
+    if (newRerrPacket.destinationCount > 0) {
+        SendRouteErrorPacket(node, &newRerrPacket);
+        aodv->stats.numRerrSent++;
+    }//if//
+    
+    GLOMO_MsgFree(node, msg);
+}//RoutingAodvHandleRouteError//
+
+
+
+
+/*
+ * RoutingAodvInitRouteTable
+ *
+ * Initialize the route table
+ */
+void RoutingAodvInitRouteTable(AODV_RT *routeTable)
+{
+    routeTable->head = NULL;
+    routeTable->size = 0;
+
+} /* RoutingAodvInitRouteTable */
+
+/*
+ * RoutingAodvInitNbrTable
+ *
+ * Initialize the neighbor table
+ */
+void RoutingAodvInitNbrTable(AODV_NT *nbrTable)
+{
+    nbrTable->head = NULL;
+    nbrTable->size = 0;
+
+} /* RoutingAodvInitNbrTable */
+
+/*
+ * RoutingAodvInitSeenTable
+ *
+ * Initialize the seen table
+ */
+void RoutingAodvInitSeenTable(AODV_RST *seenTable)
+{
+    seenTable->front = NULL;
+    seenTable->rear = NULL;
+    seenTable->size = 0;
+
+} /* RoutingAodvInitSeenTable */
+
+/*
+ * RoutingAodvInitBuffer
+ *
+ * Initialize the buffer
+ */
+void RoutingAodvInitBuffer(AODV_BUFFER *buffer)
+{
+    buffer->head = NULL;
+    buffer->size = 0;
+
+} /* RoutingAodvInitBuffer */
+
+/*
+ * RoutingAodvInitSent
+ *
+ * Initialize the sent table
+ */
+void RoutingAodvInitSent(AODV_SENT *sent)
+{
+    sent->head = NULL;
+    sent->size = 0;
+
+} /* RoutingAodvInitBuffer */
+
+/*
+ * RoutingAodvInitStats
+ *
+ * Initialize all the stat variables
+ */
+void RoutingAodvInitStats(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+
+    aodv->stats.numRequestSent = 0;
+    aodv->stats.numReplySent = 0;
+    aodv->stats.numRerrSent = 0;
+    aodv->stats.numRerrResent = 0;
+    aodv->stats.numDataSent = 0;
+    aodv->stats.numDataTxed = 0;
+    aodv->stats.numDataReceived = 0;
+    aodv->stats.numRoutes = 0;
+    aodv->stats.numHops = 0;
+    aodv->stats.numPacketsDropped = 0;
+    aodv->stats.numBrokenLinks = 0;
+    aodv->stats.numBrokenLinkRetries = 0;
+} /* RoutingAodvInitStats */
+
+/*
+ * RoutingAodvInitSeq
+ *
+ * Initialize the sequence number
+ */
+void RoutingAodvInitSeq(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+
+    aodv->seqNumber = 0;
+
+} /* RoutingAodvInitSeq */
+
+/*
+ * RoutingAodvInitBcastId
+ *
+ * Initialize the broadcast id
+ */
+void RoutingAodvInitBcastId(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+
+    aodv->bcastId = 0;
+
+} /* RoutingAodvInitBcastId */
+
+/*
+ * RoutingAodvGetNextHop
+ *
+ * Looks up the routing table to obtain next hop to the destinaton
+ */
+NODE_ADDR RoutingAodvGetNextHop(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr; 
+         current = current->next)
+    {
+        if (current->destAddr == destAddr && current->activated == TRUE)
+        {
+            return(current->nextHop);
+        }
+    }
+
+    return (ANY_DEST);
+} /* RoutingAodvGetNextHop */
+
+/*
+ * RoutingAodvGetBcastId
+ *
+ * Obtains the broadcast ID for the outgoing packet
+ */
+int RoutingAodvGetBcastId(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    int bcast;
+
+    bcast = aodv->bcastId;
+    aodv->bcastId++;
+
+    return (bcast);
+
+} /* RoutingAodvGetBcastId */
+
+/*
+ * RoutingAodvGetSeq
+ *
+ * Obtains the sequence number of the destination node 
+ */
+int RoutingAodvGetSeq(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(current->destSeq);
+        }
+    }
+
+    return (-1);
+
+} /* RoutingAodvGetSeq */
+
+/*
+ * RoutingAodvGetMySeq
+ *
+ * Obtains the node's seq number
+ */
+int RoutingAodvGetMySeq(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+
+    return (aodv->seqNumber);
+
+} /* RoutingAodvGetMySeq */
+
+/*
+ * RoutingAodvGetHopCount
+ *
+ * Obtains the hop count to the destination node
+ */
+int RoutingAodvGetHopCount(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(current->hopCount);
+        }
+    }
+
+    return (-1);
+
+} /* RoutingAodvGetHopCount */
+
+/*
+ * RoutingAodvGetLastHopCount
+ *
+ * Obtains the last hop count known to the destination node
+ */
+int RoutingAodvGetLastHopCount(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(current->lastHopCount);
+        }
+    }
+
+    return (-1);
+
+} /* RoutingAodvGetLastHopCount */
+
+/*
+ * RoutingAodvGetTtl
+ *
+ * Obtains the ttl value for the outgoing RREQ
+ */
+int RoutingAodvGetTtl(NODE_ADDR destAddr, AODV_SENT *sent)
+{
+    AODV_SENT_Node *current;
+
+    for (current = sent->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(current->ttl);
+        }
+    }
+
+    return (TTL_START);
+
+} /* RoutingAodvGetTtl */
+
+/*
+ * RoutingAodvGetTimes
+ *
+ * Obtains the number of times the RREQ was sent in TTL = NET_DIAMETER
+ */
+int RoutingAodvGetTimes(NODE_ADDR destAddr, AODV_SENT *sent)
+{
+    AODV_SENT_Node *current;
+
+    for (current = sent->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(current->times);
+        }
+    }
+
+    return (0);
+
+} /* RoutingAodvGetTimes */
+
+/*
+ * RoutingAodvGetLifetime
+ *
+ * Obtains the lifetime value of an entry in the route table
+ */
+clocktype RoutingAodvGetLifetime(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(current->lifetime);
+        }
+    }
+
+    return (0);
+
+} /* RoutingAodvGetLifetime */
+
+/*
+ * RoutingAodvGetBufferedPacket
+ *
+ * Extract the packet that was buffered
+ */
+Message *
+RoutingAodvGetBufferedPacket(NODE_ADDR destAddr, AODV_BUFFER *buffer)
+{
+    AODV_BUFFER_Node *current;
+
+    for (current = buffer->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(current->msg);
+        }
+    }
+    assert(FALSE); abort(); return NULL;
+
+} /* RoutingAodvGetBufferedPacket */
+
+/*
+ * RoutingAodvCheckRouteExist
+ * 
+ * Returns TRUE if any route to the destination is known
+ */
+BOOL RoutingAodvCheckRouteExist(NODE_ADDR destAddr, AODV_RT *routeTable)
+{
+    AODV_RT_Node *current;
+
+    if (routeTable->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if ((current->destAddr == destAddr) && 
+            (current->hopCount != AODV_INFINITY) &&
+            (current->lifetime > simclock()) &&
+            (current->activated == TRUE))
+        {
+            return(TRUE);
+        }
+    }
+
+    return (FALSE);
+
+} /* RoutingAodvCheckRouteExist */
+
+/*
+ * RoutingAodvCheckNbrExist
+ *
+ * Returns TRUE if the node is already a neighbor
+ */
+BOOL RoutingAodvCheckNbrExist(NODE_ADDR destAddr, AODV_NT *nbrTable)
+{
+    AODV_NT_Node *current;
+
+    if (nbrTable->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = nbrTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(TRUE);
+        }
+    }
+
+    return (FALSE);
+
+} /* RoutingAodvCheckNbrExist */
+
+/*
+ * RoutingAodvLookupSeenTable
+ *
+ * Returns TRUE if the broadcast packet is processed before
+ */
+BOOL RoutingAodvLookupSeenTable(NODE_ADDR srcAddr, 
+                                int bcastId,
+                                AODV_RST *seenTable)
+{
+    AODV_RST_Node *current;
+
+    if (seenTable->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = seenTable->front;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->srcAddr == srcAddr && current->bcastId == bcastId)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+
+} /* RoutingAodvLookupSeenTable */
+
+/*
+ * RoutingAodvLookupBuffer
+ *
+ * Returns TRUE if any packet is buffered to the destination
+ *
+ */
+BOOL RoutingAodvLookupBuffer(NODE_ADDR destAddr, AODV_BUFFER *buffer)
+{
+    AODV_BUFFER_Node *current;
+
+    if (buffer->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = buffer->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(TRUE);
+        }
+    }
+
+    return (FALSE);
+
+} /* RoutingAodvLookupBuffer */
+
+/*
+ * RoutingAodvCheckSent
+ *
+ * Check if RREQ has been sent; return TRUE if sent
+ */
+BOOL RoutingAodvCheckSent(NODE_ADDR destAddr, AODV_SENT *sent)
+{
+    AODV_SENT_Node *current;
+
+    if (sent->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = sent->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(TRUE);
+        }
+    }
+
+    return (FALSE);
+
+} /* RoutingAodvCheckSent */
+
+
+
+/*
+ * RoutingAodvHandleProtocolPacket
+ *
+ * Called when the packet is received from MAC
+ */
+void RoutingAodvHandleProtocolPacket(
+    GlomoNode *node, Message *msg, NODE_ADDR srcAddr, 
+    NODE_ADDR destAddr, int ttl)
+{
+    AODV_PacketType *aodvHeader = (AODV_PacketType*)GLOMO_MsgReturnPacket(msg);
+
+    switch (*aodvHeader) 
+    {
+        case AODV_RREQ:
+        {
+            RoutingAodvHandleRequest(node, msg, ttl);
+
+            break;
+        } /* RREQ */
+
+        case AODV_RREP:
+        {
+            RoutingAodvHandleReply(node, msg, srcAddr, destAddr);
+
+            break;
+        } /* RREP */
+        case AODV_RERR:
+        {
+            assert(destAddr == ANY_DEST);
+            RoutingAodvHandleRouteError(node, msg, srcAddr);
+
+            break;
+        } /* RERR */
+        
+        default:
+           assert(FALSE); abort(); 
+           break;
+    } /* switch */
+} /* RoutingAodvHandleProtocolPacket */
+
+/*
+ * RoutingAodvHandleProtocolEvent
+ *
+ * Handles all the protocol events
+ */
+void RoutingAodvHandleProtocolEvent(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+
+    switch (msg->eventType) {
+
+        /* Remove an entry from the RREQ Seen Table */
+        case MSG_NETWORK_FlushTables: {
+            RoutingAodvDeleteSeenTable(&aodv->seenTable);
+            GLOMO_MsgFree(node, msg);
+            break;
+        }
+
+        /* Remove the route that has not been used for awhile */
+        case MSG_NETWORK_CheckRouteTimeout: {
+            NODE_ADDR *destAddr = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+
+            RoutingAodvDeleteRouteTable(*destAddr, &aodv->routeTable);
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        /* Check if RREP is received after sending RREQ */
+        case MSG_NETWORK_CheckReplied: {
+            NODE_ADDR *destAddr = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+
+            /* Route has not been obtained */
+            if (!RoutingAodvCheckRouteExist(*destAddr, &aodv->routeTable))
+            {
+                if (RoutingAodvGetTimes(*destAddr, &aodv->sent) < RREQ_RETRIES)
+                {
+                    /* Retry with increased TTL */
+                    RoutingAodvRetryRREQ(node, *destAddr);
+                } /* if under the retry limit */
+
+                /* over the limit */
+                else
+                {
+                    while (RoutingAodvLookupBuffer(*destAddr, &aodv->buffer))
+                    {
+                        Message* messageToDelete = 
+                            RoutingAodvGetBufferedPacket(
+                               *destAddr, &aodv->buffer);
+                        RoutingAodvDeleteBuffer(*destAddr, &aodv->buffer);
+                        
+                        GLOMO_MsgFree(node, messageToDelete);
+                        aodv->stats.numPacketsDropped++;
+                    }
+                } /* else */
+            } /* if no route */
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        default:
+            fprintf(stderr, "RoutingAodv: Unknown MSG type %d!\n",
+                    msg->eventType);
+            abort();
+
+    } /* switch */
+
+} /* RoutingAodvHandleProtocolEvent */
+
+/*
+ * RoutingAodvRouterFunction
+ *
+ * Determine the routing action to take for a the given data packet
+ * set the PacketWasRouted variable to TRUE if no further handling of 
+ * this packet by IP is necessary 
+ */
+void RoutingAodvRouterFunction(
+    GlomoNode *node,
+    Message *msg,
+    NODE_ADDR destAddr,
+    BOOL *packetWasRouted)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+
+    /* Control packets */
+    if (ipHeader->ip_p  == IPPROTO_AODV)
+    {
+        return;
+    }
+
+    if (destAddr == node->nodeAddr)
+    {
+        *packetWasRouted = FALSE;
+    }
+    else
+    {
+        *packetWasRouted = TRUE;
+    }
+
+    /* intermediate node or destination of the route */
+    if (ipHeader->ip_src != node->nodeAddr) 
+    {
+        RoutingAodvHandleData(node, msg, destAddr);
+    }
+
+    /* source has a route to the destination */
+    else if (RoutingAodvCheckRouteExist(destAddr, &aodv->routeTable))
+    {
+        RoutingAodvTransmitData(node, msg, destAddr);
+        aodv->stats.numDataSent++;
+    }
+
+    /* There is no route to the destination and RREQ has not been sent */
+    else if (!RoutingAodvLookupBuffer(destAddr, &aodv->buffer))
+    {
+        RoutingAodvInsertBuffer(msg, destAddr, &aodv->buffer); 
+
+        RoutingAodvInitiateRREQ(node, destAddr);
+    }
+
+    /* There is no route but RREQ has already been sent */
+    else
+    {
+        RoutingAodvInsertBuffer(msg, destAddr, &aodv->buffer);
+    }
+
+} /* RoutingAodvRouterFunction */
+
+
+
+/*
+ * RoutingAodvMacLayerStatusHandler
+ *
+ * Reacts to the signal sent by the MAC protocol after link failure
+ */
+void RoutingAodvPacketDropNotificationHandler(
+    GlomoNode *node, const Message* msg, const NODE_ADDR nextHopAddress)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+
+    IpHeaderType* ipHeader;
+    NODE_ADDR destAddr;
+    int numberRouteDestinations;
+
+    ipHeader = (IpHeaderType *) GLOMO_MsgReturnPacket(msg);
+
+    if (ipHeader->ip_p  == IPPROTO_AODV)
+    {
+        return;
+    }//if//
+    
+    
+    destAddr = ipHeader->ip_dst;
+   
+    if (nextHopAddress == ANY_DEST) {
+        aodv->stats.numBrokenLinkRetries++;
+        return;
+    }//if//   
+
+    NetworkIpDeleteOutboundPacketsToANode(
+        node, nextHopAddress, ANY_DEST, FALSE); 
+    
+    aodv->stats.numBrokenLinks++;
+    
+    RoutingAodvDeleteNbrTable(nextHopAddress, &aodv->nbrTable);
+    RoutingAodvIncreaseSeq(node);
+
+    do {
+        AODV_RERR_Packet newRerrPacket;
+        newRerrPacket.pktType = AODV_RERR;
+       
+        RoutingAodvInactivateRoutesAndGetDestinations(
+            node,
+            &aodv->routeTable,
+            nextHopAddress,
+            newRerrPacket.destinationPairArray,
+            AODV_MAX_RERR_DESTINATIONS,
+            &numberRouteDestinations);
+        
+        newRerrPacket.destinationCount = numberRouteDestinations;
+        
+        if (newRerrPacket.destinationCount > 0) {
+            SendRouteErrorPacket(node, &newRerrPacket);
+            aodv->stats.numRerrSent++;
+        }//if//
+    
+    } while (numberRouteDestinations == AODV_MAX_RERR_DESTINATIONS);
+
+}//RoutingAodvMaclayerStatusHandler//
+
+
+
+/*
+ * RoutingAodvSetTimer
+ *
+ * Set timers for protocol events
+ */
+void RoutingAodvSetTimer(
+    GlomoNode *node, long eventType, NODE_ADDR destAddr, clocktype delay)
+{
+    Message *newMsg;
+    NODE_ADDR *info;
+
+    newMsg = GLOMO_MsgAlloc(node,
+                            GLOMO_NETWORK_LAYER,
+                            ROUTING_PROTOCOL_AODV,
+                            eventType);
+
+    GLOMO_MsgInfoAlloc(node, newMsg, sizeof(NODE_ADDR));
+    info = (NODE_ADDR *) GLOMO_MsgReturnInfo(newMsg);
+    *info = destAddr;
+    GLOMO_MsgSend(node, newMsg, delay);
+
+} /* RoutingAodvSetTimer */
+
+/*
+ * RoutingAodvInitiateRREQ
+ *
+ * Initiate a Route Request packet when no route to destination is known
+ */
+void RoutingAodvInitiateRREQ(GlomoNode *node, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    Message *newMsg;
+    AODV_RREQ_Packet *rreqPkt;
+    char *pktPtr;
+    int pktSize = sizeof(AODV_RREQ_Packet);
+    int ttl;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rreqPkt = (AODV_RREQ_Packet *) pktPtr;
+
+    rreqPkt->pktType = AODV_RREQ;
+    rreqPkt->bcastId = RoutingAodvGetBcastId(node); 
+    rreqPkt->destAddr = destAddr;
+    rreqPkt->destSeq = RoutingAodvGetSeq(destAddr, &aodv->routeTable);
+    rreqPkt->srcAddr = node->nodeAddr;
+    rreqPkt->srcSeq = RoutingAodvGetMySeq(node);
+    rreqPkt->lastAddr = node->nodeAddr;
+    rreqPkt->hopCount = 1;
+
+    if (RoutingAodvCheckSent(destAddr, &aodv->sent))
+    {
+        ttl = RoutingAodvGetTtl(destAddr, &aodv->sent);
+        RoutingAodvIncreaseTtl(destAddr, &aodv->sent);
+    }
+    else
+    {
+        ttl = RoutingAodvGetLastHopCount(destAddr, &aodv->routeTable);
+
+        if (ttl == -1)
+        {
+            ttl = TTL_START;
+        }
+
+        RoutingAodvInsertSent(destAddr, ttl, &aodv->sent);
+
+        RoutingAodvIncreaseTtl(destAddr, &aodv->sent);
+    }
+
+    NetworkIpSendRawGlomoMessage(
+          node, newMsg, ANY_DEST, CONTROL, IPPROTO_AODV, ttl);
+
+    aodv->stats.numRequestSent++;
+
+    RoutingAodvInsertSeenTable(
+                node, node->nodeAddr, rreqPkt->bcastId, &aodv->seenTable);
+
+    RoutingAodvSetTimer(node, MSG_NETWORK_CheckReplied, destAddr,
+                        (clocktype)2 * ttl * NODE_TRAVERSAL_TIME);
+
+} /* RoutingAodvInitiateRREQ */
+
+/*
+ * RoutingAodvRetryRREQ
+ *
+ * Send RREQ again after not receiving any RREP
+ */
+void RoutingAodvRetryRREQ(GlomoNode *node, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    Message *newMsg;
+    AODV_RREQ_Packet *rreqPkt;
+    char *pktPtr;
+    int pktSize = sizeof(AODV_RREQ_Packet);
+    int ttl;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rreqPkt = (AODV_RREQ_Packet *) pktPtr;
+
+    rreqPkt->pktType = AODV_RREQ;
+    rreqPkt->bcastId = RoutingAodvGetBcastId(node); 
+    rreqPkt->destAddr = destAddr;
+    rreqPkt->destSeq = RoutingAodvGetSeq(destAddr, &aodv->routeTable);
+    rreqPkt->srcAddr = node->nodeAddr;
+    rreqPkt->srcSeq = RoutingAodvGetMySeq(node);
+    rreqPkt->lastAddr = node->nodeAddr;
+    rreqPkt->hopCount = 1;
+
+    ttl = RoutingAodvGetTtl(destAddr, &aodv->sent);
+
+    NetworkIpSendRawGlomoMessage(
+          node, newMsg, ANY_DEST, CONTROL, IPPROTO_AODV, ttl);
+
+    RoutingAodvIncreaseTtl(destAddr, &aodv->sent);
+
+    aodv->stats.numRequestSent++;
+
+    RoutingAodvInsertSeenTable(
+                node, node->nodeAddr, rreqPkt->bcastId, &aodv->seenTable);
+
+    if (ttl == NET_DIAMETER)
+    {
+        RoutingAodvIncreaseTimes(destAddr, &aodv->sent);
+    }
+
+    RoutingAodvSetTimer(node, MSG_NETWORK_CheckReplied, destAddr,
+                        (clocktype)2 * ttl * NODE_TRAVERSAL_TIME);
+
+} /* RoutingAodvRetryRREQ */
+
+/*
+ * RoutingAodvTransmitData
+ *
+ * Forward the data packet to the next hop
+ */
+void RoutingAodvTransmitData(GlomoNode *node, Message *msg, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    NODE_ADDR nextHop;
+
+    GLOMO_MsgSetLayer(msg, GLOMO_MAC_LAYER, 0);
+    GLOMO_MsgSetEvent(msg, MSG_MAC_FromNetwork);
+
+    nextHop = RoutingAodvGetNextHop(destAddr, &aodv->routeTable);
+    
+    assert(nextHop != ANY_DEST);
+    
+    NetworkIpSendPacketToMacLayer(node, msg, DEFAULT_INTERFACE, nextHop);
+    aodv->stats.numDataTxed++;
+    
+    RoutingAodvUpdateLifetime(destAddr, &aodv->routeTable);
+
+    RoutingAodvSetTimer(node, MSG_NETWORK_CheckRouteTimeout, 
+                            destAddr, (clocktype)ACTIVE_ROUTE_TO);
+
+} /* RoutingAodvTransmitData */
+
+/*
+ * RoutingAodvRelayRREQ
+ *
+ * Forward (re-broadcast) the RREQ
+ */
+void RoutingAodvRelayRREQ(GlomoNode *node, Message *msg, int ttl)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    Message *newMsg;
+    AODV_RREQ_Packet *oldRreq;
+    AODV_RREQ_Packet *newRreq;
+    char *pktPtr;
+    int pktSize = sizeof(AODV_RREQ_Packet);
+    clocktype delay;
+
+    oldRreq = (AODV_RREQ_Packet *) GLOMO_MsgReturnPacket(msg);
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    newRreq = (AODV_RREQ_Packet *) pktPtr;
+
+    newRreq->pktType = oldRreq->pktType;
+    newRreq->bcastId = oldRreq->bcastId;
+    newRreq->destAddr = oldRreq->destAddr;
+    newRreq->destSeq = oldRreq->destSeq;
+    newRreq->srcAddr = oldRreq->srcAddr;
+    newRreq->srcSeq = oldRreq->srcSeq;
+    newRreq->lastAddr = node->nodeAddr;
+    newRreq->hopCount = oldRreq->hopCount + 1;
+
+    delay = pc_erand(node->seed) * BROADCAST_JITTER;
+
+    NetworkIpSendRawGlomoMessageWithDelay(
+                   node, newMsg, ANY_DEST, CONTROL, IPPROTO_AODV, ttl, delay);
+
+    aodv->stats.numRequestSent++;
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingAodvRelayRREQ */
+
+/*
+ * RoutingAodvInitiateRREP
+ *
+ * Destination of the route sends RREP in reaction to RREQ
+ */
+void RoutingAodvInitiateRREP(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *)ipLayer->routingProtocol;
+    Message *newMsg;
+    AODV_RREQ_Packet *rreqPkt;
+    AODV_RREP_Packet *rrepPkt;
+    char *pktPtr;
+    int pktSize = sizeof(AODV_RREP_Packet);
+    int seq;
+
+    rreqPkt = (AODV_RREQ_Packet *) GLOMO_MsgReturnPacket(msg);
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rrepPkt = (AODV_RREP_Packet *) pktPtr;
+
+    rrepPkt->pktType = AODV_RREP;
+    rrepPkt->srcAddr = rreqPkt->srcAddr;
+    rrepPkt->destAddr = node->nodeAddr;
+    seq = RoutingAodvGetMySeq(node);
+    if (seq >= rreqPkt->destSeq)
+    {
+        rrepPkt->destSeq = seq;
+    }
+    else
+    {
+        rrepPkt->destSeq = rreqPkt->destSeq;
+        RoutingAodvIncreaseSeq(node);
+    }
+    rrepPkt->hopCount = 1;
+    rrepPkt->lifetime = (clocktype)MY_ROUTE_TO;
+
+    NetworkIpSendRawGlomoMessageToMacLayer(
+        node, newMsg, rreqPkt->lastAddr, CONTROL, IPPROTO_AODV, 1,
+        DEFAULT_INTERFACE, rreqPkt->lastAddr);
+
+    aodv->stats.numReplySent++;
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingAodvInitiateRREP */
+
+/*
+ * RoutingAodvInitiateRREPbyIN
+ *
+ * An intermediate node that knows the route to the destination sends the RREP
+ */
+void RoutingAodvInitiateRREPbyIN(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *)ipLayer->routingProtocol;
+    Message *newMsg;
+    AODV_RREQ_Packet *rreqPkt;
+    AODV_RREP_Packet *rrepPkt;
+    char *pktPtr;
+    int pktSize = sizeof(AODV_RREP_Packet);
+    int seq;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rrepPkt = (AODV_RREP_Packet *) pktPtr;
+
+    rreqPkt = (AODV_RREQ_Packet *) GLOMO_MsgReturnPacket(msg);
+
+    rrepPkt->pktType = AODV_RREP;
+    rrepPkt->srcAddr = rreqPkt->srcAddr;
+    rrepPkt->destAddr = rreqPkt->destAddr;
+    rrepPkt->destSeq = RoutingAodvGetSeq(rreqPkt->destAddr, &aodv->routeTable);
+    rrepPkt->lifetime = RoutingAodvGetLifetime(
+                            rreqPkt->destAddr, &aodv->routeTable) - simclock();
+    rrepPkt->hopCount =  RoutingAodvGetHopCount(
+                             rreqPkt->destAddr, &aodv->routeTable) + 1;
+
+    NetworkIpSendRawGlomoMessageToMacLayer(
+        node, newMsg, rreqPkt->lastAddr, CONTROL, IPPROTO_AODV, 1,
+        DEFAULT_INTERFACE, rreqPkt->lastAddr);
+
+    aodv->stats.numReplySent++;
+
+    GLOMO_MsgFree(node, msg);
+} /* RoutingAodvInitiateRREPbyIN */
+
+/*
+ * RoutingAodvRelayRREP
+ *
+ * Forward the RREP packet
+ */
+void RoutingAodvRelayRREP(GlomoNode *node, Message *msg, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingAodv* aodv = (GlomoRoutingAodv *) ipLayer->routingProtocol;
+    Message *newMsg;
+    AODV_RREP_Packet *oldRrep;
+    AODV_RREP_Packet *newRrep;
+    char *pktPtr;
+    NODE_ADDR nextHop;
+    clocktype lifetime;
+    int pktSize = sizeof(AODV_RREP_Packet);
+
+    oldRrep = (AODV_RREP_Packet *) GLOMO_MsgReturnPacket(msg);
+
+    memmove(&lifetime, &oldRrep->lifetime, sizeof(clocktype));
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    newRrep = (AODV_RREP_Packet *) pktPtr;
+
+    newRrep->pktType = oldRrep->pktType;
+    newRrep->srcAddr = oldRrep->srcAddr;
+    newRrep->destAddr = oldRrep->destAddr;
+    newRrep->destSeq = oldRrep->destSeq;
+    newRrep->hopCount = oldRrep->hopCount + 1;
+    newRrep->lifetime = lifetime;
+    
+    if (destAddr == ANY_DEST)
+    {
+        NetworkIpSendRawGlomoMessage(
+            node, newMsg, ANY_DEST, CONTROL, IPPROTO_AODV, 1);
+    }
+    else
+    {
+        nextHop = RoutingAodvGetNextHop(oldRrep->srcAddr, &aodv->routeTable);
+
+        if (nextHop != ANY_DEST)
+        {
+            NetworkIpSendRawGlomoMessageToMacLayer(
+                node, newMsg, nextHop, CONTROL, IPPROTO_AODV, 1,
+                DEFAULT_INTERFACE, nextHop);
+        }
+    }
+
+    aodv->stats.numReplySent++;
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingAodvRelayRREP */
+
+

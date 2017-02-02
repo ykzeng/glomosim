@@ -1,0 +1,320 @@
+# Glomosim is COPYRIGHTED software.  It is freely available without fee for
+# education, or research, or to non-profit agencies. No cost evaluation
+# licenses are available for commercial users. By obtaining copies of this
+# and other files that comprise GloMoSim, you, the Licensee, agree to abide
+# by the following conditions and understandings with respect to the
+# copyrighted software:
+#
+# 1.Permission to use, copy, and modify this software and its documentation
+#   for education, research, and non-profit purposes is hereby granted to
+#   Licensee, provided that the copyright notice, the original author's names
+#   and unit identification, and this permission notice appear on all such
+#   copies, and that no charge be made for such copies. Any entity desiring
+#   permission to incorporate this software into commercial products or to use
+#   it for commercial purposes should contact: 
+#
+#   Professor Rajive Bagrodia 
+#   University of California, Los Angeles 
+#   Department of Computer Science 
+#   Box 951596 
+#   3532 Boelter Hall 
+#   Los Angeles, CA 90095-1596 
+#   rajive@cs.ucla.edu
+#
+# 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+#   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+#
+# 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+#   affiliate of the UC system shall be liable for any damages suffered by
+#   Licensee from the use of this software.
+#
+# $Id: config.in,v 1.32 2001/04/12 18:35:00 jmartin Exp $
+#
+# Anything following a "#" is treated as a comment.
+#
+###############################################################################
+#
+# The folowing parameter represents the maximum simulation time. The numberd
+# portion can be followed by optional letters to modify the simulation time.
+# For example:
+#        100NS   - 100 nano-seconds
+#        100MS   - 100 milli-seconds
+#        100S    - 100 seconds
+#        100     - 100 seconds (default case)
+#        100M    - 100 minutes
+#        100H    - 100 hours
+#        100D    - 100 days
+#
+
+SIMULATION-TIME     30M
+
+#
+# The following is a random number seed used to initialize  part of the seed of
+# various randomly generated numbers in the simulation. This can be used to vary
+# the seed of the simulation to see the consistency of the results of the
+# simulation.
+#
+
+SEED                1
+
+#
+# The following two parameters stand for the physical terrain in which the nodes
+# are being simulated. For example, the following represents an area of size 100
+# meters by 100 meters. All range parameters are in terms of meters.
+#
+# Terrain Area we are simulating.
+#
+
+TERRAIN-DIMENSIONS  (800, 700)
+
+#
+# The following parameter represents the number of nodes being simulated.
+#
+NUMBER-OF-NODES     50
+#
+#
+#The following parameter represents the node placement strategy.
+#- RANDOM: Nodes are placed randomly within the physical terrain.
+#- UNIFORM: Based on the number of nodes in the simulation, the physical
+#  terrain is divided into a number of cells. Within each cell, a node is
+#  placed randomly.
+#- GRID: Node placement starts at (0, 0) and are placed in grid format with
+#  each node GRID-UNIT away from its neighbors. The number of nodes has to be
+#  square of an integer.
+#- FILE: Position of nodes is read from NODE-PLACEMENT-FILE. On each line of
+#  the file, the x and y position of a single node is separated by a space.
+#
+
+# NODE-PLACEMENT      FILE
+# NODE-PLACEMENT-FILE ./nodes.input
+# NODE-PLACEMENT      GRID
+# GRID-UNIT           30  
+# NODE-PLACEMENT      RANDOM
+NODE-PLACEMENT      UNIFORM
+
+#
+# The following represent parameters for mobility. If MOBILITY is set to NO,
+# than there is no movement of nodes in the model. For the RANDOM-DRUNKEN model,
+# if a node is currently at position (x, y), it can possibly move to (x-1, y),
+# (x+1, y), (x, y-1), and (x, y+1); as long as the new position is within the
+# physical terrain. For random waypoint, a node randomly selects a destination
+# from the physical terrain. It moves in the direction of the destination in 
+# a speed uniformly chosen between MOBILITY-WP-MIN-SPEED and 
+# MOBILITY-WP-MAX-SPEED (meter/sec). After it reaches its
+# destination, the node stays there for MOBILITY-WP-PAUSE time period.
+# The MOBILITY-INTERVAL is used in some models that a node updates its position
+# every MOBILITY-INTERVAL time period. The MOBILITY-D-UPDATE is used that a node 
+# updates its position based on the distance (in meters).
+#
+
+#MOBILITY  NONE
+
+# Random Waypoint and its required parameters.
+
+MOBILITY RANDOM-WAYPOINT
+MOBILITY-WP-PAUSE       30S
+MOBILITY-WP-MIN-SPEED   5
+MOBILITY-WP-MAX-SPEED   10
+
+#MOBILITY TRACE
+#MOBILITY-TRACE-FILE ./mobility.in
+
+#MOBILITY PATHLOSS-MATRIX
+
+# The following parameters are necessary for all the mobility models
+
+MOBILITY-POSITION-GRANULARITY 0.5
+
+#####################################################################
+#
+# PROPAGATION-LIMIT:
+#   Signals with powers below PROPAGATION-LIMIT (in dBm)
+#   are not delivered. This value must be smaller than
+#   RADIO-RX-SENSITIVITY + RADIO-ANTENNA-GAIN of any node
+#   in the model. Otherwise, simulation results may be
+#   incorrect. Lower value should make the simulation more
+#   precise, but it also make the execution time longer.
+# 
+PROPAGATION-LIMIT      -111.0
+
+#
+# PROPAGATION-PATHLOSS: pathloss model
+#   FREE-SPACE:
+#     Friss free space model.
+#     (path loss exponent, sigma) = (2.0, 0.0)
+#   TWO-RAY:
+#     Two ray model. It uses free space path loss
+#     (2.0, 0.0) for near sight and plane earth
+#     path loss (4.0, 0.0) for far sight. The antenna
+#     height is hard-coded in the model (1.5m).
+#   PATHLOSS-MATRIX:
+#
+#PROPAGATION-PATHLOSS   FREE-SPACE
+PROPAGATION-PATHLOSS   TWO-RAY
+#PROPAGATION-PATHLOSS   PATHLOSS-MATRIX
+
+#
+# NOISE-FIGURE: noise figure
+#
+NOISE-FIGURE    10.0
+
+#
+# TEMPARATURE: temparature of the environment (in K)
+#
+TEMPARATURE     290.0
+
+
+#########################################
+#
+# RADIO-TYPE: radio model to transmit and receive packets
+#   RADIO-ACCNOISE: standard radio model
+#   RADIO-NONOISE: abstract radio model
+#   (RADIO-NONOISE is compatible with the current version (2.1b5)
+#    of ns-2 radio model)
+#
+RADIO-TYPE              RADIO-ACCNOISE
+#RADIO-TYPE              RADIO-NONOISE
+
+#
+# RADIO-FREQUENCY: frequency (in heltz)  (Identifying variable for multiple
+#  radios)
+#
+RADIO-FREQUENCY     2.4e9
+
+#
+# RADIO-BANDWIDTH: bandwidth (in bits per second)
+#
+RADIO-BANDWIDTH     2000000
+
+#
+# RADIO-RX-TYPE: packet reception model
+#   SNR-BOUNDED:
+#     If the Signal to Noise Ratio (SNR) is more than
+#     RADIO-RX-SNR-THRESHOLD (in dB), it receives the signal
+#     without error. Otherwise the packet is dropped.
+#     RADIO-RX-SNR-THRESHOLD needs to be specified.
+#   BER-BASED:
+#     It looks up Bit Error Rate (BER) in the SNR - BER table
+#     specified by BER-TABLE-FILE.
+#
+RADIO-RX-TYPE           SNR-BOUNDED
+RADIO-RX-SNR-THRESHOLD  10.0
+#RADIO-RX-SNR-THRESHOLD  8.49583
+
+#RADIO-RX-TYPE           BER-BASED
+#BER-TABLE-FILE          ./ber_bpsk.in
+
+#
+# RADIO-TX-POWER: radio transmition power (in dBm)
+#
+RADIO-TX-POWER        8.0
+
+#
+# RADIO-ANTENNA-GAIN: antenna gain (in dB)
+#
+RADIO-ANTENNA-GAIN  0.0
+
+#
+# RADIO-RX-SENSITIVITY: sensitivity of the radio (in dBm)
+#
+RADIO-RX-SENSITIVITY -91.0
+
+#
+# RADIO-RX-THRESHOLD: Minimum power for received packet (in dBm)
+#
+RADIO-RX-THRESHOLD -81.0
+
+#
+##############################
+#
+
+MAC-PROTOCOL        802.11
+#MAC-PROTOCOL        CSMA
+#MAC-PROTOCOL        MACA
+
+#MAC-PROTOCOL        TSMA
+#TSMA-MAX-NODE-DEGREE      8
+
+#MAC-PROPAGATION-DELAY 1000NS
+
+#
+# PROMISCUOUS-MODE defaults to YES and is necessary if nodes want
+# to overhear packets destined to the neighboring node. 
+# Currently this option needs to be set to YES only for DSR is selected
+# as routing protocol.  Setting it to "NO" may save a trivial amount
+# of time for other protocols.
+
+#PROMISCUOUS-MODE     NO
+
+##############################
+# 
+# Currently the only choice.
+
+NETWORK-PROTOCOL    IP
+NETWORK-OUTPUT-QUEUE-SIZE-PER-PRIORITY 100
+
+#RED-MIN-QUEUE-THRESHOLD 150
+#RED-MAX-QUEUE-THRESHOLD 200
+#RED-MAX-MARKING-PROBABILITY 0.1
+#RED-QUEUE-WEIGHT .0001
+#RED-TYPICAL-PACKET-TRANSMISSION-TIME 64000NS
+
+
+##############################
+#
+
+
+#ROUTING-PROTOCOL    BELLMANFORD
+#ROUTING-PROTOCOL    AODV
+#ROUTING-PROTOCOL    DSR
+#ROUTING-PROTOCOL    LAR1
+#ROUTING-PROTOCOL    WRP
+
+#ROUTING-PROTOCOL    ZRP
+#ZONE-RADIUS         2
+
+#ROUTING-PROTOCOL    STATIC
+#STATIC-ROUTE-FILE   ROUTES.IN
+
+ROUTING-PROTOCOL    FISHEYE
+FISHEYE-FILE        FISHEYEConfig
+#
+# The following is used to setup applications such as FTP and Telnet.
+# The file will need to contain parameters that will be use to
+# determine connections and other characteristics of the particular 
+# application.
+#
+
+
+APP-CONFIG-FILE   ./cbr.conf
+
+
+#
+# The following parameters determine if you are interested in the statistics of
+# a a single or multiple layer. By specifying the following parameters as YES,
+# the simulation will provide you with statistics for that particular layer. All
+# the statistics are compiled together into a file called "GLOMO.STAT" that is
+# produced at the end of the simulation. If you need the statistics for a
+# particular node or particular protocol, it is easy to do the filtering. Every
+# single line in the file is of the following format:
+# Node:      9, Layer:  RadioNoCapture, Total number of collisions is 0
+#
+
+APPLICATION-STATISTICS          YES
+TCP-STATISTICS                  NO
+UDP-STATISTICS                  NO
+ROUTING-STATISTICS              NO
+NETWORK-LAYER-STATISTICS        NO
+MAC-LAYER-STATISTICS            NO
+RADIO-LAYER-STATISTICS          NO 
+CHANNEL-LAYER-STATISTICS        NO 
+MOBILITY-STATISTICS             NO 
+
+#
+#
+# GUI-OPTION: YES allows GloMoSim to communicate with the Java Gui Vis Tool 
+#             NO does not
+
+GUI-OPTION   NO
+GUI-RADIO    NO
+GUI-ROUTING  NO

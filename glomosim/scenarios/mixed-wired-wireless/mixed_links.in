@@ -1,0 +1,13 @@
+#
+# File for the wired link definition
+#
+# Format: nodeAddr1 nodeAddr2 bandwidth1 propDelay1 [bandwidth2 propDelay2]
+#   Each link is bidirectional, and the bandwidth is
+#   specified in bits per second. The optional parameters
+#   are specified if the direction from nodeAddr2 to
+#   nodeAddr1 has a different bandwidth or propagation
+#   delay.
+#
+0 3 2000000 1MS
+
+

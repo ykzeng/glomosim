@@ -1,0 +1,468 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: ftp_server.pc,v 1.15 2001/02/15 03:17:26 mineo Exp $
+ *
+ * This file contains initialization function, message processing
+ * function, and finalize function used by ftp server. 
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h> 
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+
+#include "application.h"
+#include "app_util.h"
+#include "ftp_server.h"
+#include "tcpapps.h"
+#include "tcp.h"
+
+#define noDEBUG
+
+
+/*
+ * NAME:        AppLayerFtpServer.
+ * PURPOSE:     Models the behaviour of Ftp Server on receiving the
+ *              message encapsulated in msg.
+ * PARAMETERS:  nodePtr - pointer to the node which received the message.
+ *              msg - message received by the layer
+ * RETURN:      none.
+ */
+void 
+AppLayerFtpServer(GlomoNode *nodePtr, Message *msg)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    GlomoAppFtpServer *serverPtr;
+
+    ctoa(simclock(), buf);
+
+    switch(msg->eventType) 
+    {  
+        case MSG_APP_FromTransListenResult: 
+        {
+            TransportToAppListenResult *listenResult;
+
+            listenResult = (TransportToAppListenResult *) msg->info;
+ 
+            #ifdef DEBUG
+                printf("FTP Server: Node %ld at %s got listenResult\n",
+                        nodePtr->nodeAddr, buf);
+            #endif
+
+            if (listenResult->connectionId == -1)
+            {
+                nodePtr->appData.numAppTcpFailure++;
+            }
+
+            break;
+        }
+
+        case MSG_APP_FromTransOpenResult: 
+        {
+            TransportToAppOpenResult *openResult;
+            openResult = (TransportToAppOpenResult *) msg->info;
+ 
+            #ifdef DEBUG
+                printf("FTP Server: Node %ld at %s got OpenResult\n", 
+                        nodePtr->nodeAddr, buf);
+            #endif
+
+            assert(openResult->type == TCP_CONN_PASSIVE_OPEN);
+
+            if (openResult->connectionId < 0)
+            {
+                nodePtr->appData.numAppTcpFailure++;
+            }
+            else 
+            {
+                GlomoAppFtpServer *serverPtr; 
+                serverPtr = AppFtpServerNewFtpServer(nodePtr, openResult);
+                assert(serverPtr != NULL);
+            }
+
+            break;
+        }
+
+        case MSG_APP_FromTransDataSent:
+        {
+            TransportToAppDataSent *dataSent;
+
+            dataSent = (TransportToAppDataSent *) msg->info;
+        
+            #ifdef DEBUG
+                printf("FTP Server Node %ld at %s sent data %ld\n", 
+                        nodePtr->nodeAddr, buf, dataSent->length); 
+            #endif
+
+            serverPtr = AppFtpServerGetFtpServer(nodePtr, 
+                                     dataSent->connectionId);
+
+            assert(serverPtr != NULL);
+
+            serverPtr->numBytesSent += dataSent->length;
+
+            break;
+        }
+
+        case MSG_APP_FromTransDataReceived: 
+        {
+            TransportToAppDataReceived *dataRecvd;
+            char *packet;
+
+            dataRecvd = (TransportToAppDataReceived *) GLOMO_MsgReturnInfo(msg);
+
+            packet = GLOMO_MsgReturnPacket(msg);
+
+            #ifdef DEBUG
+                printf("FTP Server: Node %ld at %s received data size %d\n", 
+                        nodePtr->nodeAddr, buf, GLOMO_MsgReturnPacketSize(msg));
+            #endif
+
+            serverPtr = AppFtpServerGetFtpServer(nodePtr, 
+                                                 dataRecvd->connectionId);
+
+            assert(serverPtr != NULL);
+            assert(serverPtr->sessionIsClosed == FALSE);
+
+            serverPtr->numBytesRecvd += GLOMO_MsgReturnPacketSize(msg);
+
+            /* 
+             * Test if the received data contains the last byte 
+             * of an item.  If so, send a response packet back.
+             * If the data contains a 'c', close the connection.
+             */
+            if (packet[msg->packetSize - 1] == 'd') 
+            {
+                /* Do nothing since item is not completely received yet. */
+            }
+            else if (packet[msg->packetSize - 1] == 'e') 
+            {
+                /* Item completely received, now send control info. */
+                AppFtpServerSendCtrlPkt(nodePtr, serverPtr); 
+            } 
+            else if (packet[msg->packetSize - 1] == 'c') 
+            {
+                /* 
+                 * Client wants to close the session, so server also
+                 * initiates a close.
+                 */
+                AppTcpCloseConnection(nodePtr, TRANSPORT_PROTOCOL_TCP, 
+                                      serverPtr->connectionId);
+
+                serverPtr->sessionFinish = simclock();
+                serverPtr->sessionIsClosed = TRUE;
+            }
+            else
+            {
+               assert(0);
+            }
+
+            break;
+        }
+    
+        case MSG_APP_FromTransCloseResult:
+        {
+            TransportToAppCloseResult *closeResult;
+
+            closeResult = (TransportToAppCloseResult *) msg->info;
+
+            #ifdef DEBUG
+                printf("FTP Server: Node %ld at %s got close result\n", 
+                        nodePtr->nodeAddr, buf);
+            #endif
+
+            serverPtr = AppFtpServerGetFtpServer(nodePtr, 
+                                                 closeResult->connectionId);
+            assert(serverPtr != NULL);
+
+            if (serverPtr->sessionIsClosed == FALSE) 
+            {
+                serverPtr->sessionIsClosed = TRUE;
+                serverPtr->sessionFinish = simclock();
+            }
+
+            break;
+        }
+    
+        default:
+            ctoa(simclock(), buf);
+            printf("FTP Server: Node %u at time %s received "
+                   "message of unknown type"
+                   " %ld.\n", nodePtr->nodeAddr, buf, msg->eventType);
+            assert(FALSE);
+    }
+
+    GLOMO_MsgFree(nodePtr, msg);
+}
+
+
+/*
+ * NAME:        AppFtpServerInit. 
+ * PURPOSE:     listen on Ftp server port. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ * RETURN:      none. 
+ */
+void
+AppFtpServerInit(GlomoNode *nodePtr)
+{
+    AppTcpServerListen(nodePtr, 
+                       TRANSPORT_PROTOCOL_TCP, 
+                       APP_FTP_SERVER,
+                       nodePtr->nodeAddr, 
+                       (short)APP_FTP_SERVER);
+}
+
+
+/*
+ * NAME:        AppFtpServerPrintStats. 
+ * PURPOSE:     Prints statistics of a Ftp session. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              serverPtr - pointer to the ftp server data structure. 
+ * RETURN:      none. 
+ */
+static void
+AppFtpServerPrintStats(GlomoNode *nodePtr, GlomoAppFtpServer *serverPtr)
+{
+    clocktype throughput;
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    char startStr[GLOMO_MAX_STRING_LENGTH];
+    char closeStr[GLOMO_MAX_STRING_LENGTH];
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    char throughputStr[GLOMO_MAX_STRING_LENGTH];
+
+    ctoa(serverPtr->sessionStart, startStr);
+
+    if (serverPtr->sessionIsClosed == FALSE) 
+    {
+        serverPtr->sessionFinish = simclock();
+        ctoa(simclock(), clockStr);
+        sprintf(closeStr, "%s ns (not closed)", clockStr);
+    } 
+    else 
+    {
+        ctoa(serverPtr->sessionFinish, clockStr);
+        sprintf(closeStr, "%s ns (closed)", clockStr);
+    }
+
+    if (serverPtr->sessionFinish <= serverPtr->sessionStart) 
+    {
+        throughput = 0; 
+    } 
+    else 
+    {
+        throughput = (serverPtr->numBytesRecvd * 8.0 * SECOND) /
+                     (serverPtr->sessionFinish - serverPtr->sessionStart);
+    }
+
+    ctoa(throughput, throughputStr);
+
+    sprintf(buf, "from %ld to %ld (cid = %d), start = %s, end = %s "
+            "bytes sent = %ld B, bytes recv = %ld B, throughput = %s bps",
+            serverPtr->remoteAddr, serverPtr->localAddr, 
+            serverPtr->connectionId, startStr, closeStr,
+            serverPtr->numBytesSent, serverPtr->numBytesRecvd,
+            throughputStr);
+
+    GLOMO_PrintStat(nodePtr, "AppFtpServer", buf);
+}
+
+/*
+ * NAME:        AppFtpServerFinalize. 
+ * PURPOSE:     Collect statistics of a Ftp session. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              serverPtr - pointer to the ftp server data structure. 
+ * RETURN:      none. 
+ */
+void
+AppFtpServerFinalize(GlomoNode *nodePtr, GlomoAppFtpServer *serverPtr)
+{
+    if (nodePtr->appData.appStats == TRUE)
+    {
+        AppFtpServerPrintStats(nodePtr, serverPtr);
+    }
+}
+
+
+
+/*
+ * NAME:        AppFtpServerGetFtpServer.
+ * PURPOSE:     search for a ftp server data structure. 
+ * PARAMETERS:  appList - link list of applications, 
+ *              connId - connection ID of the ftp server. 
+ * RETURN:      the pointer to the ftp server data structure,
+ *              NULL if nothing found.
+ */
+static GlomoAppFtpServer *
+AppFtpServerGetFtpServer(GlomoNode *nodePtr, int connId)
+{
+    AppInfo *appList = nodePtr->appData.appPtr;
+    GlomoAppFtpServer *ftpServer;
+    
+    for (; appList != NULL; appList = appList->appNext) 
+    {
+        if (appList->appType == APP_FTP_SERVER)
+        {
+            ftpServer = (GlomoAppFtpServer *) appList->appDetail;
+
+            if (ftpServer->connectionId == connId)
+            {
+                return ftpServer;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+
+/*
+ * NAME:        AppFtpServerNewFtpServer.
+ * PURPOSE:     create a new ftp server data structure, place it
+ *              at the beginning of the application list. 
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              openResult - result of the open request. 
+ * RETRUN:      the pointer to the created ftp server data structure,
+ *              NULL if no data structure allocated. 
+ */
+static GlomoAppFtpServer *
+AppFtpServerNewFtpServer(GlomoNode *nodePtr, 
+                         TransportToAppOpenResult *openResult)
+{
+    AppInfo *newApp;
+    GlomoAppFtpServer *ftpServer;
+
+    newApp = (AppInfo *) pc_malloc(sizeof(AppInfo));
+
+    if (newApp == NULL) 
+    {
+        assert(FALSE);
+    }
+
+    ftpServer = (GlomoAppFtpServer *) pc_malloc(sizeof(GlomoAppFtpServer));
+
+    if (ftpServer == NULL) 
+    {
+        printf("FTP Server: Node %ld cannot allocate memory for ftp server\n",
+                nodePtr->nodeAddr);
+        assert(FALSE);
+    }
+
+    /*
+     * fill in connection id, etc.
+     */
+    newApp->appType = APP_FTP_SERVER;
+    ftpServer->connectionId = openResult->connectionId;
+    ftpServer->localAddr = openResult->localAddr;
+    ftpServer->remoteAddr = openResult->remoteAddr;
+    ftpServer->sessionStart = simclock();
+    ftpServer->sessionFinish = simclock(); 
+    ftpServer->sessionIsClosed = FALSE; 
+    ftpServer->numBytesSent = 0;
+    ftpServer->numBytesRecvd = 0;
+
+    newApp->appDetail = ftpServer;
+    newApp->appNext = nodePtr->appData.appPtr; 
+    nodePtr->appData.appPtr = newApp;
+    ftpServer->seed[0] = nodePtr->initialSeedValue[0] + ftpServer->connectionId;
+    ftpServer->seed[1] = nodePtr->initialSeedValue[1] + openResult->remoteAddr;
+    ftpServer->seed[2] = nodePtr->initialSeedValue[2];
+    
+
+    return ftpServer;
+}
+
+
+
+/*
+ * NAME:        AppFtpServerSendCtrlPkt.
+ * PURPOSE:     call AppFtpCtrlPktSize() to get the response packet 
+ *              size, and send the packet. 
+ * PARAMETERS:  nodePtr - pointer to the node, 
+ *              serverPtr - pointer to the server data structure. 
+ * RETRUN:      none. 
+ */
+static void
+AppFtpServerSendCtrlPkt(GlomoNode *nodePtr, GlomoAppFtpServer *serverPtr)
+{
+    int pktSize;
+    char payload[MAX_APP_DATA_UNIT];
+
+    pktSize = AppFtpServerCtrlPktSize(serverPtr);
+
+    memset(payload, 'd', MAX_APP_DATA_UNIT);
+
+    if (pktSize > MAX_APP_DATA_UNIT) 
+    {
+        /*
+         * Control packet size is larger than MAX_APP_DATA_UNIT,
+         * set it to MAX_APP_DATA_UNIT. This should be rare.
+         */
+        pktSize = MAX_APP_DATA_UNIT;
+    }
+
+    AppTcpSendData(nodePtr, TRANSPORT_PROTOCOL_TCP, serverPtr->connectionId, 
+                   payload, pktSize);
+}
+
+/*
+ * NAME:        AppFtpServerCtrlPktSize.
+ * PURPOSE:     call tcplib function ftp_ctlsize().
+ * PARAMETERS:  nodePtr - pointer to the node.
+ * RETRUN:      ftp control packet size.
+ */
+int 
+AppFtpServerCtrlPktSize(GlomoAppFtpServer *serverPtr)
+{
+    int ctrlPktSize;
+    ctrlPktSize = ftp_ctlsize(serverPtr->seed);
+  
+    #ifdef DEBUG
+        printf("FTP: Node %ld ftp control pktsize = %d\n", 
+                nodePtr->nodeAddr, ctrlPktSize);
+    #endif
+
+    return (ctrlPktSize);
+}
+

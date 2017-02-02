@@ -1,0 +1,173 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+
+#include "api.h"
+#include "fileio.h"
+#include "structmsg.h"
+#include "propagation.h"
+#include "pathloss_free_space.h"
+#include "pathloss_two_ray.h"
+#include "pathloss_matrix.h"
+#include "radio.h"
+#include "radio_accnoise.h"
+
+#define LONGEST_DISTANCE 1000000.0  // 1000km
+#define DELTA            0.001      // 1mm
+#define PACKET_SIZE      (1024 * 8) // 1kbytes
+#define RADIO_NUMBER   0
+
+entity driver(int argc, char **argv) {
+    GlomoNodeInput nodeInput;
+    GlomoProp  propDataNew;
+    GlomoNode  nodeNew;
+    PropInfo   propInfo;
+    int        radioNumber = RADIO_NUMBER;
+    GlomoRadio *thisRadio;
+
+    GlomoRadioAccnoise   *accnoise;
+    double rxAntennaGain_dB;
+    double txAntennaGain_dB;
+    double rxAntennaHeight;
+    double txAntennaHeight;
+    double noiseLevel_mW;
+    double distanceReachable = 0.0;
+    double distanceNotReachable = LONGEST_DISTANCE;
+    double distance = distanceNotReachable;
+    double pathloss_dB;
+
+    GLOMO_ReadFile(&nodeInput, argv[1]);
+
+    nodeNew.id = 0;
+    nodeNew.nodeAddr = 0;
+    GLOMO_NetworkPreInit(&nodeNew, &nodeInput);
+    GLOMO_GlobalPropInit(&propDataNew, &nodeInput);
+    GLOMO_PropInit(&nodeNew, &propDataNew);
+    GLOMO_RadioInit(&nodeNew, &nodeInput);
+    GLOMO_MacInit(&nodeNew, &nodeInput);
+
+    thisRadio = nodeNew.radioData[radioNumber];
+
+    propInfo.txAddr = nodeNew.nodeAddr;
+    propInfo.txPower_dBm = thisRadio->txPower_dBm;
+    propInfo.wavelength = thisRadio->wavelength;
+
+    accnoise = (GlomoRadioAccnoise *)thisRadio->radioVar;
+    
+    txAntennaGain_dB = thisRadio->antennaGain_dB;
+    txAntennaHeight = thisRadio->antennaHeight;
+    rxAntennaGain_dB = thisRadio->antennaGain_dB;
+    rxAntennaHeight = thisRadio->antennaHeight;
+    noiseLevel_mW = accnoise->noisePower_mW;
+
+    while (distanceNotReachable - distanceReachable > DELTA) {
+        BOOL   reachable;
+
+        switch (propDataNew.pathlossModel) {
+            case FREE_SPACE: {
+                pathloss_dB = PathlossFreeSpace(distance,
+                                                thisRadio->wavelength,
+                                                txAntennaGain_dB,
+                                                rxAntennaGain_dB);
+                break;
+            }
+            case TWO_RAY: {
+                pathloss_dB = PathlossTwoRay(distance,
+                                             thisRadio->wavelength,
+                                             txAntennaGain_dB,
+                                             txAntennaHeight,
+                                             rxAntennaGain_dB,
+                                             rxAntennaHeight);
+                break;
+            }
+            case PATHLOSS_MATRIX: {
+                assert(FALSE);
+                break;
+            }
+            default: {
+                assert(FALSE); abort();
+            }
+        }
+
+        propInfo.rxPower_mW = NON_DB(propInfo.txPower_dBm - pathloss_dB);
+
+        if (accnoise->radioRxType == BER_BASED) {
+            double BER, PER;
+
+            BER = GLOMO_PropBER(&nodeNew, propInfo.rxPower_mW,
+                                noiseLevel_mW);
+
+            PER = 1.0 - pow((1.0 - BER), (double)PACKET_SIZE);
+
+            if (PER <= 0.5) {
+                reachable = TRUE;
+            }
+            else {
+                reachable = FALSE;
+            }
+        }
+        else {
+            assert(accnoise->radioRxType == SNR_BOUNDED);
+
+            if (propInfo.rxPower_mW >= thisRadio->rxThreshold_mW) {
+                reachable = TRUE;
+            }
+            else {
+                reachable = FALSE;
+            }
+        }
+
+        if (reachable == TRUE) {
+            distanceReachable = distance;
+            distance += (distanceNotReachable - distanceReachable) / 2.0;
+        }
+        else {
+            assert(reachable == FALSE);
+
+            distanceNotReachable = distance;
+            distance -= (distanceNotReachable - distanceReachable) / 2.0;
+        }
+    }
+    printf("radio range: %.3lfm\n", distanceReachable);
+}
+
+

@@ -1,0 +1,4 @@
+This directory demonstrates how to set up a 10 x 10 grid topology of 100
+nodes with FTP traffic (from tcplib) from node 3 to node 93, 
+node 6 to node 96, node 30 to node 39 and node 60 to node 69.
+

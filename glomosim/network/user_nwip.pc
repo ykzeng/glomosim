@@ -1,0 +1,171 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+//------------------------------------------------------------------------
+//
+// File: user_nwip.pc
+// By: Jay Martin (jmartin@cs.ucla.edu) 
+// Objectives: Provide simple skeletion routines so that users can
+//             more easily hook their protocols into GloMoSim without
+//             modifying the "nwip.pc" file itself.
+//
+//             This file should not change in the GloMoSim distribution
+//             and should replaced by the user modified file after each
+//             GloMoSim update.
+//
+//------------------------------------------------------------------------
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "ip.h"
+#include "nwip.h"
+
+
+
+// The Ip Protocol is 0..255, and must be different than the GloMoSim
+// values for IP protocols (some standard, some arbitrarily picked).
+// "IPPROTO_" is the current prefix for these numbers in GloMoSim.
+
+#define USER_DEFINED_IP_PROTOCOL_NUMBER 123
+
+// The GLOMOSIM protocol number is a "unsigned short" that must be
+// unique within the layers.  So pick a random one to get near zero
+// probability of conflict. 
+
+#define USER_DEFINED_GLOMOSIM_PROTOCOL_NUMBER 123
+
+
+
+void NetworkIpUserProtocolInit(
+   GlomoNode *node,
+   const GlomoNodeInput *nodeInput,
+   const char* routingProtocolString, 
+   NetworkRoutingProtocolType* routingProtocolChoice,
+   void** routingProtocolData)
+{
+   if (strcmp(routingProtocolString, "USER-DEFINED-PROTOCOL") == 0) {
+      *routingProtocolChoice = USER_DEFINED_GLOMOSIM_PROTOCOL_NUMBER;
+      
+      // Put function to create your datastructures and 
+      // initialize your protocol here.  For Example,
+           
+      // YourRoutingProtocolInit(node, nodeInput, 
+      //    (YourType**)routingProtocolData);
+   }
+   else {
+      fprintf(stderr, "CONFIG.IN Error: Unknown Routing ProtocolType "
+              "Type %s.\n", routingProtocolString);
+      assert(FALSE); abort();
+   }
+}
+
+
+void NetworkIpUserHandleProtocolEvent(GlomoNode* node, Message* msg) {
+   switch (msg->protocolType) {
+   case USER_DEFINED_GLOMOSIM_PROTOCOL_NUMBER: {
+   
+      // Put function to handle GlomoSim Events for your protocol here.  
+      // For Example,
+           
+      // YourRoutingProtocolEventHandler(node, msg);
+   }
+   default:
+      printf("GloMoSim: Network IP Protocol %d Not Handled\n", 
+             msg->protocolType);
+      assert(FALSE); abort();
+   }/*switch*/
+}
+
+
+void NetworkIpUserHandleProtocolPacket(
+   GlomoNode* node, 
+   Message* msg, 
+   unsigned char ipProtocol,
+   NODE_ADDR sourceAddress,
+   NODE_ADDR destinationAddress, 
+   int ttl)
+{
+   switch (ipProtocol) {
+   case USER_DEFINED_IP_PROTOCOL_NUMBER: {
+   
+      // Put function call to handle Ip protocol packets (with IP header
+      // already stripped). 
+      // For Example,
+      
+      // YourIpPacketHandlingFunction(node, msg, sourceAddress, 
+      //    destinationAddress, ttl);
+      
+      break;
+   }
+   default:
+      printf("Ip Protocol %d Not Handled\n", ipProtocol);
+      assert(FALSE); abort();
+   }/*switch*/
+}
+
+
+void NetworkIpUserProtocolFinalize(
+   GlomoNode* node, 
+   int userProtocolNumber)
+{
+   switch (userProtocolNumber) {
+   case USER_DEFINED_GLOMOSIM_PROTOCOL_NUMBER: {
+   
+      // Put function call to handle routing protocol finalization here:
+      // For Example,
+      
+      // YourFinalizationRoutine(node);
+   }
+   default:
+      printf("Glomosim Protocol %d Not Handled\n", userProtocolNumber);
+      assert(FALSE); abort();
+   }/*switch*/
+}
+
+
+
+
+

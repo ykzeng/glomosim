@@ -1,0 +1,417 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: mac.pc,v 1.12 2001/04/12 18:31:12 jmartin Exp $
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "main.h"
+#include "fileio.h"
+#include "mac.h"
+#include "propagation.h"
+
+#include "csma.h"
+#include "maca.h"
+#include "802_11.h"
+#include "tsma.h"
+#include "wiredlink.h"
+
+
+/*
+ * FUNCTION    GLOMO_MacInit
+ * PURPOSE     Initialization function for the MAC layer.
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+
+void GLOMO_MacInit(GlomoNode *node, const GlomoNodeInput* nodeInput)
+{
+   char buf[GLOMO_MAX_STRING_LENGTH];
+   char clockStr[GLOMO_MAX_STRING_LENGTH];
+   BOOL wasFound;
+   BOOL hasWired = FALSE;
+   int baseWiredInterfaceIndex = 0;
+   int bandwidthBits;
+   int retVal;
+   int interfaceIndex = 0;
+   int i;
+
+   while(TRUE) {
+      char macProtocolName[GLOMO_MAX_STRING_LENGTH];
+      char queueTypeName[GLOMO_MAX_STRING_LENGTH];
+   
+      GLOMO_ReadStringInstance(
+          node->nodeAddr, nodeInput, "MAC-PROTOCOL", interfaceIndex,
+          (interfaceIndex == 0), &wasFound, macProtocolName);
+      
+      if (!wasFound) { break; }
+      
+      
+      if (hasWired) {
+          fprintf(stderr, "WIRED should be specified only once and be last\n");
+          assert(FALSE); abort();
+      }//if//
+      
+      
+      if (strcmp(macProtocolName, "WIRED") == 0) {
+          hasWired = TRUE;
+          if (node->numberRadios > interfaceIndex) {
+              fprintf(stderr,
+                      "MAC-PROTOCOL 'WIRED' does work with radio models.\n"
+                      "Please comment out RADIO-TYPE for the corresponding "
+                      "interface.\n");
+              assert(FALSE); abort();
+          }//if//
+      } else {
+          assert(interfaceIndex < MAX_NUM_INTERFACES);
+
+          node->numberInterfaces = interfaceIndex + 1;
+          
+          node->macData[interfaceIndex] = 
+             (GlomoMac*)checked_pc_malloc(sizeof(GlomoMac));
+
+          node->macData[interfaceIndex]->interfaceIndex = interfaceIndex;
+
+          node->macData[interfaceIndex]->macStats = FALSE;
+
+          GLOMO_RadioCreateARadioForMacLayer(
+            node, nodeInput, interfaceIndex, 
+            &node->macData[interfaceIndex]->radioNumber); 
+      
+          node->macData[interfaceIndex]->bandwidth = 
+            (GLOMO_RadioGetBandwidthBits(
+               node, node->macData[interfaceIndex]->radioNumber) / 8);
+          
+          node->macData[interfaceIndex]->propDelay = MAC_PROPAGATION_DELAY;
+      
+          GLOMO_ReadTimeInstance(
+             node->nodeAddr, nodeInput, "MAC-PROPAGATION-DELAY", 
+             interfaceIndex, TRUE, &wasFound, 
+             &node->macData[interfaceIndex]->propDelay);
+          
+          NetworkIpAddNewInterfaceWithOutputQueue(
+              node, interfaceIndex, nodeInput);
+
+          GLOMO_ReadStringInstance(
+              node->nodeAddr, nodeInput, "MAC-LAYER-STATISTICS", 
+              interfaceIndex, TRUE, 
+              &wasFound, buf);
+
+          if (wasFound) {
+              if (strcmp(buf, "YES") == 0) {
+                 node->macData[interfaceIndex]->macStats = TRUE;
+              }
+              else if (strcmp(buf, "NO") != 0) {
+                 printf("GLOMO Error: Unknown Mac Layer statistics "
+                        "command (%s).\n", buf);
+                 assert(FALSE); abort();
+              }
+          }
+
+          node->macData[interfaceIndex]->promiscuousMode = TRUE;
+
+          GLOMO_ReadStringInstance(
+              node->nodeAddr, nodeInput, "PROMISCUOUS-MODE", 
+              interfaceIndex, TRUE,
+              &wasFound, buf);
+
+          if (wasFound) {
+             if (strcmp(buf, "NO") == 0) {
+                 node->macData[interfaceIndex]->promiscuousMode = FALSE;
+             }
+             else if (strcmp(buf, "YES") != 0) {
+                 printf("GLOMO Error: Unknown Mac Layer promiscuous mode "
+                        "command (%s).\n", buf);
+                 assert(FALSE); abort();
+             } 
+          }
+    
+          /*
+           * Init the Mac protocol being used.
+           */
+      
+          if (strcmp(macProtocolName, "CSMA") == 0) {
+             node->macData[interfaceIndex]->macProtocol = MAC_PROTOCOL_CSMA;
+             MacCsmaInit(node, interfaceIndex, nodeInput);
+          }
+          else if (strcmp(macProtocolName, "MACA") == 0) {
+             node->macData[interfaceIndex]->macProtocol = MAC_PROTOCOL_MACA;
+             MacMacaInit(node, interfaceIndex, nodeInput);
+          }
+          else if (strcmp(macProtocolName, "802.11") == 0) {
+             node->macData[interfaceIndex]->macProtocol = MAC_PROTOCOL_802_11;
+             Mac802_11Init(node, interfaceIndex, nodeInput);
+          }
+          else if (strcmp(macProtocolName, "TSMA") == 0) {
+             node->macData[interfaceIndex]->macProtocol = MAC_PROTOCOL_TSMA;
+             MacTsmaInit(node, interfaceIndex, nodeInput);
+          }
+          else {
+             MacInitUserMacProtocol(
+                node, nodeInput,  
+                macProtocolName, 
+                interfaceIndex);
+          }//if//
+      }//if//
+      interfaceIndex++;       
+   }/*while*/
+
+   if (hasWired) {
+       WiredLinkInit(node, nodeInput);
+   }//if//
+}
+
+
+/*
+ * FUNCTION    GLOMO_MacLayer
+ * PURPOSE     Models the behaviour of the MAC Layer on receiving the
+ *             message
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:      message received by the layer
+ */
+void GLOMO_MacLayer(GlomoNode *node, Message *msg)
+{
+   int interfaceIndex = GLOMO_MsgGetInstanceId(msg);
+
+   /*
+   * Based on the mac protocol call the appropriate function for
+   * executing the message.
+   */
+   
+   switch(node->macData[interfaceIndex]->macProtocol) {
+   case MAC_PROTOCOL_CSMA:
+      MacCsmaLayer(node, interfaceIndex, msg);
+      break;
+   case MAC_PROTOCOL_MACA:
+      MacMacaLayer(node, interfaceIndex, msg);
+      break;
+   case MAC_PROTOCOL_802_11:
+      Mac802_11Layer(node, interfaceIndex, msg);
+      break;
+   case MAC_PROTOCOL_TSMA:
+      MacTsmaLayer(node, interfaceIndex, msg);
+      break;
+   case MAC_PROTOCOL_WIRED:
+      WiredLinkLayer(node, interfaceIndex, msg);
+      break;
+   default:
+      MacHandleUserMacProtocolEvent(node, interfaceIndex, msg);
+      break;
+   }/*switch*/
+}
+
+
+void GLOMO_MacNetworkLayerHasPacketToSend(
+   GlomoNode *node, InterfaceIdType interfaceIndex) 
+{
+   /*
+   * Based on the mac protocol call the appropriate function for
+   * executing the message.
+   */
+   
+   switch(node->macData[interfaceIndex]->macProtocol) {
+   case MAC_PROTOCOL_CSMA:
+      MacCsmaNetworkLayerHasPacketToSend(
+          node, (GlomoMacCsma*)node->macData[interfaceIndex]->macVar);
+      break;
+   case MAC_PROTOCOL_MACA:
+      MacMacaNetworkLayerHasPacketToSend(
+          node, (GlomoMacMaca*)node->macData[interfaceIndex]->macVar);
+      break;
+   case MAC_PROTOCOL_802_11:
+      Mac802_11NetworkLayerHasPacketToSend(
+          node, (GlomoMac802_11*)node->macData[interfaceIndex]->macVar);
+      break;
+   case MAC_PROTOCOL_TSMA:
+      MacTsmaNetworkLayerHasPacketToSend(
+          node, (GlomoMacTsma*)node->macData[interfaceIndex]->macVar);
+      break;
+   case MAC_PROTOCOL_WIRED:
+      WiredLinkNetworkLayerHasPacketToSend(
+          node, (GlomoWiredLink*)node->macData[interfaceIndex]->macVar);
+      break;
+   default:
+      assert(FALSE); abort();
+      //MacHandleUserMacProtocolEvent(node, interfaceIndex, msg);
+      break;
+   }/*switch*/
+}
+
+
+void GLOMO_MacReceivePacketFromRadio(
+   GlomoNode *node, 
+   InterfaceIdType interfaceIndex,
+   Message* packet) 
+{
+   switch(node->macData[interfaceIndex]->macProtocol) {
+   case MAC_PROTOCOL_802_11:
+      Mac802_11ReceivePacketFromRadio(
+         node, (GlomoMac802_11*)node->macData[interfaceIndex]->macVar, packet);
+      break;
+   
+   case MAC_PROTOCOL_CSMA:
+      MacCsmaReceivePacketFromRadio(
+          node, (GlomoMacCsma*)node->macData[interfaceIndex]->macVar, packet);
+      break;
+   
+   case MAC_PROTOCOL_MACA:
+      MacMacaReceivePacketFromRadio(
+          node, (GlomoMacMaca*)node->macData[interfaceIndex]->macVar, packet);
+      break;
+   
+   case MAC_PROTOCOL_TSMA:
+      MacTsmaReceivePacketFromRadio(
+          node, (GlomoMacTsma*)node->macData[interfaceIndex]->macVar, packet);
+      break;
+   
+   default:
+      assert(FALSE); abort();
+      //MacHandleUserMacProtocolEvent(node, interfaceIndex, msg);
+      break;
+   }/*switch*/
+}
+
+void GLOMO_MacReceiveRadioStatusChangeNotification(
+   GlomoNode *node, 
+   InterfaceIdType interfaceIndex,
+   RadioStatusType oldRadioStatus,
+   RadioStatusType newRadioStatus,
+   clocktype receiveDuration,
+   const Message* potentialIncomingPacket) 
+{
+   switch(node->macData[interfaceIndex]->macProtocol) {
+   case MAC_PROTOCOL_802_11:
+      Mac802_11ReceiveRadioStatusChangeNotification(
+          node, (GlomoMac802_11*)node->macData[interfaceIndex]->macVar,
+          oldRadioStatus, newRadioStatus,
+          receiveDuration, potentialIncomingPacket);
+      break;
+      
+   case MAC_PROTOCOL_CSMA:
+      MacCsmaReceiveRadioStatusChangeNotification(
+          node, (GlomoMacCsma*)node->macData[interfaceIndex]->macVar,
+          oldRadioStatus, newRadioStatus);
+      break;
+   
+   case MAC_PROTOCOL_MACA:
+      MacMacaReceiveRadioStatusChangeNotification(
+          node, (GlomoMacMaca*)node->macData[interfaceIndex]->macVar,
+          oldRadioStatus, newRadioStatus);
+      break;
+   case MAC_PROTOCOL_TSMA:
+      MacTsmaReceiveRadioStatusChangeNotification(
+          node, (GlomoMacTsma*)node->macData[interfaceIndex]->macVar,
+          oldRadioStatus, newRadioStatus);
+      break;
+   
+   default:
+      assert(FALSE); abort();
+      //MacHandleUserMacProtocolEvent(node, interfaceIndex, msg);
+      break;
+   }/*switch*/
+
+
+}
+
+
+
+
+/*
+ * FUNCTION    GLOMO_MacFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of 
+ *             the simulation of the MAC Layer.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+void GLOMO_MacFinalize(GlomoNode *node) {
+   int interfaceIndex;
+   BOOL finalizeEnd = FALSE;
+
+   for (interfaceIndex = 0; 
+        interfaceIndex < node->numberInterfaces;
+        interfaceIndex++)
+   {
+      /*
+       * Based on the mac protocol call the appropriate function for
+       * collecting the results at the end of the simulation.
+       */
+      if(node->macData[interfaceIndex]) {
+         switch(node->macData[interfaceIndex]->macProtocol) {
+         case MAC_PROTOCOL_CSMA:
+            MacCsmaFinalize(node, interfaceIndex);
+            break;
+         case MAC_PROTOCOL_MACA:
+            MacMacaFinalize(node, interfaceIndex);
+            break;
+         case MAC_PROTOCOL_802_11:
+            Mac802_11Finalize(node, interfaceIndex);
+            break;
+         case MAC_PROTOCOL_TSMA:
+            MacTsmaFinalize(node, interfaceIndex);
+            break;
+         case MAC_PROTOCOL_WIRED:
+            WiredLinkFinalize(node, interfaceIndex);
+            finalizeEnd = TRUE;
+            break;
+         default:
+            MacFinalizeUserMacProtocol(node, interfaceIndex);
+            break;
+         }/*switch*/
+      }
+      if (finalizeEnd == TRUE) {
+          break;
+      }
+   }/*for*/
+}
+
+
+
+
+
+

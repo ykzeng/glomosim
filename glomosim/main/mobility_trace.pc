@@ -1,0 +1,260 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+#include "structmsg.h"
+#include "glomo.h"
+
+#include "mobility.h"
+#include "mobility_trace.h"
+
+#define ARRAY_INCREMENTS 100
+
+static
+void FindNextPos(GlomoNode *node);
+
+/*
+ * FUNCTION     GLOMO_MobilityTraceInit
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+void GLOMO_MobilityTraceInit(GlomoNode *node,
+                             GlomoNodeInput *nodeInput)
+{
+    GlomoNodeInput mobilityInput;
+    BOOL retVal;
+    GlomoMobilityTrace* mobilityVar;
+    int  i;
+    
+    retVal = GLOMO_ReadCachedFile(nodeInput,
+                                  "MOBILITY-TRACE-FILE",
+                                  &mobilityInput);
+    if (retVal != TRUE) {
+        fprintf(stderr, "MOBILITY-TRACE-FILE is not specified.\n");
+        abort();
+    }
+
+    mobilityVar
+        = (GlomoMobilityTrace *)checked_pc_malloc(sizeof(GlomoMobilityTrace));
+
+    node->mobilityData.mobilityVar = mobilityVar;
+
+    mobilityVar->numItems = 0;
+    mobilityVar->counter = 0;
+    mobilityVar->destArray = NULL;
+
+    for (i = 0; i < mobilityInput.numLines; i++) {
+        NODE_ADDR nodeAddr;
+        char simTime[GLOMO_MAX_STRING_LENGTH];
+
+        sscanf(mobilityInput.inputStrings[i], "%u %s", &nodeAddr, simTime);
+
+        if (nodeAddr == node->nodeAddr) {
+            char *stringPtr;
+            GlomoCoordinates dest;
+            clocktype simClock;
+
+            if (mobilityVar->numItems % ARRAY_INCREMENTS == 0) {
+                GlomoMobilityTraceDest *oldArray = mobilityVar->destArray;
+
+                mobilityVar->destArray
+                    = (GlomoMobilityTraceDest *)
+                        pc_malloc((mobilityVar->numItems + ARRAY_INCREMENTS)
+                                  * sizeof(GlomoMobilityTraceDest));
+                assert(mobilityVar->destArray != NULL);
+
+                if (oldArray != NULL) {
+                    memcpy(mobilityVar->destArray,
+                           oldArray,
+                           (mobilityVar->numItems *
+                            sizeof(GlomoMobilityTraceDest)));
+                    pc_free(oldArray);
+                }
+            }
+            simClock = GLOMO_ConvertToClock(simTime);
+            stringPtr = strchr(mobilityInput.inputStrings[i], '(');
+            if (stringPtr == NULL) {
+                char filename[GLOMO_MAX_STRING_LENGTH];
+
+                GLOMO_ReadString(-1, nodeInput,
+                                 "MOBILITY-TRACE-FILE", filename);
+                fprintf(stderr,
+                        "The following line in '%s' includes no coordinates\n"
+                        "    %s",
+                        filename, mobilityInput.inputStrings[i]);
+                abort();
+            }
+            GLOMO_ConvertToCoordinates(stringPtr, &dest);
+
+            mobilityVar->destArray[mobilityVar->numItems].time = simClock;
+            mobilityVar->destArray[mobilityVar->numItems].dest = dest;
+            mobilityVar->numItems++;
+        }
+    }
+
+    if (mobilityVar->numItems > 0) {
+        GLOMO_MobilityTrace(node);
+    }
+
+    if (mobilityVar->numItems > 1) {
+        //
+        // average speed is not accurate
+        // need to be changed depending upon how it is used
+        //
+        node->mobilityData.avgSpeed
+            = (double)(mobilityVar->destArray[1].time
+                       - mobilityVar->destArray[0].time);
+    }
+    else {
+        node->mobilityData.avgSpeed = 0.0;
+    }
+}
+
+
+/*
+ * FUNCTION    GLOMO_MobilityTrace
+ *
+ * Parameters:
+ *     node:     node which received the message
+ */
+void GLOMO_MobilityTrace(GlomoNode *node) {
+    GlomoMobilityTrace* mobilityVar = 
+        (GlomoMobilityTrace*)node->mobilityData.mobilityVar;
+
+    if (mobilityVar->number_moves_left == 0) {
+        if (mobilityVar->counter == mobilityVar->numItems) {
+            node->mobilityData.nextMoveTime = CLOCKTYPE_MAX;
+
+            return;
+        }
+        else {
+            FindNextPos(node);
+            node->mobilityData.nextMoveTime = 
+                simclock() +
+                mobilityVar->move_interval;
+        }
+    }
+    else {
+        mobilityVar->number_moves_left--;
+
+        if (mobilityVar->number_moves_left == 0) {
+            // Avoid rounding errors
+            node->mobilityData.nextMoveTime
+                = mobilityVar->destArray[mobilityVar->counter].time;
+
+            mobilityVar->counter++;
+        } else {
+            node->mobilityData.nextMoveTime
+                = simclock() + mobilityVar->move_interval;
+        }
+    }//if//
+    
+    node->mobilityData.next.x = node->position.x + mobilityVar->move_step.x;
+    node->mobilityData.next.y = node->position.y + mobilityVar->move_step.y;
+    node->mobilityData.next.z = node->position.z + mobilityVar->move_step.z;
+
+#ifdef DEBUG
+    printf("%d: %lld (%lf, %lf, %lf) -> (%lf, %lf, %lf)\n", node->nodeAddr,
+           node->mobilityData.nextMoveTime,
+           node->position.x,
+           node->position.y,
+           node->position.z,
+           node->mobilityData.next.x,
+           node->mobilityData.next.y,
+           node->mobilityData.next.z);
+#endif
+}
+
+static
+void FindNextPos(GlomoNode *node) {
+    GlomoMobilityTrace *mobilityVar =
+        (GlomoMobilityTrace *)node->mobilityData.mobilityVar;
+    GlomoCoordinates diff;
+    clocktype time;
+    int num_steps;
+
+    //
+    // Skip simultaneous events and make sure the time difference is positive.
+    //
+    while (mobilityVar->destArray[mobilityVar->counter].time == simclock()) {
+        mobilityVar->counter++;
+    }
+    assert(mobilityVar->destArray[mobilityVar->counter].time > simclock());
+
+    {
+        const GlomoMobilityTraceDest *next
+            = &(mobilityVar->destArray[mobilityVar->counter]);
+
+        time = next->time - simclock();
+
+        diff.x = next->dest.x - node->position.x;
+        diff.y = next->dest.y - node->position.y;
+        diff.z = next->dest.z - node->position.z;
+
+        //
+        // Compute num_steps if the node moves
+        //
+        if (diff.x != 0.0 ||
+            diff.y != 0.0 ||
+            diff.z != 0.0)
+        {
+            double distance
+                = sqrt(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+
+            num_steps = (int)ceil(distance / node->mobilityData.distance_granularity);
+        } else {
+            num_steps = 1;
+        }
+    }
+
+    mobilityVar->number_moves_left = num_steps - 1;
+    mobilityVar->move_interval = time / num_steps;
+    mobilityVar->move_step.x = diff.x / num_steps;
+    mobilityVar->move_step.y = diff.y / num_steps;
+    mobilityVar->move_step.z = diff.z / num_steps;
+}
+

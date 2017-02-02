@@ -1,0 +1,564 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: radio_nonoise.pc,v 1.8 2001/04/14 03:42:46 jmartin Exp $
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "radio.h"
+#include "radio_nonoise.h"
+#include "propagation.h"
+#include "mac.h"
+
+#include "java_gui.h"
+
+
+static
+void RadioNonoiseReportExtendedStatusToMac(
+    GlomoNode *node,
+    int radioNum,
+    RadioStatusType status,
+    clocktype receiveDuration,
+    const Message* potentialIncomingPacket)
+{
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioNonoise* nonoise = (GlomoRadioNonoise *)thisRadio->radioVar;
+
+    assert(status == nonoise->mode);
+    
+    GLOMO_MacReceiveRadioStatusChangeNotification(
+        node, 
+        node->radioData[radioNum]->macInterfaceIndex, 
+        nonoise->previousMode, status, 
+        receiveDuration, potentialIncomingPacket);
+}
+
+static /*inline*/
+void RadioNonoiseReportStatusToMac(
+    GlomoNode *node, int radioNum, RadioStatusType status)
+{
+    RadioNonoiseReportExtendedStatusToMac(
+        node, radioNum, status, 0, NULL); 
+}
+                                   
+void RadioNonoiseLockPacket(GlomoRadioNonoise *nonoise, Message *msg);
+void RadioNonoiseUnlockPacket(GlomoRadioNonoise *nonoise);
+BOOL RadioNonoiseCheckRxPacketError(GlomoNode *node, int radioNum);
+void RadioNonoiseGuiDrawLine(NODE_ADDR sourceAddr, NODE_ADDR destAddr,
+                        BOOL success);
+
+void RadioNonoiseInit(GlomoNode *node,
+                 const int radioNum,
+                 const GlomoNodeInput *nodeInput)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioNonoise *nonoise;
+    BOOL wasFound;
+    double snr;
+
+    nonoise = (GlomoRadioNonoise *)checked_pc_malloc(sizeof(GlomoRadioNonoise));
+    memset(nonoise, 0, sizeof(GlomoRadioNonoise));
+    thisRadio->radioVar = (void *)nonoise;
+    
+
+    GLOMO_ReadDoubleInstance(node->nodeAddr,
+                             nodeInput,
+                             "RADIO-RX-SNR-THRESHOLD",
+                             radioNum,
+                             TRUE,
+                             &wasFound,
+                             &snr);
+    if (wasFound) {
+        nonoise->radioRxSnrThreshold_dB = snr;
+        nonoise->radioRxSnrThreshold = NON_DB(snr);
+    }
+    else {
+        nonoise->radioRxSnrThreshold_dB = NONOISE_SNR_THRESHOLD_dB;
+        nonoise->radioRxSnrThreshold = NON_DB(NONOISE_SNR_THRESHOLD_dB);
+    }
+
+    /*
+     * Initialize radio statistics variables
+     */
+    nonoise->stats.totalRxSignalsAboveCS = 0;
+    nonoise->stats.totalRxSignalsAboveRX = 0;
+    nonoise->stats.totalRxSignalsToMac = 0;
+    nonoise->stats.totalTxSignals  = 0;
+    nonoise->stats.totalCollisions = 0;
+    nonoise->stats.energyConsumed   = 0.0;
+    nonoise->stats.turnOnTime = simclock();
+
+
+    /*
+     * Initialize status of radio
+     */
+    nonoise->rxMsg = NULL;
+    nonoise->rxMsgPower_mW = 0.0;
+    nonoise->rxMsgTxDuration = 0;
+    nonoise->rxStartTime = 0;
+    nonoise->numSignals = 0;
+    nonoise->previousMode = RADIO_IDLE;
+    nonoise->mode       = RADIO_IDLE;
+}
+
+
+
+
+/*
+ * Used by the MAC layer to start transmitting a packet.
+ */
+ 
+
+void RadioNonoiseStartTransmittingPacket(
+    GlomoNode* node, 
+    int radioNum, 
+    Message* packet,
+    BOOL useMacLayerSpecifiedDelay,
+    clocktype initDelayUntilAirborne)
+{
+    clocktype delayUntilAirborne = initDelayUntilAirborne;
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioNonoise* nonoise = (GlomoRadioNonoise *)thisRadio->radioVar;
+    clocktype  txDuration;
+    PropInfo* propInfo;
+    
+    if (!useMacLayerSpecifiedDelay) {
+       delayUntilAirborne = RADIO_PHY_DELAY;
+    }//if//
+     
+    assert(nonoise->mode != RADIO_TRANSMITTING);
+
+    if (nonoise->mode == RADIO_RECEIVING) {
+        nonoise->rxMsg->error = TRUE;
+    }
+
+    /*
+     * Increment number of packets currently being processed,
+     * switch to transmitting mode,
+     * and then transmit packet to channel layer
+     */
+    nonoise->previousMode = nonoise->mode;
+    nonoise->mode = RADIO_TRANSMITTING;
+    txDuration = (SYNCHRONIZATION_TIME +
+                  (packet->packetSize * 8 * SECOND) / 
+                  thisRadio->bandwidth);
+
+    GLOMO_MsgInfoAlloc(node, packet, sizeof(PropInfo));
+    propInfo = (PropInfo *)GLOMO_MsgReturnInfo(packet);
+
+    propInfo->txAddr = node->nodeAddr;
+    propInfo->wavelength = thisRadio->wavelength;
+    propInfo->txPosition = node->position;
+    propInfo->txAntennaGain_dB = thisRadio->antennaGain_dB;
+    propInfo->txAntennaHeight = thisRadio->antennaHeight;
+    propInfo->txPower_dBm = thisRadio->txPower_dBm;
+    propInfo->txStartTime = simclock() + delayUntilAirborne;
+    propInfo->txDuration = txDuration;
+
+    GLOMO_MsgSetLayer(packet, GLOMO_CHANNEL_LAYER, 0);
+    GLOMO_MsgSetEvent(packet, MSG_SPECIAL_Broadcast);
+   
+    
+
+    GLOMO_MsgSetInstanceId(packet, radioNum);
+    GLOMO_MsgSetLayer(packet, GLOMO_RADIO_LAYER, 0);
+    GLOMO_MsgSetEvent(packet, MSG_RADIO_StartPropagation);
+    GLOMO_MsgSend(node, packet, delayUntilAirborne);
+
+    /* Keep track of radio statistics and battery computations */
+    nonoise->stats.totalTxSignals++;
+    nonoise->stats.energyConsumed
+        += txDuration * (BATTERY_TX_POWER_COEFFICIENT
+                         * thisRadio->txPower_mW
+                         + BATTERY_TX_POWER_OFFSET
+                         - BATTERY_RX_POWER);
+}
+
+
+
+
+
+
+
+/*
+ * FUNCTION    RadioNonoiseLayer
+ * PURPOSE     Models the behaviour of the Radio with capture on receiving
+ *             the message.
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:   message received by the layer
+ */
+void RadioNonoiseLayer(GlomoNode *node, const int radioNum, Message *msg) {
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioNonoise* nonoise = (GlomoRadioNonoise *)thisRadio->radioVar;
+
+    switch (msg->eventType) {
+        //
+        // Radio signal arrival
+        //
+        case MSG_RADIO_FromChannelBegin: {
+            PropInfo  *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+            clocktype  txDuration = propInfo->txDuration;
+
+            //
+            // Discard the message if its power is below the sensitivity.
+            //
+            if (propInfo->rxPower_mW < thisRadio->rxSensitivity_mW) {
+                GLOMO_MsgFree(node, msg);
+
+                break;
+            }
+            nonoise->stats.totalRxSignalsAboveCS++;
+
+            if (propInfo->rxPower_mW < thisRadio->rxThreshold_mW) {
+                msg->error = TRUE;
+            }
+            if (nonoise->mode == RADIO_TRANSMITTING) {
+                msg->error = TRUE;
+            }
+            if (nonoise->rxMsg == NULL) {
+                assert(nonoise->mode != RADIO_RECEIVING);
+
+                RadioNonoiseLockPacket(nonoise, msg);
+
+                if (nonoise->mode == RADIO_IDLE) {
+                    nonoise->previousMode = nonoise->mode;
+                    nonoise->mode = RADIO_RECEIVING;
+
+                    RadioNonoiseReportExtendedStatusToMac(
+                        node,
+                        radioNum,
+                        RADIO_RECEIVING,
+                        txDuration,
+                        msg);
+                }
+                else {
+                    assert(nonoise->mode == RADIO_TRANSMITTING);
+                }
+
+                GLOMO_MsgSetInstanceId(msg, radioNum);
+                GLOMO_MsgSetEvent(msg, MSG_RADIO_FromChannelEnd);
+                GLOMO_MsgSend(node, msg, txDuration);
+
+                nonoise->numSignals++;
+                assert(nonoise->numSignals >= 1);
+            }
+            else {
+                assert(nonoise->mode != RADIO_IDLE);
+
+                if (propInfo->rxPower_mW >= (nonoise->rxMsgPower_mW *
+                                             nonoise->radioRxSnrThreshold))
+                {
+                    RadioNonoiseUnlockPacket(nonoise);
+                    RadioNonoiseLockPacket(nonoise, msg);
+
+                    if (nonoise->mode == RADIO_RECEIVING) {
+                        nonoise->previousMode = nonoise->mode;
+                        nonoise->mode = RADIO_RECEIVING;
+
+                        RadioNonoiseReportExtendedStatusToMac(
+                            node,
+                            radioNum,
+                            RADIO_RECEIVING,
+                            txDuration,
+                            msg);
+                    }                        
+                    else {
+                        assert(nonoise->mode == RADIO_TRANSMITTING);
+                    }
+
+                    GLOMO_MsgSetInstanceId(msg, radioNum);
+                    GLOMO_MsgSetEvent(msg, MSG_RADIO_FromChannelEnd);
+                    GLOMO_MsgSend(node, msg, txDuration);
+
+                    nonoise->numSignals++;
+                    assert(nonoise->numSignals >= 1);
+                }
+                else if (nonoise->rxMsgPower_mW < (propInfo->rxPower_mW *
+                                              nonoise->radioRxSnrThreshold))
+                {
+                    if (nonoise->rxMsg->error == FALSE) {
+                        nonoise->stats.totalCollisions++;
+                    }
+
+                    if (nonoise->rxStartTime + nonoise->rxMsgTxDuration <
+                        simclock() + txDuration)
+                    {
+                        RadioNonoiseUnlockPacket(nonoise);
+                        RadioNonoiseLockPacket(nonoise, msg);
+
+                        if (nonoise->mode == RADIO_RECEIVING) {
+                            nonoise->previousMode = nonoise->mode;
+                            nonoise->mode = RADIO_RECEIVING;
+
+                            RadioNonoiseReportExtendedStatusToMac(
+                                node,
+                                radioNum,
+                                RADIO_RECEIVING,
+                                txDuration,
+                                msg);
+                        }
+                        else {
+                            assert(nonoise->mode == RADIO_TRANSMITTING);
+                        }
+
+                        GLOMO_MsgSetInstanceId(msg, radioNum);
+                        GLOMO_MsgSetEvent(msg, MSG_RADIO_FromChannelEnd);
+                        GLOMO_MsgSend(node, msg, txDuration);
+
+                        nonoise->numSignals++;
+                        assert(nonoise->numSignals >= 1);
+                    }
+                    else {
+                        GLOMO_MsgFree(node, msg);
+                    }
+
+                    nonoise->rxMsg->error = TRUE;
+                }
+                else {
+                    GLOMO_MsgFree(node, msg);
+                }
+            }
+
+            //
+            // Statistics
+            //
+            if (propInfo->rxPower_mW >= thisRadio->rxThreshold_mW) {
+                nonoise->stats.totalRxSignalsAboveRX++;
+            }
+
+            break;
+        }
+
+        //
+        // Radio signal end
+        //
+        case MSG_RADIO_FromChannelEnd: {
+            PropInfo *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+
+            if (nonoise->rxMsg == msg) {
+                assert(nonoise->mode != RADIO_IDLE);
+                assert(nonoise->rxStartTime + nonoise->rxMsgTxDuration == simclock());
+
+                RadioNonoiseUnlockPacket(nonoise);
+
+                if (nonoise->mode == RADIO_RECEIVING) {
+                    nonoise->previousMode = nonoise->mode;
+                    nonoise->mode = RADIO_IDLE;
+
+                    if (msg->error != TRUE) {
+                        GLOMO_MacReceivePacketFromRadio(
+                            node, 
+                            node->radioData[radioNum]->macInterfaceIndex, 
+                            msg);
+
+                        nonoise->stats.totalRxSignalsToMac++;
+                    }
+                    else {
+                        RadioNonoiseReportStatusToMac(
+                            node,
+                            radioNum,
+                            RADIO_IDLE);
+                        GLOMO_MsgFree(node, msg);
+                    }
+                }
+                else {
+                    assert(nonoise->mode == RADIO_TRANSMITTING);
+                    assert(msg->error == TRUE);
+
+                    GLOMO_MsgFree(node, msg);
+                }
+            }
+            else {
+                GLOMO_MsgFree(node, msg);
+            }
+
+            //
+            // Decrement the number of packets being sensed.
+            //
+            nonoise->numSignals--;
+            assert(nonoise->numSignals >= 0);
+
+            break;
+        }
+
+        case MSG_RADIO_StartPropagation: {
+            PropInfo *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+
+            assert(nonoise->mode == RADIO_TRANSMITTING);
+
+            GLOMO_MsgSetInstanceId(msg, radioNum);
+            GLOMO_MsgSetLayer(msg, GLOMO_RADIO_LAYER, 0);
+            GLOMO_MsgSetEvent(msg, MSG_RADIO_SwitchToIdle);
+            GLOMO_MsgSend(node, msg, propInfo->txDuration);
+
+            GLOMO_PropBroadcast(node->partitionData, msg);
+            break;
+        }
+
+
+        case MSG_RADIO_SwitchToIdle: {
+            assert(nonoise->mode == RADIO_TRANSMITTING);
+
+            if (nonoise->rxMsg == NULL) {
+                nonoise->previousMode = nonoise->mode;
+                nonoise->mode = RADIO_IDLE;
+                RadioNonoiseReportStatusToMac(node, radioNum, RADIO_IDLE);
+            }
+            else {
+                nonoise->previousMode = nonoise->mode;
+                nonoise->mode = RADIO_RECEIVING;
+                RadioNonoiseReportExtendedStatusToMac(
+                    node,
+                    radioNum,
+                    RADIO_RECEIVING,
+                    (nonoise->rxStartTime + nonoise->rxMsgTxDuration - simclock()),
+                    nonoise->rxMsg);
+            }
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        /*
+         * Mac Layer asking radio to check channel status
+         * (Carrier Sensing)
+         */
+        case MSG_RADIO_CheckChannelStatus: {
+            GLOMO_MsgFree(node, msg);
+
+            RadioNonoiseReportStatusToMac(node, radioNum, nonoise->mode);
+            break;
+        }
+
+        default: {
+            char clockStr[GLOMO_MAX_STRING_LENGTH];
+            ctoa(simclock(), clockStr);
+            printf("Time %s: Node %u received message of unknown type %d.\n",
+                    clockStr, node->nodeAddr, msg->eventType);
+            assert(FALSE);
+        }
+    }
+}
+
+void RadioNonoiseFinalize(GlomoNode *node, const int radioNum) {
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioNonoise* nonoise = thisRadio->radioVar;
+    char buf[100];
+
+    if (thisRadio->radioStats == FALSE) {
+        return;
+    }
+
+    assert(thisRadio->radioStats == TRUE);
+
+    sprintf(buf, "Signals transmitted: %d",
+            nonoise->stats.totalTxSignals);
+    GLOMO_PrintStat(node, "RadioNonoise", buf);
+
+    sprintf(buf, "Signals arrived with power above RX sensitivity: %d",
+            nonoise->stats.totalRxSignalsAboveCS);
+    GLOMO_PrintStat(node, "RadioNonoise", buf);
+
+    sprintf(buf, "Signals arrived with power above RX threshold: %d",
+            nonoise->stats.totalRxSignalsAboveRX);
+    GLOMO_PrintStat(node, "RadioNonoise", buf);
+
+    sprintf(buf, "Signals received and forwarded to MAC: %d",
+            nonoise->stats.totalRxSignalsToMac);
+    GLOMO_PrintStat(node, "RadioNonoise", buf);
+
+    sprintf(buf, "Collisions: %d",
+            nonoise->stats.totalCollisions);
+    GLOMO_PrintStat(node, "RadioNonoise", buf);
+
+    nonoise->stats.energyConsumed
+        += BATTERY_RX_POWER * (simclock() - nonoise->stats.turnOnTime);
+
+    sprintf(buf, "Energy consumption (in mWhr): %.3f",
+            nonoise->stats.energyConsumed / 3600.0);
+    GLOMO_PrintStat(node, "RadioNonoise", buf);
+}
+
+void RadioNonoiseLockPacket(GlomoRadioNonoise *nonoise, Message *msg) {
+    PropInfo *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+
+    nonoise->rxMsg = msg;
+    nonoise->rxMsgPower_mW = propInfo->rxPower_mW;
+    nonoise->rxMsgTxDuration = propInfo->txDuration;
+    nonoise->rxStartTime = simclock();
+}
+
+void RadioNonoiseUnlockPacket(GlomoRadioNonoise *nonoise) {
+    nonoise->rxMsg = NULL;
+    nonoise->rxMsgPower_mW = 0.0;
+    nonoise->rxMsgTxDuration = 0;
+    nonoise->rxStartTime = 0;
+}
+
+void RadioNonoiseGuiDrawLine(NODE_ADDR sourceAddr, NODE_ADDR destAddr, BOOL success) {
+    JGUI_COLOR failTxColor, successTxColor;
+    char simTime[50];
+                    
+    ctoa(simclock(), simTime);
+    failTxColor = JGUI_RED;
+    successTxColor = JGUI_GREEN;
+
+    JGUI_EraseLink(sourceAddr, destAddr, simTime);
+
+    if (success == TRUE) {
+        JGUI_DrawLine(sourceAddr, destAddr, simTime, successTxColor);
+    }
+    else {
+        JGUI_DrawLine(sourceAddr, destAddr, simTime, failTxColor);
+    }
+}
+

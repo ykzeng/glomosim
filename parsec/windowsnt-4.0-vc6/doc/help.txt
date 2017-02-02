@@ -1,0 +1,24 @@
+Usage: pcc [ C or PARSEC compiler options ] [ file ... ]
+
+PARSEC Compiler Options
+    -E :     Generate ".c" and ".pi" files for a ".pc" file.
+    -c :     Generate ".o" and ".pi" files for a ".pc" file.
+    -v :     Show the process of PARSEC compiler.
+    -V :     Show the process of both PARSEC and C compilers.
+    -P :     Do not generate line number commands (used with -E option).
+    -sync :  Specify the synchronization protocol for parallel execution.
+    -stack : Specify the default stack size in bytes (20000 is the minimum).
+    -ini :   Do not remove the file containing initializer functions.
+    -clock : Specify clocktype to use (unsigned (default) | longlong).
+    -user_main :  Rename main() to parsec_main() for a user-defined main().
+    -shared_lib : Rename main() to parsec_main() to make a shared library.
+    -env :   Show environment names set for pcc.
+    -help :  Show this help.
+
+Following options override environment variables
+    -pcc_directory
+    -pcc_cc
+    -pcc_linker
+    -pcc_pp_options
+    -pcc_cc_options
+    -pcc_linker_options

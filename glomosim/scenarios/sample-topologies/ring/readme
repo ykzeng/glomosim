@@ -1,0 +1,6 @@
+This directory demonstrates how to set up a ring topology of 8 nodes with
+FTP traffic (generic, meaning no feedback from the receiver, unlike from
+tcplib) from node 0 to node 1, node 1 to node 2, node 2 to node 3,
+node 3 to noe 4, node 4 to node 5, node 5 to node 6, node 6 to node 7 and
+node 7 to node 0.
+

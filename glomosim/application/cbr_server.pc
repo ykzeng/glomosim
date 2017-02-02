@@ -1,0 +1,395 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: cbr_server.pc,v 1.11 2001/02/15 03:17:26 mineo Exp $
+ */
+
+/*
+ * NOTE: CBR does not attempt to reorder packets.  Any out of order
+ *       packets will be dropped.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+
+#include "application.h"
+#include "app_util.h"
+#include "cbr_server.h"
+#include "transport.h"
+
+#define noEXCEL
+
+
+/*
+ * NAME:        AppLayerCbrServer.
+ * PURPOSE:     Models the behaviour of CbrServer Server on receiving the
+ *              message encapsulated in msg.
+ * PARAMETERS:  nodePtr - pointer to the node which received the message.
+ *              msg - message received by the layer
+ * RETURN:      none.
+ */
+void
+AppLayerCbrServer(GlomoNode *nodePtr, Message *msg)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    GlomoAppCbrServer *serverPtr;
+
+    ctoa(simclock(), buf);
+
+    switch(msg->eventType) 
+    {
+        case MSG_APP_FromTransport:
+        {
+            UdpToAppRecv *info;
+            GlomoAppCbrData data;
+
+            info = (UdpToAppRecv *) GLOMO_MsgReturnInfo(msg);
+            memcpy(&data, GLOMO_MsgReturnPacket(msg), sizeof(data));
+
+            #ifdef DEBUG
+                ctoa(data.txTime, clockStr);
+                printf("CBR Server %ld: packet transmitted at %s\n", 
+                        nodePtr->nodeAddr, clockStr);
+
+                ctoa(simclock(), clockStr);
+                printf("    received at %s\n", clockStr);
+                printf("    client is %ld\n", info->sourceAddr);
+                printf("    connection Id is %d\n", data.uniqueId);
+                printf("    seqNo is %d\n", data.seqNo);
+            #endif
+
+            serverPtr = AppCbrServerGetCbrServer(nodePtr, 
+                                                 info->sourceAddr,
+                                                 data.uniqueId);
+
+            /* New connection, so create new cbr server to handle client. */
+            if (serverPtr == NULL) 
+            {
+                serverPtr = AppCbrServerNewCbrServer(nodePtr, 
+                                                     info->sourceAddr, 
+                                                     data.uniqueId);
+            }
+
+            if (serverPtr == NULL)
+            {
+                printf("CBR Server: Node %ld unable to "
+                       "allocation server\n", nodePtr->nodeAddr);
+
+                assert(FALSE);
+            }
+
+            if (data.seqNo >= serverPtr->seqNo)
+            {
+                serverPtr->numBytesRecvd += GLOMO_MsgReturnPacketSize(msg);
+                serverPtr->numPktsRecvd++;
+                serverPtr->sessionLastReceived = simclock();
+                serverPtr->totalEndToEndDelay += simclock() - data.txTime;
+                serverPtr->seqNo = data.seqNo + 1;
+
+                #ifdef DEBUG
+                    ctoa(serverPtr->totalEndToEndDelay, clockStr);
+                    printf("    total end-to-end delay so far is %s\n", 
+                           clockStr);
+                #endif
+
+                if (data.type == 'd')
+                {
+                    /* Do nothing. */
+                }
+                else if (data.type == 'c')
+                {
+                    serverPtr->sessionFinish = simclock();
+                    serverPtr->sessionIsClosed = TRUE;
+                }
+                else
+                {
+                    assert(0);
+                }
+            }
+
+            break;
+        }
+
+        default:
+            ctoa(simclock(), buf);
+            printf("CBR Server: At time %s, node %ld received "
+                   "message of unknown type "
+                   "%ld.\n", buf, nodePtr->nodeAddr, msg->eventType);
+            assert(FALSE);
+    } 
+
+    GLOMO_MsgFree(nodePtr, msg);
+}
+
+
+/*
+ * NAME:        AppCbrServerInit.
+ * PURPOSE:     listen on CbrServer server port.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ * RETURN:      none.
+ */
+void
+AppCbrServerInit(GlomoNode *nodePtr)
+{
+    #ifdef EXCEL
+        remove(APP_CBR_SERVER_FILE);
+    #endif
+}
+
+
+/*
+ * NAME:        AppCbrServerPrintStats.
+ * PURPOSE:     Prints statistics of a CbrServer session.
+ * PARAMETERS:  nodePtr - pointer to this node.
+ *              serverPtr - pointer to the cbr server data structure.
+ * RETURN:      none.
+ */
+void
+AppCbrServerPrintStats(GlomoNode *nodePtr, GlomoAppCbrServer *serverPtr) {
+    FILE *excel= NULL;
+    clocktype throughput;
+
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    char startStr[GLOMO_MAX_STRING_LENGTH];
+    char closeStr[GLOMO_MAX_STRING_LENGTH];
+    char sessionStatusStr[GLOMO_MAX_STRING_LENGTH];
+    char throughputStr[GLOMO_MAX_STRING_LENGTH];
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+    #ifdef EXCEL
+        excel = fopen(APP_CBR_SERVER_FILE, "a");
+
+        if (excel == NULL) 
+        {
+            fprintf(stderr, "CBR Server: cannot open excel stat file.\n");
+            assert(FALSE);
+        }
+    #endif
+
+    GLOMO_PrintClockInSecond(serverPtr->sessionStart, startStr);
+    GLOMO_PrintClockInSecond(serverPtr->sessionLastReceived, closeStr);
+
+    if (serverPtr->sessionIsClosed == FALSE) {
+        serverPtr->sessionFinish = simclock();
+        sprintf(sessionStatusStr, "Not closed");
+    }
+    else {
+        sprintf(sessionStatusStr, "Closed");
+    }
+
+    if (serverPtr->numPktsRecvd == 0) {
+        GLOMO_PrintClockInSecond(0, clockStr);
+    }
+    else {
+        GLOMO_PrintClockInSecond(
+            serverPtr->totalEndToEndDelay / serverPtr->numPktsRecvd,
+            clockStr);
+    }
+
+    if (serverPtr->sessionFinish <= serverPtr->sessionStart) {
+        throughput = 0;
+    } 
+    else {
+        throughput = (serverPtr->numBytesRecvd * 8.0 * SECOND) /
+                     (serverPtr->sessionFinish - serverPtr->sessionStart);
+    }
+
+    ctoa(throughput, throughputStr);
+
+    sprintf(buf, "(%d) Client address: %d",
+            serverPtr->uniqueId, serverPtr->remoteAddr);
+    GLOMO_PrintStat(nodePtr, "AppCbrServer", buf);
+
+    sprintf(buf, "(%d) First packet received at [s]: %s",
+            serverPtr->uniqueId, startStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrServer", buf);
+
+    sprintf(buf, "(%d) Last packet received at [s]: %s",
+            serverPtr->uniqueId, closeStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrServer", buf);
+
+    sprintf(buf, "(%d) Average end-to-end delay [s]: %s",
+            serverPtr->uniqueId, clockStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrServer", buf);
+
+    sprintf(buf, "(%d) Session status: %s",
+            serverPtr->uniqueId, sessionStatusStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrServer", buf);
+
+    sprintf(buf, "(%d) Total number of bytes received: %ld",
+            serverPtr->uniqueId, serverPtr->numBytesRecvd);
+    GLOMO_PrintStat(nodePtr, "AppCbrServer", buf);
+
+    sprintf(buf, "(%d) Total number of packets received: %ld",
+            serverPtr->uniqueId, serverPtr->numPktsRecvd);
+    GLOMO_PrintStat(nodePtr, "AppCbrServer", buf);
+
+    sprintf(buf, "(%d) Throughput (bits per second): %s",
+            serverPtr->uniqueId, throughputStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrServer", buf);
+
+    #ifdef EXCEL
+        fprintf(excel, "%ld\t%ld\t%d\t%s\t%s\t%ld\t%ld\t%s\t%s\n",
+                serverPtr->remoteAddr, serverPtr->localAddr, 
+                serverPtr->uniqueId, startStr, closeStr,
+                serverPtr->numBytesRecvd, serverPtr->numPktsRecvd,
+                clockStr, throughputStr);
+
+        fflush(excel);
+        fclose(excel);
+    #endif
+}
+
+
+
+/*
+ * NAME:        AppCbrServerFinalize.
+ * PURPOSE:     Collect statistics of a CbrServer session.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              serverPtr - pointer to the cbr server data structure.
+ * RETURN:      none.
+ */
+void
+AppCbrServerFinalize(GlomoNode *nodePtr, GlomoAppCbrServer *serverPtr)
+{
+    if (nodePtr->appData.appStats == TRUE)
+    {
+        AppCbrServerPrintStats(nodePtr, serverPtr);
+    }
+}
+
+
+
+/*
+ * NAME:        AppCbrServerGetCbrServer.
+ * PURPOSE:     search for a cbr server data structure.
+ * PARAMETERS:  nodePtr - cbr server.
+ *              remoteAddr - cbr client sending the data.
+ *              uniqueId - uniqueId of cbr client/server pair.
+ * RETURN:      the pointer to the cbr server data structure,
+ *              NULL if nothing found.
+ */
+static GlomoAppCbrServer *
+AppCbrServerGetCbrServer(GlomoNode *nodePtr, NODE_ADDR remoteAddr, int uniqueId)
+{
+    AppInfo *appList = nodePtr->appData.appPtr;
+    GlomoAppCbrServer *cbrServer;
+
+    for (; appList != NULL; appList = appList->appNext)
+    {
+        if (appList->appType == APP_CBR_SERVER)
+        {
+            cbrServer = (GlomoAppCbrServer *) appList->appDetail;
+
+            if ((cbrServer->uniqueId == uniqueId) && 
+                (cbrServer->remoteAddr == remoteAddr))
+            {
+                return cbrServer;
+            } 
+       }
+   }
+
+    return NULL;
+}
+
+
+/*
+ * NAME:        AppCbrServerNewCbrServer.
+ * PURPOSE:     create a new cbr server data structure, place it
+ *              at the beginning of the application list.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              remoteAddr - remote address.
+ *              uniqueId - uniqueId of cbr client/server pair.
+ * RETRUN:      the pointer to the created cbr server data structure,
+ *              NULL if no data structure allocated.
+ */
+static GlomoAppCbrServer *
+AppCbrServerNewCbrServer(GlomoNode *nodePtr, NODE_ADDR remoteAddr, int uniqueId)
+{
+    AppInfo *newApp;
+    GlomoAppCbrServer *cbrServer;
+
+    newApp = (AppInfo *) malloc(sizeof(AppInfo));
+
+    if (newApp == NULL)
+    {
+        assert(FALSE);
+    }
+
+    cbrServer = (GlomoAppCbrServer *)
+                pc_malloc(sizeof(GlomoAppCbrServer));
+
+    if (cbrServer == NULL)
+    {
+        printf("CBR Client: Node %ld unable to allocate new cbr client\n",
+                nodePtr->nodeAddr);
+
+        assert(FALSE);
+    }
+
+    /*
+     * Fill in cbr info.
+     */
+    newApp->appType = APP_CBR_SERVER;
+    cbrServer->localAddr = nodePtr->nodeAddr;
+    cbrServer->remoteAddr = remoteAddr;
+    cbrServer->uniqueId = uniqueId;
+    cbrServer->sessionStart = simclock();
+    cbrServer->sessionFinish = simclock();
+    cbrServer->sessionLastReceived = simclock();
+    cbrServer->sessionIsClosed = FALSE;
+    cbrServer->numBytesRecvd = 0;
+    cbrServer->numPktsRecvd = 0;
+    cbrServer->totalEndToEndDelay = 0;
+    cbrServer->seqNo = 0;
+
+    newApp->appDetail = cbrServer;
+    newApp->appNext = nodePtr->appData.appPtr;
+    nodePtr->appData.appPtr = newApp;
+
+    return cbrServer;
+}
+

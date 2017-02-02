@@ -1,0 +1,820 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: radio_accnoise.pc,v 1.21 2001/08/31 19:25:35 jmartin Exp $
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "radio.h"
+#include "radio_accnoise.h"
+#include "propagation.h"
+#include "mac.h"
+#include "radio_lookahead.h"
+
+#include "java_gui.h"
+
+
+static
+void RadioAccnoiseReportExtendedStatusToMac(
+    GlomoNode *node,
+    int radioNum,
+    RadioStatusType status,
+    clocktype receiveDuration,
+    const Message* potentialIncomingPacket)
+{
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioAccnoise* accnoise = (GlomoRadioAccnoise *)thisRadio->radioVar;
+
+    assert(status == accnoise->mode);
+    
+    GLOMO_MacReceiveRadioStatusChangeNotification(
+        node, node->radioData[radioNum]->macInterfaceIndex,
+        accnoise->previousMode, status, 
+        receiveDuration, potentialIncomingPacket);
+}
+
+static /*inline*/
+void RadioAccnoiseReportStatusToMac(
+    GlomoNode *node, int radioNum, RadioStatusType status)
+{
+    RadioAccnoiseReportExtendedStatusToMac(
+        node, radioNum, status, 0, NULL); 
+}
+
+
+
+static //inline//
+void RadioAccnoiseLockPacket(GlomoRadioAccnoise *accnoise, Message *msg) {
+    PropInfo *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+
+    accnoise->rxMsg = msg;
+    accnoise->rxMsgPower_mW = propInfo->rxPower_mW;
+    accnoise->rxStartTime = simclock();
+}
+
+static //inline//
+void RadioAccnoiseUnlockPacket(GlomoNode* node, GlomoRadioAccnoise* accnoise) {
+    accnoise->noisePower_mW += accnoise->rxMsgPower_mW;
+    accnoise->rxMsg = NULL;
+    accnoise->rxMsgPower_mW = 0.0;
+    accnoise->rxStartTime = 0;
+    
+    
+}
+
+                                   
+BOOL RadioAccnoiseCheckRxPacketError(GlomoNode *node, int radioNum);
+void RadioAccnoiseGuiDrawLine(NODE_ADDR sourceAddr, NODE_ADDR destAddr,
+                             BOOL success);
+
+void RadioAccnoiseInit(GlomoNode *node,
+                      const int radioNum,
+                      const GlomoNodeInput *nodeInput)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioAccnoise *accnoise;
+    BOOL wasFound;
+
+    accnoise
+        = (GlomoRadioAccnoise *)checked_pc_malloc(sizeof(GlomoRadioAccnoise));
+    memset(accnoise, 0, sizeof(GlomoRadioAccnoise));
+    thisRadio->radioVar = (void *)accnoise;
+    accnoise->radioIdNumber = radioNum;
+    accnoise->lastReceivedFrameTime = 0;
+    accnoise->lastReceivedFrameFastFading_dB = 0.0;
+    accnoise->lastReceivedFrameSourceNode = INVALID_ADDRESS; 
+    
+    //
+    // Set RADIO-RX-TYPE
+    //
+    GLOMO_ReadStringInstance(node->nodeAddr,
+                             nodeInput,
+                             "RADIO-RX-TYPE",
+                             radioNum,
+                             TRUE,
+                             &wasFound,
+                             buf);
+    if (wasFound) {
+        if (strcmp(buf, "SNR-BOUNDED") == 0) {
+            accnoise->radioRxType = SNR_BOUNDED;
+        }
+        else if (strcmp(buf, "BER-BASED") == 0) {
+            accnoise->radioRxType = BER_BASED;
+        }
+        else {
+            fprintf(stderr, "Unknown RADIO-RX-TYPE %s.\n", buf);
+            assert(FALSE); abort();
+        }
+    }
+    else {
+        fprintf(stderr, "RADIO-RX-TYPE is missing.\n");
+        assert(FALSE); abort();
+    }
+
+    //
+    // RADIO-RX-TYPE specific setting
+    //
+    // If RADIO-RX-TYPE is SNR-BOUNDED, set RADIO-RX-SNR-THRESHOLD
+    //
+    if (accnoise->radioRxType == SNR_BOUNDED) {
+        double snr;
+
+        GLOMO_ReadDoubleInstance(node->nodeAddr,
+                                 nodeInput,
+                                 "RADIO-RX-SNR-THRESHOLD",
+                                 radioNum,
+                                 TRUE,
+                                 &wasFound,
+                                 &snr);
+        if (wasFound) {
+            accnoise->radioRxSnrThreshold_dB = snr;
+            accnoise->radioRxSnrThreshold = NON_DB(snr);
+        }
+        else {
+            fprintf(stderr, "RADIO-RX-SNR-THRESHOLD is missing.\n");
+            assert(FALSE); abort();
+        }
+    }
+    else if (accnoise->radioRxType == BER_BASED) {
+        //
+        // These have to be set.
+        //
+        accnoise->radioRxSnrThreshold_dB = 0.0;
+        accnoise->radioRxSnrThreshold = 1.0;
+    }
+    else {
+        assert(FALSE); abort();
+    }
+
+    /*
+     * Initialize radio statistics variables
+     */
+    accnoise->stats.totalRxSignalsAboveCS = 0;
+    accnoise->stats.totalRxSignalsAboveRX = 0;
+    accnoise->stats.totalRxSignalsToMac = 0;
+    accnoise->stats.totalTxSignals  = 0;
+    accnoise->stats.totalCollisions = 0;
+    accnoise->stats.energyConsumed   = 0.0;
+    accnoise->stats.turnOnTime = simclock();
+
+    /*
+     * Initialize status of radio
+     */
+    accnoise->rxMsg = NULL;
+    accnoise->rxMsgPower_mW = 0.0;
+    accnoise->rxStartTime = 0;
+    accnoise->noisePower_mW = thisRadio->backgroundNoise_mW;
+    accnoise->numSignals = 0;
+    accnoise->previousMode = RADIO_IDLE;
+    accnoise->mode       = RADIO_IDLE;
+    
+    
+}
+
+
+
+
+/*
+ * Used by the MAC layer to start transmitting a packet.
+ */
+ 
+
+void RadioAccnoiseStartTransmittingPacket(
+    GlomoNode* node, 
+    int radioNum, 
+    Message* packet,
+    NODE_ADDR destinationNode,
+    BOOL useMacLayerSpecifiedDelay,
+    clocktype initDelayUntilAirborne)
+{
+    clocktype delayUntilAirborne = initDelayUntilAirborne;
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioAccnoise* accnoise = (GlomoRadioAccnoise *)thisRadio->radioVar;
+    clocktype  txDuration;
+    PropInfo* propInfo;
+    
+    if (!useMacLayerSpecifiedDelay) {
+       delayUntilAirborne = RADIO_PHY_DELAY;
+    }//if//
+     
+    assert(accnoise->mode != RADIO_TRANSMITTING);
+
+    if (accnoise->mode == RADIO_RECEIVING) {
+        //
+        // TX has priority over RX; drop the receiving packet
+        //
+        RadioAccnoiseUnlockPacket(node, accnoise);
+    }
+
+    /*
+     * Increment number of packets currently being processed,
+     * switch to transmitting mode,
+     * and then transmit packet to channel layer
+     */
+    accnoise->previousMode = accnoise->mode;
+    accnoise->mode = RADIO_TRANSMITTING;
+    txDuration = (SYNCHRONIZATION_TIME +
+                  (packet->packetSize * 8 * SECOND) / thisRadio->bandwidth);
+
+    GLOMO_MsgInfoAlloc(node, packet, sizeof(PropInfo));
+    propInfo = (PropInfo *)GLOMO_MsgReturnInfo(packet);
+
+    propInfo->txAddr = node->nodeAddr;
+    propInfo->wavelength = thisRadio->wavelength;
+    propInfo->txPosition = node->position;
+    propInfo->txAntennaHeight = thisRadio->antennaHeight;
+    propInfo->txAntennaGain_dB = thisRadio->antennaGain_dB;
+    
+    propInfo->txPower_dBm = thisRadio->txPower_dBm;
+    propInfo->txStartTime = simclock() + delayUntilAirborne;
+    propInfo->txDuration = txDuration;
+    
+    if ((destinationNode != ANY_DEST) &&
+        (destinationNode == accnoise->lastReceivedFrameSourceNode) &&
+        ((accnoise->lastReceivedFrameTime + FAST_FADING_COHERENCE_TIME) > 
+         simclock()))
+    {
+        propInfo->correlatedFastFading_dB = 
+            accnoise->lastReceivedFrameFastFading_dB;
+        propInfo->correlatedFastFadingDestinationNode = destinationNode;
+    } else {
+        propInfo->correlatedFastFading_dB = 0.0;
+        propInfo->correlatedFastFadingDestinationNode = INVALID_ADDRESS;
+    }//if//
+    accnoise->lastReceivedFrameSourceNode = INVALID_ADDRESS;
+    
+    
+
+    GLOMO_MsgSetLayer(packet, GLOMO_CHANNEL_LAYER, 0);
+    GLOMO_MsgSetEvent(packet, MSG_SPECIAL_Broadcast);
+    GLOMO_MsgSetInstanceId(packet, radioNum);
+    
+    
+
+    GLOMO_MsgSetInstanceId(packet, radioNum);
+    GLOMO_MsgSetLayer(packet, GLOMO_RADIO_LAYER, 0);
+    GLOMO_MsgSetEvent(packet, MSG_RADIO_StartPropagation);
+    GLOMO_MsgSend(node, packet, delayUntilAirborne);
+
+    
+
+    /* Keep track of radio statistics and battery computations */
+    accnoise->stats.totalTxSignals++;
+    accnoise->stats.energyConsumed
+        += txDuration * (BATTERY_TX_POWER_COEFFICIENT
+                         * thisRadio->txPower_mW
+                         + BATTERY_TX_POWER_OFFSET
+                         - BATTERY_RX_POWER);
+}
+
+
+/*
+ * FUNCTION    RadioAccnoiseLayer
+ * PURPOSE     Models the behaviour of the Radio with capture on receiving
+ *             the message.
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:   message received by the layer
+ */
+void RadioAccnoiseLayer(GlomoNode *node, const int radioNum, Message *msg) {
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioAccnoise* accnoise = (GlomoRadioAccnoise *)thisRadio->radioVar;
+
+    switch (msg->eventType) {
+        //
+        // Radio signal arrival
+        //
+        case MSG_RADIO_FromChannelBegin: {
+            PropInfo  *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+            clocktype txDuration = propInfo->txDuration;
+            clocktype endSignalTime = simclock() + txDuration;
+            BOOL receivingNewSignal = FALSE;
+            
+            
+            if(thisRadio->guiOption == TRUE) {
+                char simTime[50];
+                ctoa(simclock(), simTime);
+
+                JGUI_DrawLink(propInfo->txAddr, node->nodeAddr,
+                              simTime, JGUI_YELLOW);
+            }
+
+            switch (accnoise->mode) {
+                //
+                // If the radio is transmitting, the arrived signal just
+                // contributes to the accumlated noise.
+                //
+                case RADIO_TRANSMITTING: {
+                    accnoise->noisePower_mW += propInfo->rxPower_mW;
+
+                    break;
+                }
+                //
+                // If the radio is idle, check if it can receive the arrived
+                // signal.
+                //
+                case RADIO_IDLE: {
+                    //
+                    // If the signal power is strong enough, lock the signal
+                    // and change the mode to receiving.
+                    //
+                    if (propInfo->rxPower_mW >= thisRadio->rxThreshold_mW) {
+                        RadioAccnoiseLockPacket(accnoise, msg);
+                        
+                        accnoise->previousMode = accnoise->mode;
+                        accnoise->mode = RADIO_RECEIVING;
+                        receivingNewSignal = TRUE;
+                        RadioAccnoiseReportExtendedStatusToMac(
+                            node,
+                            radioNum,
+                            RADIO_RECEIVING,
+                            txDuration,
+                            msg);
+                    }
+                    //
+                    // If not, add it to the accumulated noise.
+                    //
+                    else {
+                        accnoise->noisePower_mW += propInfo->rxPower_mW;
+
+                        //
+                        // If accumulated noise is stronger than the radio
+                        // sensitivity, change the mode to sensing.
+                        // Otherwise, the mode stays idle.
+                        //
+                        if (accnoise->noisePower_mW >
+                            thisRadio->rxSensitivity_mW)
+                        {
+                            accnoise->previousMode = accnoise->mode;
+                            accnoise->mode = RADIO_SENSING;
+                            RadioAccnoiseReportStatusToMac(
+                                node,
+                                radioNum,
+                                RADIO_SENSING);
+                        }
+                        else {
+                            assert(accnoise->mode == RADIO_IDLE);
+                        }
+                    }
+
+                    break;
+                }
+                //
+                // If the radio is sensing, check if it can receive the arrived
+                // signal.
+                //
+                case RADIO_SENSING: {
+                    //
+                    // If the signal power is strong enough, lock the signal and
+                    // change the mode to receiving.
+                    //
+                    if ((propInfo->rxPower_mW >= thisRadio->rxThreshold_mW) &&
+                        (propInfo->rxPower_mW >= (accnoise->noisePower_mW *
+                                                  accnoise->radioRxSnrThreshold)))
+                    {
+                        RadioAccnoiseLockPacket(accnoise, msg);
+                        accnoise->previousMode = accnoise->mode;
+                        accnoise->mode = RADIO_RECEIVING;
+                        receivingNewSignal = TRUE;
+                        RadioAccnoiseReportExtendedStatusToMac(
+                            node,
+                            radioNum,
+                            RADIO_RECEIVING,
+                            txDuration,
+                            msg);
+                    }
+                    //
+                    // If not, add it to the accumulated noise.
+                    // The radio mode stays sensing.
+                    //
+                    else {
+                        accnoise->noisePower_mW += propInfo->rxPower_mW;
+                    }
+                    
+                    break;
+                }
+                //
+                // If the radio is receiving, check if the arrived signal can
+                // be captured or collied with the receiving signal.
+                //
+                case RADIO_RECEIVING: {
+                    //
+                    // If the radio type is BER_BASED, check if the receiving
+                    // signal has been dropped.
+                    //
+                    if (accnoise->radioRxType == BER_BASED) {
+                        BOOL errorOccurred =
+                            RadioAccnoiseCheckRxPacketError(node, radioNum);
+
+                        if (errorOccurred == TRUE) {
+                            RadioAccnoiseUnlockPacket(node, accnoise);
+                            accnoise->previousMode = accnoise->mode;
+                            accnoise->mode = RADIO_SENSING;
+                        }
+                        else {
+                            accnoise->rxStartTime = simclock();
+                        }
+                    }
+
+                    //
+                    // Check if the arrived packet can be captured.
+                    //
+                    if (propInfo->rxPower_mW >= ((accnoise->noisePower_mW +
+                                                  accnoise->rxMsgPower_mW) *
+                                                 accnoise->radioRxSnrThreshold))
+                    {
+                        RadioAccnoiseUnlockPacket(node, accnoise);
+                        RadioAccnoiseLockPacket(accnoise, msg);
+                        accnoise->previousMode = accnoise->mode;
+                        accnoise->mode = RADIO_RECEIVING;
+                        receivingNewSignal = TRUE;
+                        
+
+                        RadioAccnoiseReportExtendedStatusToMac(
+                            node,
+                            radioNum,
+                            RADIO_RECEIVING,
+                            txDuration,
+                            msg);
+                    }
+                    //
+                    // Check if the arrived packet can be collied with the
+                    // receiving signal.
+                    // This check is only for SNR_BOUNDED as the error
+                    // (collision) from now till the next noise level change
+                    // will be evaluated later in BER_BASED.
+                    //
+                    else {
+                        accnoise->noisePower_mW += propInfo->rxPower_mW;
+
+                        if (accnoise->radioRxType == SNR_BOUNDED &&
+                            accnoise->rxMsgPower_mW <
+                            (accnoise->noisePower_mW *
+                             accnoise->radioRxSnrThreshold))
+                        {
+                            RadioAccnoiseUnlockPacket(node, accnoise);
+                            accnoise->previousMode = accnoise->mode;
+                            accnoise->mode = RADIO_SENSING;
+                            accnoise->stats.totalCollisions++;
+                        }
+                    }                        
+
+                    if (accnoise->mode == RADIO_SENSING) {
+                        RadioAccnoiseReportStatusToMac(node,
+                                                      radioNum,
+                                                      RADIO_SENSING);
+                    }
+
+                    break;
+                }
+
+                default:
+                    assert(FALSE);
+            }
+
+            //
+            // Statistics
+            //
+            if (propInfo->rxPower_mW >= thisRadio->rxSensitivity_mW) {
+                accnoise->stats.totalRxSignalsAboveCS++;
+            }
+            if (propInfo->rxPower_mW >= thisRadio->rxThreshold_mW) {
+                accnoise->stats.totalRxSignalsAboveRX++;
+            }
+
+            GLOMO_MsgSetInstanceId(msg, radioNum);
+            GLOMO_MsgSetEvent(msg, MSG_RADIO_FromChannelEnd);
+            GLOMO_MsgSend(node, msg, txDuration);
+
+            //
+            // Increment number of packets currently being processed.
+            //
+            accnoise->numSignals++;
+            assert(accnoise->numSignals >= 1);
+
+                           
+           
+            
+                
+
+            break;
+        }
+
+        //
+        // Radio signal end
+        //
+        case MSG_RADIO_FromChannelEnd: {
+            PropInfo *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+            BOOL noiseSignalStopped = FALSE;
+
+            
+            if (propInfo->correlatedFastFading_dB != 0.0) {                               
+                accnoise->lastReceivedFrameFastFading_dB = 
+                    propInfo->correlatedFastFading_dB;
+                accnoise->lastReceivedFrameSourceNode = propInfo->txAddr;
+                accnoise->lastReceivedFrameTime = simclock();
+            }//if//
+            
+            //
+            // If the BER_BASED radio is in the receiving mode, check if the
+            // receiving signal has been dropped.
+            //
+            if (accnoise->mode == RADIO_RECEIVING &&
+                accnoise->radioRxType == BER_BASED)
+            {
+                BOOL errorOccurred =
+                    RadioAccnoiseCheckRxPacketError(node, radioNum);
+
+                if (errorOccurred == TRUE) {
+                    RadioAccnoiseUnlockPacket(node, accnoise);
+                    accnoise->previousMode = accnoise->mode;
+                    accnoise->mode = RADIO_SENSING;
+
+                    RadioAccnoiseReportStatusToMac(node,
+                                                  radioNum,
+                                                  RADIO_SENSING);
+                }
+                else {
+                    accnoise->rxStartTime = simclock();
+                }
+            }
+
+            //
+            // If the radio is still receiving this signal, forward the frame
+            // to the MAC layer.
+            //
+            if (accnoise->mode == RADIO_RECEIVING && accnoise->rxMsg == msg) {
+                if (thisRadio->guiOption == TRUE) {
+                    RadioAccnoiseGuiDrawLine(propInfo->txAddr,
+                                            node->nodeAddr,
+                                            TRUE);
+                }
+
+                /*
+                 * Success! No longer locking onto the packet
+                 */
+                
+                accnoise->rxMsg = NULL;
+                accnoise->rxMsgPower_mW = 0.0;
+                accnoise->rxStartTime = 0;
+                
+                if (accnoise->noisePower_mW > thisRadio->rxSensitivity_mW) {
+                    accnoise->previousMode = accnoise->mode;
+                    accnoise->mode = RADIO_SENSING;
+                }
+                else {
+                    accnoise->previousMode = accnoise->mode;
+                    accnoise->mode = RADIO_IDLE;
+                }
+
+                assert(msg->error == FALSE);
+               
+                GLOMO_MacReceivePacketFromRadio(
+                    node, node->radioData[radioNum]->macInterfaceIndex, msg);
+
+                accnoise->stats.totalRxSignalsToMac++;
+            }
+            else {
+                if (thisRadio->guiOption == TRUE) {
+                    RadioAccnoiseGuiDrawLine(propInfo->txAddr,
+                                            node->nodeAddr,
+                                            FALSE);
+                }
+
+                accnoise->noisePower_mW -= propInfo->rxPower_mW; 
+                noiseSignalStopped = TRUE;
+
+                if (accnoise->mode == RADIO_SENSING &&
+                    accnoise->noisePower_mW <= thisRadio->rxSensitivity_mW)
+                {
+                    accnoise->previousMode = accnoise->mode;
+                    accnoise->mode = RADIO_IDLE;
+
+                    RadioAccnoiseReportStatusToMac(node,
+                                                  radioNum,
+                                                  RADIO_IDLE);
+                }
+
+                GLOMO_MsgFree(node, msg);
+            }
+
+
+            //
+            // Decrement the number of packets being sensed.
+            //
+            accnoise->numSignals--;
+            assert(accnoise->numSignals >= 0);
+            
+            
+            
+            
+            //
+            // Avoid rounding error in the accumulated noise value.
+            //
+            if (accnoise->numSignals == 0) {
+                double noise_mW = thisRadio->backgroundNoise_mW;
+
+                //
+                // Sanity check.
+                //
+                if (fabs((double)(accnoise->noisePower_mW - noise_mW))
+                    >= 1.0e-13)
+                {
+                    assert(FALSE); abort();
+                }
+
+                accnoise->noisePower_mW = noise_mW;
+            }
+
+            break;
+        }
+
+        case MSG_RADIO_StartPropagation: {
+            PropInfo *propInfo = (PropInfo *)GLOMO_MsgReturnInfo(msg);
+
+            assert(accnoise->mode == RADIO_TRANSMITTING);
+
+            GLOMO_PropBroadcast(node->partitionData, msg);
+            
+            GLOMO_MsgSetInstanceId(msg, radioNum);
+            GLOMO_MsgSetLayer(msg, GLOMO_RADIO_LAYER, 0);
+            GLOMO_MsgSetEvent(msg, MSG_RADIO_SwitchToIdle);
+            GLOMO_MsgSend(node, msg, propInfo->txDuration);
+
+            break;
+        }
+
+        case MSG_RADIO_SwitchToIdle: {
+            assert(accnoise->mode == RADIO_TRANSMITTING);
+
+            if (accnoise->noisePower_mW > thisRadio->rxSensitivity_mW) {
+                accnoise->previousMode = accnoise->mode;
+                accnoise->mode = RADIO_SENSING;
+            }
+            else {
+                accnoise->previousMode = accnoise->mode;
+                accnoise->mode = RADIO_IDLE;
+            }
+            RadioAccnoiseReportStatusToMac(node, radioNum, accnoise->mode);
+            GLOMO_MsgFree(node, msg);
+            
+            
+            
+            break;
+        }
+
+        /*
+         * Mac Layer asking radio to check channel status
+         * (Carrier Sensing)
+         */
+        case MSG_RADIO_CheckChannelStatus: {
+            assert(FALSE); abort(); 
+            GLOMO_MsgFree(node, msg);
+
+            RadioAccnoiseReportStatusToMac(node, radioNum, accnoise->mode);
+            break;
+        }
+
+        default: {
+            char clockStr[GLOMO_MAX_STRING_LENGTH];
+            ctoa(simclock(), clockStr);
+            printf("Time %s: Node %u received message of unknown type %d.\n",
+                    clockStr, node->nodeAddr, msg->eventType);
+            assert(FALSE);
+        }
+    }
+}
+
+
+void RadioAccnoiseFinalize(GlomoNode *node, const int radioNum) {
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioAccnoise* accnoise = thisRadio->radioVar;
+    char buf[100];
+
+    if (thisRadio->radioStats == FALSE) {
+        return;
+    }
+
+    assert(thisRadio->radioStats == TRUE);
+
+    sprintf(buf, "Signals transmitted: %d",
+            accnoise->stats.totalTxSignals);
+    GLOMO_PrintStat(node, "RadioAccnoise", buf);
+
+    sprintf(buf, "Signals arrived with power above RX sensitivity: %d",
+            accnoise->stats.totalRxSignalsAboveCS);
+    GLOMO_PrintStat(node, "RadioAccnoise", buf);
+
+    sprintf(buf, "Signals arrived with power above RX threshold: %d",
+            accnoise->stats.totalRxSignalsAboveRX);
+    GLOMO_PrintStat(node, "RadioAccnoise", buf);
+
+    sprintf(buf, "Signals received and forwarded to MAC: %d",
+            accnoise->stats.totalRxSignalsToMac);
+    GLOMO_PrintStat(node, "RadioAccnoise", buf);
+
+    sprintf(buf, "Collisions: %d",
+            accnoise->stats.totalCollisions);
+    GLOMO_PrintStat(node, "RadioAccnoise", buf);
+
+    accnoise->stats.energyConsumed
+        += BATTERY_RX_POWER * (simclock() - accnoise->stats.turnOnTime);
+
+    sprintf(buf, "Energy consumption (in mWhr): %.3f",
+            accnoise->stats.energyConsumed / 3600.0);
+    GLOMO_PrintStat(node, "RadioAccnoise", buf);
+}
+
+
+BOOL RadioAccnoiseCheckRxPacketError(GlomoNode *node, int radioNum) {
+    double BER;
+    GlomoRadio* thisRadio = node->radioData[radioNum];
+    GlomoRadioAccnoise *accnoise = thisRadio->radioVar;
+
+    //
+    // Get BER from the fading model
+    //
+    BER = GLOMO_PropBER(node, accnoise->rxMsgPower_mW, accnoise->noisePower_mW);
+
+    if (BER != 0.0) {
+        double numBits = ((double)(simclock() - accnoise->rxStartTime)
+                          * (double)thisRadio->bandwidth / (double)SECOND);
+
+        double errorProbability = 1.0 - pow((1.0 - BER), numBits);
+
+        assert((errorProbability >= 0.0) && (errorProbability <= 1.0));
+
+        if (errorProbability > pc_erand(node->seed)) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+void RadioAccnoiseGuiDrawLine(NODE_ADDR sourceAddr, NODE_ADDR destAddr, BOOL success) {
+    JGUI_COLOR failTxColor, successTxColor;
+    char simTime[50];
+                    
+    ctoa(simclock(), simTime);
+    failTxColor = JGUI_RED;
+    successTxColor = JGUI_GREEN;
+
+    JGUI_EraseLink(sourceAddr, destAddr, simTime);
+
+    if (success == TRUE) {
+        JGUI_DrawLine(sourceAddr, destAddr, simTime, successTxColor);
+    }
+    else {
+        JGUI_DrawLine(sourceAddr, destAddr, simTime, failTxColor);
+    }
+}
+
+

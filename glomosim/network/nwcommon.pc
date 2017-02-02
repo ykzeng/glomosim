@@ -1,0 +1,249 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: nwcommon.pc,v 1.11 2000/02/25 06:26:33 jmartin Exp $
+ *
+ * File: nwCommon.pc
+ * By: Teresa Yan (tyan@cs.ucla.edu)
+ * Objective: for routing protocol to update IP forwarding table and
+ *            layer on top of IP to encapsulate IP header by setting 
+ *            certain fields in IP. 
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "ip.h"
+#include "nwip.h"
+
+
+/*  FUNCTION    NetworkInitForwardingTable
+ *  PURPOSE     initialize the fowarding table, allocate enough memory for
+ *              number of rows, used by ip
+ *  PARAMETER   node
+ *  RETURN      None.
+ */
+void NetworkInitForwardingTable(GlomoNode *node)
+{
+    GlomoNetworkIp *ip;
+     
+    ip = (GlomoNetworkIp *) node->networkData.networkVar;
+
+
+    ip->forwardTable.size = 0;
+    ip->forwardTable.allocatedSize = 0;
+    ip->forwardTable.row = NULL;
+}
+
+/*  FUNCTION    NetworkEmptyFowardingTable
+ *  PURPOSE     empty out all the entries in the routing table
+ *              basically set the size of table back to 0.
+ *  PARAMETER   node
+ *  RETURN      None.
+ */
+void NetworkEmptyForwardingTable(GlomoNode *node)
+{
+    GlomoNetworkIp *ip;
+     
+    ip = (GlomoNetworkIp *) node->networkData.networkVar;
+    ip->forwardTable.size = 0;
+}
+
+
+/*  FUNCTION    NetworkGetInterfaceAndNextHopFromForwardingTable
+ *  PURPOSE     get the interface Id node that lead to destAddress.
+ *  PARAMETER   node - its own node.
+ *              destAddress - destination Address.
+ *  RETURN      interface Id from node to destAddr, or
+ *              NETWORK_UNREACHABLE (no such entry is found)
+ */
+void NetworkGetInterfaceAndNextHopFromForwardingTable(
+   GlomoNode *node, NODE_ADDR destinationAddress, 
+   InterfaceIdType* interfaceId, NODE_ADDR* nextHopAddress)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    NetworkForwardingTable* routingTable = &(ipLayer->forwardTable);
+    int i;
+    
+    *interfaceId = NETWORK_UNREACHABLE;
+    *nextHopAddress = NETWORK_UNREACHABLE;
+
+    for (i=0; (i < routingTable->size); i++) {
+        if (routingTable->row[i].destAddress == destinationAddress) {
+            *interfaceId = routingTable->row[i].interfaceId;
+            *nextHopAddress = routingTable->row[i].nextHopAddress;
+            break;
+        }
+    }
+}
+
+
+#define FORWARDING_TABLE_ROW_START_SIZE 8
+
+
+/*  FUNCTION    NetworkUpdateForwardingTable
+ *  PURPOSE     update entry with destAddress
+ *              search for the row with destAddress, update its interfaceAddress
+ *               if no row is found, add a new row and increase table size.
+ *  PARAMETER   node   - its own node.
+ *              destAddress - destination Id to match in the table
+ *              interfaceAddress - new interface.
+ */
+ 
+void NetworkUpdateForwardingTable(
+    GlomoNode *node, 
+    NODE_ADDR destAddress, 
+    InterfaceIdType interfaceId, 
+    NODE_ADDR nextHopAddress)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    NetworkForwardingTable* routingTable = &(ipLayer->forwardTable);
+    int i;
+
+
+
+
+    for(i=0; ((i < routingTable->size) && 
+              (routingTable->row[i].destAddress != destAddress)); i++)
+    {
+        // Nothing
+    }//for//
+    
+    if (i == routingTable->size) {
+        routingTable->size++;
+        assert (routingTable->size <= node->numNodes);
+        if (routingTable->size > routingTable->allocatedSize) {
+            if (routingTable->allocatedSize == 0) {
+                routingTable->allocatedSize = FORWARDING_TABLE_ROW_START_SIZE;
+                routingTable->row = (NetworkForwardingTableRow*)
+                    checked_pc_malloc(
+                        routingTable->allocatedSize * 
+                        sizeof(NetworkForwardingTableRow));
+            } else {
+                int newSize = (routingTable->allocatedSize * 2);
+                NetworkForwardingTableRow* newTableRow = 
+                    (NetworkForwardingTableRow*)checked_pc_malloc(
+                        newSize * sizeof(NetworkForwardingTableRow));
+
+                memcpy(newTableRow, routingTable->row,
+                       (routingTable->allocatedSize * 
+                        sizeof(NetworkForwardingTableRow)));
+
+                pc_free(routingTable->row);
+                routingTable->row = newTableRow;
+                routingTable->allocatedSize = newSize;
+            }
+        }
+    }
+    
+    routingTable->row[i].destAddress = destAddress;
+    routingTable->row[i].interfaceId = interfaceId;
+    routingTable->row[i].nextHopAddress = nextHopAddress;
+}
+   
+
+ 
+/*  FUNCTION    NetworkPrintForwardingTable
+ *  PURPOSE     display all entries in routing table of the node.
+ *  PARAMETER   node 
+ *  RETURN      None.
+ */
+void NetworkPrintForwardingTable(GlomoNode *node)
+{
+    int i;
+    GlomoNetworkIp *ip;
+    NetworkForwardingTable *rt;
+     
+    ip = (GlomoNetworkIp *) node->networkData.networkVar;
+    rt = &(ip->forwardTable);
+
+    printf ("Forwarding Table for node %u\n", node->nodeAddr);
+    for (i=0; i<rt->size; i++) {
+        printf ("destAddress %u interfaceId %u nextHop %u\n",
+                rt->row[i].destAddress, rt->row[i].interfaceId,
+                rt->row[i].nextHopAddress);
+    }
+    printf ("\n");
+}
+
+void NetworkPrintIpHeader(Message *msg)
+{
+    struct ip *ipHdr;
+    struct ip_options *opt;
+    char *dataptr = msg->packet;
+    int i;
+
+    ipHdr = (struct ip *) (msg->packet);
+
+    printf("IP header\n");
+    printf("totalLength %d headerLength %d moreFragment %d fragmentOffset %d"
+           "  timeToLive %d ",
+           ipHdr->ip_len, ipHdr->ip_hl, ipHdr->ip_more_fragments,
+           ipHdr->ip_fragment_offset,
+           ipHdr->ip_ttl);
+    printf("protocol %d sourceId %ld destId %ld identity %d\n",
+           ipHdr->ip_p, ipHdr->ip_src, ipHdr->ip_dst, ipHdr->ip_id);
+
+    dataptr += sizeof(struct ip);
+    opt = (struct ip_options *) dataptr;
+
+    printf ("code %d, len %d, ptr %d\n", opt->code, opt->len, opt->ptr);
+
+    if (ipHdr->ip_hl * 4 > sizeof(struct ip)) {
+        if ( opt->code == IPOPT_SSRR) {
+            for (i=1; i<= (opt->len - 3) / 4; i++) {
+                NODE_ADDR nodePtr;
+                memcpy(&nodePtr, (dataptr + i*4 - 1), sizeof(NODE_ADDR));
+                printf ("%d, ", nodePtr);
+
+            }
+            printf ("\n");
+        }
+    }
+    /*printf ("payload %s\n", (dataptr + opt->len)); */
+
+}
+

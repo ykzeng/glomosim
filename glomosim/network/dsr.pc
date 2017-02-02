@@ -1,0 +1,2814 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * Name: dsr.pc
+ *
+ * Written By S.J. Lee
+ *
+ */
+ 
+/*
+ NOTE: - Followed the specification of DSR Internet Draft (03)
+       - Must set promiscuous mode to YES in "config.in" in order to run DSR
+       - Assumes the MAC protocol sends a signal to the routing protocol
+         when it detects link breaks. MAC protocols such as IEEE 802.11
+         and MACAW has this functionality. In IEEE 802.11, when no CTS
+         is received after RTS, and no ACK is received after retransmissions
+         of unicasted packet, it sends the signal to the routing protocol
+       - If users want to use MAC protocols other than IEEE 802.11, they
+         must implement schemes to detect link breaks. A way to do this is,
+         for example, using passive acknowledgments, as specified in DSR
+         documents
+       - Destination sends Route Replies to ALL Route Requests it receives, as
+         was done in CMU's NS2 implementation
+       - Most, but not all, optimization features of DSR are implemented.
+         Implemented optimizations are:
+          + Promiscuous learning of source routes
+          + Discovering shorter routes
+          + Rate limiting the route discovery process
+          + All nodes process all of the Route Error messages the receive 
+            (when the node is the destination of the packet, is the forwarder,
+             or overhears the packet promiscuously) 
+          + Nonpropagating Route Requests
+          + Replying from cache
+          + Gratuitous Route Replies
+          + Salvaging (for data and Route Errors)
+          + Tapping
+
+         Optimizations not implemented are:
+          + Preventing Route Reply Storms
+          + Path state and flow state mechanisms
+          + Piggybacking on Route Discoveries
+          + Gratuitous Route Errors
+*/
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "dsr.h"
+#include "ip.h"
+#include "nwip.h"
+#include "nwcommon.h"
+#include "application.h"
+#include "transport.h"
+#include "java_gui.h"
+
+
+/*
+ * RoutingDsrInit
+ *
+ * Initialization function for DSR protocol 
+ */
+void RoutingDsrInit(
+    GlomoNode *node,
+    GlomoRoutingDsr **dsrPtr,
+    const GlomoNodeInput *nodeInput)
+{
+    GlomoRoutingDsr *dsr = 
+        (GlomoRoutingDsr *)checked_pc_malloc (sizeof(GlomoRoutingDsr));
+
+    (*dsrPtr) = dsr;
+
+    if (dsr == NULL)
+    {
+        fprintf(stderr, "DSR: Cannot alloc memory for DSR struct!\n");
+        assert (FALSE);
+    }
+
+    RoutingDsrInitStats(node);
+    RoutingDsrInitRequestSeen(&dsr->requestSeenTable);
+    RoutingDsrInitRouteCache(&dsr->routeCacheTable);
+    RoutingDsrInitSeq(node);
+    RoutingDsrInitRequestTable(&dsr->requestTable);
+    RoutingDsrInitBuffer(&dsr->buffer);
+
+    NetworkIpSetPacketDropNotificationFunction(
+        node, &RoutingDsrPacketDropNotificationHandler);
+
+    NetworkIpSetRouterFunction(node, &RoutingDsrRouterFunction);
+
+    /* Need to do this to run promiscuous mode */
+    NetworkIpSetPromiscuousMessagePeekFunction(node, &RoutingDsrPeekFunction);
+
+} /* RoutingDsrInit */
+
+/* 
+ * RoutingDsrFinalize
+ *
+ * Called at the end of simulation to collect the results 
+ */
+void RoutingDsrFinalize(GlomoNode *node)
+{
+    GlomoNetworkIp *ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingDsr *dsr = (GlomoRoutingDsr *)ipLayer->routingProtocol;
+    FILE *statOut;
+    float avgHopCnt;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+    sprintf(buf, "Number of Requests Txed = %d", dsr->stats.numRequestSent);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    sprintf(buf, "Number of Replies Txed = %d", dsr->stats.numReplySent);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    sprintf(buf, "Number of Errors Txed = %d", dsr->stats.numErrorSent);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    sprintf(buf, "Number of CTRL Packets Txed = %d",
+                 dsr->stats.numRequestSent + dsr->stats.numReplySent + 
+                 dsr->stats.numErrorSent);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+
+    sprintf(buf, "Number of Routes Selected = %d", dsr->stats.numRoutes);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    sprintf(buf, "Number of Hop Counts = %d", dsr->stats.numHops);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+
+    sprintf(buf, "Number of Data Txed = %d", dsr->stats.numDataTxed);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    sprintf(buf, "Number of Data Originated = %d", dsr->stats.numDataSent);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    sprintf(buf, "Number of Data Received = %d", dsr->stats.numDataReceived);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    
+    sprintf(buf, "Number of Link Breaks = %d", dsr->stats.numLinkBreaks);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    
+    sprintf(buf, "Number of Salvaged Packets = %d", 
+        dsr->stats.numSalvagedPackets);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+    
+    sprintf(buf, "Number of Dropped Packets = %d", 
+        dsr->stats.numDroppedPackets);
+    GLOMO_PrintStat(node, "RoutingDsr", buf);
+
+} /* Network Dsr Finalize */
+
+/*
+ * RoutingDsrHandleRequest
+ * 
+ * Processing procedure when Route Request is received
+ */
+void RoutingDsrHandleRequest(GlomoNode *node, Message *msg, int ttl)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    DSR_RouteRequest *rreq = (DSR_RouteRequest *)GLOMO_MsgReturnPacket(msg);
+    IpHeaderType *ipHdr = (IpHeaderType *)GLOMO_MsgReturnPacket(msg);
+
+    /* If destination of the route (dest sends Reply to every requests) */
+    if (rreq->targetAddr == node->nodeAddr)
+    {
+        RoutingDsrInitiateRREP(node, msg);
+    }
+
+    /* Not a destination; if the request is not seen before */
+    else if (!RoutingDsrLookupRequestSeen(rreq->srcAddr, 
+                                          rreq->seqNumber, 
+                                          &dsr->requestSeenTable))
+    {
+        /* Insert request info into request seen table */
+        RoutingDsrInsertRequestSeen(node, 
+                                    rreq->srcAddr, 
+                                    rreq->seqNumber, 
+                                    &dsr->requestSeenTable);
+
+        /* Check if its address is in the path of the packet */
+        if (!RoutingDsrCheckRequestPath(node, 
+                                        rreq->path, 
+                                        rreq->hopCount - 1))
+        {
+            /* If it has a route to destination, send a Route Reply */
+            if (RoutingDsrCheckRouteExist(rreq->targetAddr, 
+                                          &dsr->routeCacheTable))
+            {
+                RoutingDsrInitiateRREPbyIN(node, msg);
+            } /* if check route exist */
+
+            /* Does not have any route in cache; Relay the packet if ttl > 0 */
+            else if (ttl > 0 && rreq->hopCount < DSR_MAX_SR_LEN)
+            {
+                RoutingDsrRelayRREQ(node, msg, ttl);
+            } /* else if ttl > 0 */
+
+            else
+            {
+                GLOMO_MsgFree(node, msg);
+            }
+
+        } /* if check request path */
+
+        else
+        {
+            GLOMO_MsgFree(node, msg);
+        }
+    } /* else if lookup request seen */
+
+    else
+    {
+        GLOMO_MsgFree(node, msg);
+    }
+} /* Handle Request */
+
+/*
+ * RoutingDsrHandleReply
+ *
+ * Processing procedure when Route Reply is received
+ */
+void RoutingDsrHandleReply(
+    GlomoNode *node, Message *msg, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteReply *rrep = (DSR_RouteReply *)GLOMO_MsgReturnPacket(msg);
+    NODE_ADDR newPath[DSR_MAX_SR_LEN];
+    int segLeft;
+    int i, j, k;
+
+    segLeft = rrep->segLeft - 1;
+
+    /* I'm the destination of the packet (source of the route) */
+    if (rrep->targetAddr == node->nodeAddr && destAddr == node->nodeAddr)
+    {
+        /* A new (and first) route to the destination */
+        if (!RoutingDsrCheckRouteExist(rrep->srcAddr, &dsr->routeCacheTable) &&
+            !RoutingDsrCheckDataSeen(node, rrep->path, rrep->hopCount) &&
+            rrep->srcAddr != ANY_DEST)
+        {
+            RoutingDsrInsertRouteCache(rrep->path[rrep->hopCount - 1],
+                                       rrep->hopCount,
+                                       rrep->path,
+                                       &dsr->routeCacheTable);
+
+            dsr->stats.numRoutes++;
+            dsr->stats.numHops += rrep->hopCount;
+
+            RoutingDsrDeleteRequestTable(rrep->srcAddr, &dsr->requestTable);
+
+            // Remove packets expired waiting for route.
+            
+            RoutingDsrRemoveOldPacketsFromBuffer(&dsr->buffer); 
+                            
+            /* Send buffered data packets that waited for a route */
+            while (RoutingDsrLookupBuffer(rrep->srcAddr, &dsr->buffer))
+            {
+                newMsg = RoutingDsrGetBufferedPacket(rrep->srcAddr, 
+                                                     &dsr->buffer);
+
+                RoutingDsrTransmitData(node, newMsg, rrep->srcAddr);
+
+                RoutingDsrDeleteBuffer(rrep->srcAddr, &dsr->buffer);
+
+            } /* while */
+
+            /* Optimization: Adding routes to intermediate nodes */
+            for (i = 0; i < rrep->hopCount - 1; i++)
+            {
+                for (j = 0; j <= i; j++)
+                {
+                    newPath[j] = rrep->path[j];
+                }
+                for (j = i + 1; j < DSR_MAX_SR_LEN; j++)
+                {
+                    newPath[j] = ANY_DEST;
+                }
+
+                /* Check if the route is new */
+                if (!RoutingDsrCompareRoute(rrep->path[i],
+                                            i + 1,
+                                            newPath,
+                                            &dsr->routeCacheTable) &&
+                    !RoutingDsrCheckDataSeen(node, newPath, i + 1))
+                {
+                    RoutingDsrInsertRouteCache(rrep->path[i],
+                                               i + 1, 
+                                               newPath,
+                                               &dsr->routeCacheTable);
+
+                } /* if a new route */
+            } /* for */
+        } /* if check route exist */
+
+        /* routes to the destination already exist */
+        else
+        {
+            /* if the route is not the same as one in the cache */
+            if (!RoutingDsrCompareRoute(rrep->path[rrep->hopCount - 1],
+                                        rrep->hopCount,
+                                        rrep->path,
+                                        &dsr->routeCacheTable) &&
+                !RoutingDsrCheckDataSeen(node, rrep->path, rrep->hopCount))
+            {
+                RoutingDsrInsertRouteCache(rrep->path[rrep->hopCount - 1],
+                                           rrep->hopCount,
+                                           rrep->path,
+                                           &dsr->routeCacheTable);
+
+            }
+
+            /* Optimization: Adding routes to intermediate nodes */
+            for (i = 0; i < rrep->hopCount - 1; i++)
+            {
+                for (j = 0; j <= i; j++)
+                {
+                    newPath[j] = rrep->path[j];
+                }
+                for (j = i + 1; j < DSR_MAX_SR_LEN; j++)
+                {
+                    newPath[j] = ANY_DEST;
+                }
+
+                /* Check if new route is the same as one in cache */
+                if (!RoutingDsrCompareRoute(rrep->path[i],
+                                            i + 1,
+                                            newPath,
+                                            &dsr->routeCacheTable) &&
+                    !RoutingDsrCheckDataSeen(node, newPath, i + 1))
+                {
+                    /* Insert the route into cache */
+                    RoutingDsrInsertRouteCache(rrep->path[i],
+                                               i + 1, 
+                                               newPath,
+                                               &dsr->routeCacheTable);
+
+                } /* if a new route */
+            } /* for */
+        } /* else */
+
+        GLOMO_MsgFree(node, msg);
+
+    } /* if dest */
+
+    /* Node is the intended intermediate node; 
+       cache the routes and relay the packet*/
+    else if (destAddr == node->nodeAddr)
+    {
+        /* Insert the routes into cache */
+        for (i = 0; i < rrep->hopCount; i++)
+        {
+            newPath[i] = rrep->path[segLeft + i];
+        }
+        for (i = rrep->hopCount; i < DSR_MAX_SR_LEN; i++)
+        {
+            newPath[i] = ANY_DEST;
+        }
+
+        /* Check if the route is new */
+        if (!RoutingDsrCompareRoute(rrep->srcAddr,
+                                    rrep->hopCount,
+                                    newPath,
+                                    &dsr->routeCacheTable) &&
+            !RoutingDsrCheckDataSeen(node, newPath, rrep->hopCount))
+        {
+            RoutingDsrInsertRouteCache(
+                rrep->srcAddr, rrep->hopCount, newPath, &dsr->routeCacheTable);
+
+        } /* if compare route */
+
+        /* Optimization: Adding routes to intermediate nodes */
+        for (j = segLeft; 
+             j < rrep->hopCount + segLeft - 1; 
+             j++)
+        {
+            for (k = 0; k <= j - segLeft; k++)
+            {
+                newPath[k] = rrep->path[k + segLeft];
+            }
+            for (k = j + 1 - segLeft; k < DSR_MAX_SR_LEN; k++)
+            {
+                newPath[k] = ANY_DEST;
+            }
+
+            /* Check if the route is new */
+            if (!RoutingDsrCompareRoute(rrep->path[j],
+                                        j + 1 - segLeft,
+                                        newPath,
+                                        &dsr->routeCacheTable) &&
+                !RoutingDsrCheckDataSeen(node, newPath, j + 1 - segLeft))
+            {
+                RoutingDsrInsertRouteCache(rrep->path[j],
+                                           j + 1 - segLeft,
+                                           newPath,
+                                           &dsr->routeCacheTable);
+
+            } /* if compare route */
+        } /* for */
+
+        RoutingDsrRelayRREP(node, msg); 
+
+    } /* else if intended receiver */
+
+    else
+    {
+        GLOMO_MsgFree(node, msg);
+    }
+} /* Handle Reply */
+
+/*
+ * RoutingDsrHandleError
+ *
+ * Processing procedure when Route Error is received
+ */
+void RoutingDsrHandleError(GlomoNode *node, Message *msg, 
+                           NODE_ADDR srcAddr, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteError *rerr = (DSR_RouteError *)GLOMO_MsgReturnPacket(msg);
+
+    /* Delete routes in cache that use the broken link */
+    RoutingDsrDeleteRouteCache(node,
+                               rerr->srcAddr, 
+                               rerr->unreachableAddr, 
+                               &dsr->routeCacheTable);
+
+    /* If intermediate node of the broken route, then forward the packet */
+    if (rerr->path[rerr->hopCount - 1] == node->nodeAddr &&
+        destAddr == node->nodeAddr &&
+        rerr->destAddr != node->nodeAddr)
+    {
+        RoutingDsrRelayRERR(node, msg);
+    } /* if intended receiver */
+
+    /* if source of the broken route */
+    else if (rerr->destAddr == node->nodeAddr)
+    {
+        GLOMO_MsgFree(node, msg);
+    }
+
+} /* Handle Error */
+
+/*
+ * RoutingDsrInitRouteCache
+ *
+ * Initialize the Route Cache Table
+ */
+void RoutingDsrInitRouteCache(DSR_RouteCache *routeCache)
+{
+    routeCache->head = NULL;
+    routeCache->count = 0;
+} /* Init route cache */
+
+/*
+ * RoutingDsrInitRequestSeen
+ *
+ * Initialize the Request Seen Table
+ */
+void RoutingDsrInitRequestSeen(DSR_RequestSeen *requestSeen)
+{
+    requestSeen->front = NULL;
+    requestSeen->rear = NULL;
+    requestSeen->count = 0;
+} /* Init Request Seen */
+
+/*
+ * RoutingDsrInitRequestTable
+ *
+ * Initialize the Node Info Cache Table
+ */
+void RoutingDsrInitRequestTable(DSR_RequestTable *requestTable)
+{
+    requestTable->head = NULL;
+    requestTable->count = 0;
+} /* Init node info cache */
+
+/*
+ * RoutingDsrInitSeq
+ *
+ * Initialize the Sequence Table
+ */
+void RoutingDsrInitSeq(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+
+    dsr->seqNumber = 0;
+} /* Init seq */
+
+/*
+ * RoutingDsrInitBuffer
+ *
+ * Initialize the buffer
+ */
+void RoutingDsrInitBuffer(DSR_BUFFER *buffer)
+{
+    buffer->head = NULL;
+    buffer->size = 0;
+}
+
+/* 
+ * RoutingDsrInitStats
+ *
+ * Initialize all the stats variables  
+ */
+void RoutingDsrInitStats(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+
+    dsr->stats.numRequestSent = 0;
+    dsr->stats.numReplySent = 0;
+    dsr->stats.numErrorSent = 0;
+    dsr->stats.numDataSent = 0;
+    dsr->stats.numDataTxed = 0;
+    dsr->stats.numDataReceived = 0;
+    dsr->stats.numHops = 0;
+    dsr->stats.numRoutes = 0;
+    dsr->stats.numLinkBreaks = 0;
+    dsr->stats.numSalvagedPackets = 0;
+    dsr->stats.numDroppedPackets = 0;
+} /* Init stats */
+
+/*
+ * RoutingDsrDeleteSeenTable
+ *
+ * Delete a request seen table entry
+ */
+void RoutingDsrDeleteSeenTable(DSR_RequestSeen *requestSeen)
+{
+    DSR_RequestSeenEntry *toFree;
+
+    toFree = requestSeen->front;
+    requestSeen->front = toFree->next;
+    --(requestSeen->count);
+
+    if (requestSeen->count == 0)
+    {
+        requestSeen->rear = NULL;
+    }
+} /* Delete Seen Table */
+
+/*
+ * RoutingDsrCheckRouteExist
+ *
+ * Check if a route to a specific node is already known
+ * return TRUE if route already exists; FALSE otherwise
+ */
+BOOL RoutingDsrCheckRouteExist(NODE_ADDR destAddr,
+                               DSR_RouteCache *routeCache)
+{
+    DSR_RouteCacheEntry *current;
+
+    if (routeCache->count == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = routeCache->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ * RoutingDsrLookupRequestSeen
+ *
+ * Check if the route request packet is seen before
+ * return TRUE if seen before; FALSE otherwise
+ */
+BOOL RoutingDsrLookupRequestSeen(NODE_ADDR srcAddr,
+                                 int seq,
+                                 DSR_RequestSeen *requestSeen)
+{
+    DSR_RequestSeenEntry *current;
+
+    if (requestSeen->count == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = requestSeen->front;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->srcAddr == srcAddr && current->seqNumber == seq)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ * RoutingDsrLookupRequestTable
+ *
+ * Check if backoff interval has expired for a destination
+ * return TRUE if interval expired; FALSE otherwise
+ */
+BOOL RoutingDsrLookupRequestTable(NODE_ADDR destAddr,
+                                  DSR_RequestTable *requestTable)
+{
+    DSR_RequestTableEntry *current;
+
+    if (requestTable->count == 0)
+    {
+        return (TRUE);
+    }
+
+    for (current = requestTable->head;
+         current != NULL;
+         current = current->next)
+    {
+        if ((current->destAddr == destAddr) &&
+            ((simclock() - current->lastRequest) > current->backoffInterval))
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+
+} /* Lookup info cache */
+
+/*
+ * RoutingDsrInsertRequestSeen
+ *
+ * Insert a new route request entry
+ */
+void RoutingDsrInsertRequestSeen(GlomoNode *node,
+                                 NODE_ADDR srcAddr,
+                                 int seqNumber,
+                                 DSR_RequestSeen *requestSeen)
+{
+    DSR_CR cr;
+    if (requestSeen->count == 0)
+    {
+        requestSeen->rear = (DSR_RequestSeenEntry *)
+                            pc_malloc(sizeof(DSR_RequestSeenEntry));
+        assert(requestSeen->rear != NULL);
+        requestSeen->front = requestSeen->rear;
+    }
+    else
+    {
+        requestSeen->rear->next = (DSR_RequestSeenEntry *)
+                                  pc_malloc(sizeof(DSR_RequestSeenEntry));
+        assert(requestSeen->rear->next != NULL);
+        requestSeen->rear = requestSeen->rear->next;
+    }
+
+    requestSeen->rear->srcAddr = srcAddr;
+    requestSeen->rear->seqNumber = seqNumber;
+    requestSeen->rear->next = NULL;
+
+    ++(requestSeen->count);
+
+    cr.destAddr = ANY_DEST;
+    cr.ttl = 0;
+
+    RoutingDsrSetTimer(node, MSG_NETWORK_FlushTables, cr, DSR_FLUSH_INTERVAL);
+
+} /* Insert request seen */
+
+/*
+ * RoutingDsrInsertRouteCache
+ *
+ * Insert a new route entry
+ */
+void RoutingDsrInsertRouteCache(NODE_ADDR destAddr,
+                                int hopCount,
+                                NODE_ADDR *path,
+                                DSR_RouteCache *routeCache)
+{
+    ++(routeCache->count);
+
+    routeCache->head = RoutingDsrInsertRCInOrder(destAddr,
+                                                 hopCount,
+                                                 path,
+                                                 routeCache->head,
+                                                 NULL);     
+} /* Insert route cache */
+
+/* 
+ * RoutingDsrInsertRCInOrder
+ *
+ * Insert a new route entry in the order of destAddr
+ */
+DSR_RouteCacheEntry *RoutingDsrInsertRCInOrder(NODE_ADDR destAddr,
+                                               int hopCount,
+                                               NODE_ADDR *path,
+                                               DSR_RouteCacheEntry *old,
+                                               DSR_RouteCacheEntry *last)
+{
+    DSR_RouteCacheEntry *newOne;
+    int i;
+
+    if (old == NULL)
+    {
+        newOne = (DSR_RouteCacheEntry *)pc_malloc(sizeof(DSR_RouteCacheEntry));
+        assert(newOne != NULL);
+
+        newOne->destAddr = destAddr;
+        newOne->hopCount = hopCount;
+        for (i = 0; i < DSR_MAX_SR_LEN; i++)
+        {
+            newOne->path[i] = path[i];
+        }
+        newOne->prev = last;
+        newOne->next = NULL;
+    }
+    else if ((old->destAddr > destAddr) || 
+             ((old->destAddr == destAddr) && (old->hopCount > hopCount)))
+    {
+        newOne = (DSR_RouteCacheEntry *)pc_malloc(sizeof(DSR_RouteCacheEntry));
+        assert(newOne != NULL);
+  
+        newOne->destAddr = destAddr;
+        newOne->hopCount = hopCount;
+        for (i = 0; i < DSR_MAX_SR_LEN; i++)
+        {
+            newOne->path[i] = path[i];
+        }
+
+        newOne->prev = old->prev;
+        if (old->prev != NULL)
+        {
+            old->prev->next = newOne;
+        }
+        old->prev = newOne;
+        newOne->next = old;
+        
+    }
+    else if ((old->destAddr == destAddr) && (old->hopCount == hopCount))
+    {
+        newOne = (DSR_RouteCacheEntry *)pc_malloc(sizeof(DSR_RouteCacheEntry));
+        assert(newOne != NULL);
+  
+        newOne->destAddr = destAddr;
+        newOne->hopCount = old->hopCount;
+        old->hopCount = hopCount;
+        for (i = 0; i < DSR_MAX_SR_LEN; i++)
+        {
+            newOne->path[i] = old->path[i];
+        }
+        for (i = 0; i < DSR_MAX_SR_LEN; i++)
+        {
+            old->path[i] = path[i];
+        }
+
+        newOne->prev = old->prev;
+        if (old->prev != NULL)
+        {
+            old->prev->next = newOne;
+        }
+        old->prev = newOne;
+        newOne->next = old;
+    }
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingDsrInsertRCInOrder(destAddr,
+                                                 hopCount,
+                                                 path,
+                                                 old->next,
+                                                 newOne);
+    }
+
+    return(newOne);
+}
+
+/*
+ * RoutingDsrInsertRequestTable
+ *
+ * Insert a new entry into the request table
+ */
+void RoutingDsrInsertRequestTable(NODE_ADDR destAddr,
+                                  DSR_RequestTable *requestTable)
+{
+    ++(requestTable->count);
+    requestTable->head = RoutingDsrInsertRTInOrder(destAddr,
+                                                   requestTable->head);
+}
+
+/*
+ * RoutingDsrInsertRTInOrder
+ *
+ * Insert a new entry into the request table in the order of destAddr
+ */
+DSR_RequestTableEntry *RoutingDsrInsertRTInOrder(NODE_ADDR destAddr,
+                                                 DSR_RequestTableEntry *old)
+{
+    DSR_RequestTableEntry *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (DSR_RequestTableEntry *)
+                 pc_malloc(sizeof(DSR_RequestTableEntry));
+        assert(newOne != NULL);
+
+        newOne->destAddr = destAddr;
+        newOne->lastRequest = simclock();
+        newOne->backoffInterval = DSR_REQUEST_PERIOD;
+        newOne->ttl = 1;
+        newOne->next = NULL;
+    }
+    else if (old->destAddr > destAddr)
+    {
+        newOne = (DSR_RequestTableEntry *)
+                 pc_malloc(sizeof(DSR_RequestTableEntry));
+        assert(newOne != NULL);
+
+        newOne->destAddr = destAddr;
+        newOne->lastRequest = simclock();
+        newOne->backoffInterval = DSR_REQUEST_PERIOD;
+        newOne->ttl = 1;
+        newOne->next = old;
+    }
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingDsrInsertRTInOrder(destAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/*
+ * RoutingDsrInsertBuffer
+ *
+ * Insert a new packet into the buffer
+ */
+void RoutingDsrInsertBuffer(Message *msg, NODE_ADDR destAddr,
+                            DSR_BUFFER *buffer)
+{
+    ++(buffer->size);
+    buffer->head = RoutingDsrInsertBufInOrder(msg, destAddr, buffer->head);
+}
+
+/*
+ * RoutingDsrInsertBufInOrder
+ *
+ * Insert a new packet into the buffer in the order of destAddr
+ */
+DSR_BUFFER_Node *RoutingDsrInsertBufInOrder(Message *msg, NODE_ADDR destAddr,
+                                            DSR_BUFFER_Node *old)
+{
+    DSR_BUFFER_Node *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (DSR_BUFFER_Node *)pc_malloc(sizeof(DSR_BUFFER_Node));
+        assert(newOne != NULL);
+
+        newOne->destAddr = destAddr;
+        newOne->msg = msg;
+        newOne->timestamp = simclock();
+        newOne->next = NULL;
+    }
+    else if (old->destAddr > destAddr)
+    {
+        newOne = (DSR_BUFFER_Node *)pc_malloc(sizeof(DSR_BUFFER_Node));
+        assert(newOne != NULL);
+
+        newOne->destAddr = destAddr;
+        newOne->msg = msg;
+        newOne->timestamp = simclock();
+        newOne->next = old;
+    }
+    else if (old->destAddr == destAddr)
+    {
+        newOne = (DSR_BUFFER_Node *)pc_malloc(sizeof(DSR_BUFFER_Node));
+        assert(newOne != NULL);
+
+        newOne->destAddr = destAddr;
+        newOne->msg = old->msg;
+        old->msg = msg;
+        newOne->timestamp = old->timestamp;
+        old->timestamp = simclock();
+        newOne->next = old;
+    }
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingDsrInsertBufInOrder(msg, destAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/*
+ * RoutingDsrCompareRoute
+ *
+ * Check if new route is the same as the one in cache
+ * return TRUE if new route is the same; FALSE otherwise
+ */
+BOOL RoutingDsrCompareRoute(NODE_ADDR destAddr,
+                            int hopCount,
+                            NODE_ADDR *path,
+                            DSR_RouteCache *routeCache)
+{
+    int i, j;
+    BOOL found = FALSE;
+    DSR_RouteCacheEntry *current;
+
+/*
+printf("COMPARE ROUTE: hop count = %d\n", hopCount);
+*/
+
+    for (current = routeCache->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr && current->hopCount == hopCount)
+        {
+            for (i = 0; i < hopCount; i++)
+            {
+                if (current->path[i] != path[i])
+                {
+                    found = FALSE;
+                    break;
+                }
+                else
+                {
+                    found = TRUE;
+                }
+            }
+            if (found == TRUE)
+            {
+                return (found);
+            }
+        }
+    }
+
+    return (found);
+
+} /* Compare route */
+ 
+/*
+ * RoutingDsrDeleteRouteCache
+ *
+ * Delete route entries that use the broken link
+ */
+void RoutingDsrDeleteRouteCache(GlomoNode *node,
+                                NODE_ADDR fromHop,
+                                NODE_ADDR nextHop,
+                                DSR_RouteCache *routeCache)
+{
+    int i;
+    DSR_RouteCacheEntry *toFree;
+    DSR_RouteCacheEntry *current;
+    BOOL found;
+
+    if (routeCache->count == 0 || routeCache->head == NULL)
+    {
+        return;
+    }
+    else
+    {
+        current = routeCache->head;
+        while (current != NULL)
+        {
+            if (current->path[0] == nextHop && fromHop == node->nodeAddr)
+            {
+                toFree = current;
+
+                if (current->prev == NULL && current->next == NULL)
+                {
+                    routeCache->head = current->next;
+                }
+                else if (current->prev == NULL)
+                {
+                    current->next->prev = current->prev;
+                    routeCache->head = current->next;
+                }
+                else if (current->next == NULL)
+                {
+                    current->prev->next = current->next;
+                }
+                else
+                { 
+                    current->prev->next = current->next;
+                    current->next->prev = current->prev;
+                }
+
+                current = current->next;
+                pc_free(toFree);
+                --(routeCache->count);
+            }
+
+            else 
+            {
+                found = FALSE;
+                for (i = 0; i < current->hopCount - 1; i++)
+                {
+                    if (current->path[i] == fromHop && 
+                        current->path[i + 1] == nextHop)
+                    {
+                        toFree = current;
+                        found = TRUE;
+
+                        if (current->prev == NULL && current->next == NULL)
+                        {
+                            routeCache->head = current->next;
+                        }
+                        else if (current->prev == NULL)
+                        {
+                            current->next->prev = current->prev;
+                            routeCache->head = current->next;
+                        }
+                        else if (current->next == NULL)
+                        {
+                            current->prev->next = current->next;
+                        }
+                        else
+                        { 
+                            current->prev->next = current->next;
+                            current->next->prev = current->prev;
+                        }
+
+                        current = current->next;
+                        pc_free(toFree);
+                        --(routeCache->count);
+
+                        break;
+                    }
+                }
+
+                if (found == FALSE)
+                {
+                    current = current->next;
+                }
+            }
+        }
+    }
+
+} /* Delete route cache */
+
+/*
+ * RoutingDsrDeleteBuffer
+ *
+ * Remove an entry from teh buffer
+ */
+BOOL RoutingDsrDeleteBuffer(NODE_ADDR destAddr, DSR_BUFFER *buffer)
+{
+    DSR_BUFFER_Node *toFree;
+    DSR_BUFFER_Node *current;
+    BOOL deleted;
+
+    if (buffer->size == 0)
+    {
+        deleted = FALSE;
+    }
+    else if (buffer->head->destAddr == destAddr)
+    {
+        toFree = buffer->head;
+        buffer->head = toFree->next;
+        pc_free(toFree);
+        --(buffer->size);
+        deleted = TRUE;
+    }
+    else
+    {
+        for (current = buffer->head;
+             current->next != NULL && current->next->destAddr < destAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->destAddr == destAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(buffer->size);
+            deleted = TRUE;
+        }
+        else
+        {
+            deleted = FALSE;
+        }
+    }
+
+    return (deleted);
+
+}
+
+/*
+ * RoutingDsrDeleteRequestTable
+ *
+ * Remove an entry from the request table
+ */
+void RoutingDsrDeleteRequestTable(NODE_ADDR destAddr,
+                                  DSR_RequestTable *requestTable)
+{
+    DSR_RequestTableEntry *toFree;
+    DSR_RequestTableEntry *current;
+
+    if (requestTable->count == 0)
+    {
+        return;
+    }
+    else if (requestTable->head->destAddr == destAddr)
+    {
+        toFree = requestTable->head;
+        requestTable->head = toFree->next;
+        pc_free(toFree);
+        --(requestTable->count);
+    }
+    else
+    {
+        for (current = requestTable->head;
+             current->next != NULL && current->next->destAddr < destAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->destAddr == destAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(requestTable->count);
+        }
+    }
+}
+
+/*
+ * RoutingDsrCheckDataSeen
+ *
+ * Check if this data packet has been seen before by looking at the header
+ * return TRUE if seen before; FALSE otherwise
+ */
+BOOL RoutingDsrCheckDataSeen(GlomoNode *node, NODE_ADDR *header, int currentHop)
+{
+    int i;
+
+    for (i = 0; i < currentHop - 1; i++)
+    {
+        if (header[i] == node->nodeAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return(FALSE);
+} /* Check data seen */
+
+/*
+ * RoutingDsrCheckRequestPath
+ *
+ * Check if the own node address is already in the request packet's path
+ * return TRUE if ID exist in the path; FALSE otherwise
+ */
+BOOL RoutingDsrCheckRequestPath(
+    GlomoNode *node, NODE_ADDR *path, int currentHop)
+{
+    int i;
+
+    for (i = 0; i < currentHop; i++)
+    {
+        if (path[i] == node->nodeAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+} /* Check request path */
+
+/*
+ * RoutingDsrGetRoute
+ *
+ * Extract a route from the route cache table
+ */
+NODE_ADDR *RoutingDsrGetRoute(NODE_ADDR destAddr, DSR_RouteCache *routeCache)
+{
+    DSR_RouteCacheEntry *current;
+
+    for (current = routeCache->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr) 
+        {
+            return(current->path);
+        }
+    }
+
+    printf("ERROR: Get Route - No route can be retrived from Cache\n");
+    return(NULL);
+} /* Get route */
+
+/*
+ * RoutingDsrGetHop
+ *
+ * Get the hop count to the destination
+ */
+int RoutingDsrGetHop(NODE_ADDR destAddr, DSR_RouteCache *routeCache) 
+{
+    DSR_RouteCacheEntry *current;
+
+    for (current = routeCache->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(current->hopCount);
+        }
+    }
+
+    printf("ERROR: Get Hop - No route can be retrived from Cache\n");
+    return(DSR_MAX_SR_LEN);
+} /* Get hop */
+
+/*
+ * RoutingDsrGetSeq
+ *
+ * Get the sequence number of the packet to send
+ */
+int RoutingDsrGetSeq(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    int number; 
+
+    number = dsr->seqNumber;
+    dsr->seqNumber++;
+
+    return(number);
+} /* Get seq */
+ 
+/*
+ * RoutingDsrCheckUnprocessedPath
+ *
+ * Check if the node address can be found in unprocess part of route header
+ * return TRUE if found in unprocessed part; FALSE otherwise
+ */
+BOOL RoutingDsrCheckUnprocessedPath(GlomoNode *node,
+                                    int currentHop,
+                                    int segmentLeft,
+                                    NODE_ADDR *header)
+{
+    int i;
+
+    for (i = currentHop + 1; i < currentHop + segmentLeft + 1; i++)
+    {
+        if (header[i] == node->nodeAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return(FALSE);
+} /* Check unprocessed path */
+
+/*
+ * RoutingDsrGetBufferedPacket
+ *
+ * Pop up the buffered data packet so that it can be sent via obtained route
+ */
+Message *
+RoutingDsrGetBufferedPacket(NODE_ADDR destAddr, DSR_BUFFER *buffer)
+{
+    DSR_BUFFER_Node *current;
+
+    for (current = buffer->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            assert((current->timestamp + DSR_MAX_PACKET_BUFFER_TIME) > 
+                   simclock());
+            
+            return(current->msg);
+        }
+    }
+    assert(FALSE); abort(); return NULL;
+}
+
+
+/*
+ * RoutingDsrRemoveOldPacketsFromBuffer
+ *
+ * Check if any packets have expired and remove them.
+ */
+void RoutingDsrRemoveOldPacketsFromBuffer(DSR_BUFFER *buffer)
+{
+    DSR_BUFFER_Node* current;
+    DSR_BUFFER_Node* last = NULL;
+
+    if (buffer->size == 0)
+    {
+        return;
+    }//if//
+    
+    last = NULL;
+    current = buffer->head;
+    while (current != NULL) { 
+        if ((current->timestamp + DSR_MAX_PACKET_BUFFER_TIME) < simclock())
+        {
+            DSR_BUFFER_Node* toFree = current;
+            if (buffer->head == current) {
+               buffer->head = current->next;
+            } else {
+               last->next = current->next;
+            }//if//
+            current = current->next;
+            pc_free(toFree);
+            buffer->size = buffer->size - 1;
+        } else {
+           last = current;
+           current = current->next;
+        }//if//
+    }//while//
+}
+
+
+/*
+ * RoutingDsrLookupBuffer
+ *
+ * Check if any packet to the destAddr is buffered
+ * return TRUE if found; FALSE otherwise
+ */
+BOOL RoutingDsrLookupBuffer(NODE_ADDR destAddr, DSR_BUFFER *buffer)
+{
+    DSR_BUFFER_Node *current;
+
+    if (buffer->size == 0)
+    {
+        return (FALSE);
+    }
+    
+    for (current = buffer->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return(TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ * RoutingDsrUpdateRequestTable
+ * 
+ * Update the backoff interval and last request field of an entry
+ */
+void RoutingDsrUpdateRequestTable(NODE_ADDR destAddr,
+                                  DSR_RequestTable *requestTable)
+{
+    DSR_RequestTableEntry *current;
+
+    for (current = requestTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            current->lastRequest = simclock();
+            if (current->backoffInterval < DSR_MAX_REQUEST_PERIOD)
+            {
+                current->backoffInterval *= 2;
+            }
+            current->ttl = DSR_MAX_TTL;
+        }
+    }
+
+} 
+
+/*
+ * RoutingDsrUpdateTtl
+ *
+ * Update the ttl value of an entry
+ */
+void RoutingDsrUpdateTtl(NODE_ADDR destAddr, 
+                         DSR_RequestTable *requestTable)
+{
+    DSR_RequestTableEntry *current;
+
+    for (current = requestTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            current->ttl = 1;
+        }
+    }
+}
+
+/*
+ * RoutingDsrCheckRequestTable
+ *
+ * Check if the destAddr entry is recorded in the request table
+ */
+BOOL RoutingDsrCheckRequestTable(NODE_ADDR destAddr, 
+                                 DSR_RequestTable *requestTable)
+{
+    DSR_RequestTableEntry *current;
+
+    for (current = requestTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ * RoutingDsrGetBackoff
+ * 
+ * Get the backoff interval for destAddr
+ */
+clocktype RoutingDsrGetBackoff(
+              NODE_ADDR destAddr, DSR_RequestTable *requestTable)
+{
+    DSR_RequestTableEntry *current;
+
+    for (current = requestTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return (current->backoffInterval);
+        }
+    }
+
+    return (DSR_RING0_REQUEST_TO);
+}
+
+/*
+ * RoutingDsrHandleProtocolPacket
+ *
+ * Called when packet is received from MAC
+ */
+void RoutingDsrHandleProtocolPacket(
+    GlomoNode *node, Message *msg, NODE_ADDR srcAddr,
+    NODE_ADDR destAddr, int ttl)
+{
+    DSR_PacketType *dsrHeader = (DSR_PacketType*)GLOMO_MsgReturnPacket(msg);
+
+    switch (*dsrHeader)
+    {
+        case DSR_ROUTE_REQUEST:
+        {
+            RoutingDsrHandleRequest(node, msg, ttl);
+
+            break;
+        } /* RREQ */
+
+        case DSR_ROUTE_REPLY:
+        {
+            RoutingDsrHandleReply(node, msg, destAddr);
+
+            break;
+        } /* RREP */
+
+        case DSR_ROUTE_ERROR:
+        {
+            RoutingDsrHandleError(node, msg, srcAddr, destAddr);
+
+            break;
+        } /* RERR */
+    } /* switch */
+} /* RoutingDsrHandleProtocolPacket */
+
+/*
+ * RoutingDsrHandleProtocolEvent
+ *
+ * Handles all the protocol events
+ */
+void RoutingDsrHandleProtocolEvent(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+
+    switch (msg->eventType) {
+
+        /* Remove an entry from the request seen table */
+        case MSG_NETWORK_FlushTables: {
+            RoutingDsrDeleteSeenTable(&dsr->requestSeenTable);
+            GLOMO_MsgFree(node, msg);
+            break;
+        }
+
+        /* check if a route is obtained after sending a Route Request */
+        case MSG_NETWORK_CheckReplied: {
+            DSR_CR *cr = (DSR_CR *)GLOMO_MsgReturnInfo(msg);
+            int ttl;
+
+            if (!RoutingDsrCheckRouteExist(
+                     cr->destAddr, &dsr->routeCacheTable))
+            {
+                if (cr->ttl == 1)
+                {
+                    ttl = DSR_MAX_TTL;
+                }
+                else 
+                {
+                    ttl = 1;
+                }
+
+                RoutingDsrRetryRREQ(node, cr->destAddr, ttl);
+
+            } /* if no route */
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        default:
+            fprintf(stderr, "RoutingDsr: Unknown MSG type %d!\n",
+                    msg->eventType);
+            assert(FALSE);
+
+    } /* switch */
+
+} /* RoutingDsrHandleProtocolEvent */
+
+/*
+ * RoutingDsrRouterFunction
+ *
+ * Determine the routing action to take for a the given data packet
+ * set the PacketWasRouted variable to TRUE if no further handling of
+ * this packet by IP is necessary
+ */
+void RoutingDsrRouterFunction(
+    GlomoNode *node,
+    Message *msg,
+    NODE_ADDR destAddr,
+    BOOL *packetWasRouted)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+    DsrIpOptionType* option;
+    NODE_ADDR path[DSR_MAX_SR_LEN + 1];
+    int length;
+    int current;
+
+    if (ipHeader->ip_p  == IPPROTO_DSR)
+    {
+        return;
+    }
+
+    if (ipHeader->ip_src == node->nodeAddr)
+    {
+        *packetWasRouted = TRUE;
+    }
+    else
+    {
+        ExtractIpSourceAndRecordedRoute(msg, path, &length, &current);
+        assert(length <= (DSR_MAX_SR_LEN + 1));
+
+        option = GetPtrToDsrIpOptionField(msg);
+
+        option->segmentLeft = option->segmentLeft - 1;
+
+        /* Check if received the packet before */
+        if (!RoutingDsrCheckDataSeen(node, path, current))
+        {
+            *packetWasRouted = FALSE;
+        } 
+
+        else
+        {
+            *packetWasRouted = TRUE;
+        }
+    }
+
+    if (ipHeader->ip_src != node->nodeAddr)
+    {
+        /* check if i'm the dest */
+        if (destAddr == node->nodeAddr && path[current - 1] == node->nodeAddr)
+        {
+            dsr->stats.numDataReceived++;
+        } /* if dest */
+
+        /* I'm the intended intermediate node */
+        else if (path[current - 1] == node->nodeAddr)
+        {
+            dsr->stats.numDataTxed++;
+        } /* else if i'm the intended receiver */
+    }
+
+    /* Source of the route and route to the destination is known */
+    else if (RoutingDsrCheckRouteExist(destAddr, &dsr->routeCacheTable))
+    {
+        RoutingDsrTransmitData(node, msg, destAddr);
+    }
+
+    /* No route to the dest is known and no Route Request has been sent */
+    else if (!RoutingDsrLookupBuffer(destAddr, &dsr->buffer))
+    {
+        RoutingDsrInsertBuffer(msg, destAddr, &dsr->buffer);
+
+        if (RoutingDsrLookupRequestTable(destAddr, &dsr->requestTable))
+        {
+            RoutingDsrInitiateRREQ(node, destAddr);
+        }
+    }
+
+    /* Already sent an Route Request; just buffer the packet */
+    else
+    {
+        RoutingDsrInsertBuffer(msg, destAddr, &dsr->buffer);
+    }
+
+} /* RoutingDsrRouterFunction */
+
+/*
+ * RoutingDsrPeekFunction
+ * 
+ * Handles packets overheard promiscuously
+ */
+void RoutingDsrPeekFunction(GlomoNode *node, const Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    IpHeaderType* ipHeader = (IpHeaderType *) GLOMO_MsgReturnPacket(msg);
+    Message *newMsg = GLOMO_MsgCopy(node, msg);
+    DsrIpOptionType *option;
+
+    /* Control packets */
+    if (ipHeader->ip_p  == IPPROTO_DSR)
+    {
+        DSR_PacketType *dsrHeader;
+        NODE_ADDR sourceAddress;
+        NODE_ADDR destinationAddress;
+        unsigned char IpProtocol;
+        unsigned int ttl;
+        NetworkQueueingPriorityType priority;
+
+        NetworkIpRemoveIpHeader(node, newMsg, &sourceAddress, 
+            &destinationAddress, &priority, &IpProtocol, &ttl);
+
+        dsrHeader = (DSR_PacketType *) GLOMO_MsgReturnPacket(newMsg);
+
+        switch (*dsrHeader)
+        {
+            case DSR_ROUTE_REQUEST:
+            {
+                break;
+            } /* RREQ */
+
+            case DSR_ROUTE_REPLY:
+            {
+                DSR_RouteReply *rrep;
+                NODE_ADDR newPath[DSR_MAX_SR_LEN];
+                int i, j;
+                int segLeft;
+
+                rrep = (DSR_RouteReply *) GLOMO_MsgReturnPacket(newMsg);
+                segLeft = rrep->segLeft - 1;
+
+                /* If not already processed this packet before */
+                if (!RoutingDsrCheckUnprocessedPath(node,
+                                                    segLeft - 1,
+                                                    rrep->hopCount,
+                                                    rrep->path))
+                {
+
+                    /* Insert routes into the cache */
+                    for (i = segLeft; 
+                         i < rrep->hopCount + segLeft; 
+                         i++)
+                    {
+                        for (j = 0; j <= i - segLeft; j++)
+                        {
+                            newPath[j] = rrep->path[j + segLeft];
+                        }
+                        for (j = i + 1 - segLeft; 
+                             j < DSR_MAX_SR_LEN; 
+                             j++)
+                        {
+                            newPath[j] = ANY_DEST;
+                        }
+
+                        if (!RoutingDsrCompareRoute(
+                                        rrep->path[i],
+                                        i + 1 - segLeft,
+                                        newPath,
+                                        &dsr->routeCacheTable) &&
+                            !RoutingDsrCheckDataSeen(
+                                        node, newPath, i + 1 - segLeft))
+                        {
+                            RoutingDsrInsertRouteCache(
+                                           rrep->path[i],
+                                           i + 1 - segLeft,
+                                           newPath,
+                                           &dsr->routeCacheTable);
+
+                        } /* if compare route */
+                    } /* for */
+                } 
+
+                break;
+            } /* RREP */
+
+            case DSR_ROUTE_ERROR:
+            {
+                DSR_RouteError *rerr = (DSR_RouteError *)
+                                        GLOMO_MsgReturnPacket(newMsg);
+
+                /* Delete routes in cache that use the broken link */
+                RoutingDsrDeleteRouteCache(node,
+                                           rerr->srcAddr, 
+                                           rerr->unreachableAddr, 
+                                           &dsr->routeCacheTable);
+
+                break;
+            }
+
+            default:
+                fprintf(stderr, "RoutingDsr: Unknown MSG type %d!\n",
+                        newMsg->eventType);
+                assert(FALSE);
+
+        } /* switch */
+    }
+
+    /* data packets */
+    else
+    {
+        NODE_ADDR path[DSR_MAX_SR_LEN + 1];
+        int length;
+        int current;
+
+        ExtractIpSourceAndRecordedRoute(newMsg, path, &length, &current);
+        assert(length <= (DSR_MAX_SR_LEN + 1));
+
+        option = GetPtrToDsrIpOptionField(newMsg);
+        option->segmentLeft = option->segmentLeft - 1;
+
+        /* check to see if gratuitous route reply can be sent */
+        if (RoutingDsrCheckUnprocessedPath(node, 
+                                           current - 1,
+                                           option->segmentLeft,
+                                           path) &&
+             option->salvagedBit == FALSE)
+        {
+            RoutingDsrGratuitousRREP(
+                        node, ipHeader->ip_src, ipHeader->ip_dst, 
+                        path, current - 1, length);
+
+        } 
+
+    } /* else - data */
+
+    GLOMO_MsgFree(node, newMsg);
+
+} /* RoutingDsrPeekFunction */
+
+/*
+ * RoutingDsrPacketDropNotificationHandler
+ *
+ * Reacts to the signal sent by the MAC protocol after link failure
+ */
+void RoutingDsrPacketDropNotificationHandler(
+    GlomoNode *node, const Message* msg, const NODE_ADDR nextHopAddress)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg = GLOMO_MsgCopy(node, msg);
+
+    IpHeaderType* ipHeader;
+    DsrIpOptionType *option;
+    NODE_ADDR destAddr;
+    NODE_ADDR unreachableAddr;
+    NODE_ADDR targetAddr;
+    NODE_ADDR errorPath[DSR_MAX_SR_LEN];
+    int i, j;
+
+    ipHeader = (IpHeaderType *) GLOMO_MsgReturnPacket(newMsg);
+
+    
+    dsr->stats.numLinkBreaks++;
+    
+    /* Control packets */
+    if (ipHeader->ip_p  == IPPROTO_DSR)
+    {
+        DSR_PacketType *dsrHeader;
+        NODE_ADDR sourceAddress;
+        NODE_ADDR destinationAddress;
+        unsigned char IpProtocol;
+        unsigned int ttl;
+        NetworkQueueingPriorityType priority;
+
+        NetworkIpRemoveIpHeader(node, newMsg, &sourceAddress, 
+                       &destinationAddress, &priority, &IpProtocol, 
+                       &ttl);
+
+        dsrHeader = (DSR_PacketType *) GLOMO_MsgReturnPacket(newMsg);
+
+        unreachableAddr = destinationAddress;
+
+        /* Delete the routes that use the broken link */
+        RoutingDsrDeleteRouteCache(node, node->nodeAddr, 
+                           unreachableAddr, &dsr->routeCacheTable);
+
+        switch (*dsrHeader)
+        {
+            case DSR_ROUTE_REQUEST:
+            {
+                break;
+            } /* RREQ */
+
+            case DSR_ROUTE_REPLY:
+            {
+                DSR_RouteReply *rrep;
+
+                rrep = (DSR_RouteReply *)GLOMO_MsgReturnPacket (newMsg);
+
+                /* Build a route back to the source and  
+                   send a Route Error */
+                if (rrep->srcAddr != node->nodeAddr)
+                {
+                    for (i = rrep->segLeft, j = 0; 
+                         i < rrep->hopCount + rrep->segLeft - 1; 
+                         i++, j++)
+                    {
+                        errorPath[j] = rrep->path[i];
+                    }
+                    for (; j < DSR_MAX_SR_LEN; j++)
+                    {
+                        errorPath[j] = ANY_DEST;
+                    }
+
+                    RoutingDsrInitiateRERR(node, rrep->srcAddr, 
+                                           unreachableAddr, errorPath);
+                }
+
+                break;
+            } /* RREP */
+
+            case DSR_ROUTE_ERROR:
+            {
+                DSR_RouteError *rerr;
+
+                rerr = (DSR_RouteError *)GLOMO_MsgReturnPacket (newMsg);
+
+                targetAddr = rerr->destAddr;
+
+                if (rerr->salvaged == TRUE && 
+                    node->nodeAddr != rerr->path[0]) 
+                {
+                    destAddr = rerr->path[0];
+
+                    if (rerr->hopCount > 3)
+                    {
+                        for (i = rerr->hopCount - 3, j = 0; 
+                             i >= 0; 
+                             i--, j++)
+                        {
+                            errorPath[j] = rerr->path[i];
+                        }
+                        for (; j < DSR_MAX_SR_LEN; j++)
+                        {
+                            errorPath[j] = ANY_DEST;
+                        }
+                    }
+
+                    else
+                    {
+                        errorPath[0] = rerr->path[0];
+
+                        for (j = 1; j < DSR_MAX_SR_LEN; j++)
+                        {
+                            errorPath[j] = ANY_DEST;
+                        }
+                    }
+
+                    RoutingDsrInitiateRERR(node, destAddr, 
+                                       unreachableAddr, errorPath);
+                }
+
+                else if (rerr->salvaged == FALSE &&
+                         node->nodeAddr != rerr->srcAddr)
+                {
+                    destAddr = rerr->srcAddr;
+
+                    if (rerr->hopCount > 2)
+                    {
+                        for (i = rerr->hopCount - 3, j = 0; 
+                             i >= 0; 
+                             i--, j++)
+                        {
+                            errorPath[j] = rerr->path[i];
+                        }
+                        errorPath[j] = rerr->srcAddr;
+
+                        j++;
+                        for (; j < DSR_MAX_SR_LEN; j++)
+                        {
+                            errorPath[j] = ANY_DEST;
+                        }
+                    }
+
+                    else
+                    {
+                        errorPath[0] = rerr->srcAddr;
+
+                        for (j = 1; j < DSR_MAX_SR_LEN; j++)
+                        {
+                            errorPath[j] = ANY_DEST;
+                        }
+                    }
+
+                    RoutingDsrInitiateRERR(node, destAddr, 
+                                       unreachableAddr, errorPath);
+                }
+
+                /* Salvage the packet if other route is known */
+                if (RoutingDsrCheckRouteExist(targetAddr, 
+                                              &dsr->routeCacheTable) &&
+                    rerr->salvaged == FALSE)
+                {
+                    RoutingDsrSalvageRERR(
+                        node, targetAddr, rerr->srcAddr, 
+                        rerr->unreachableAddr);
+                }
+               
+                break;
+
+            } /* RERR */
+        } /* switch */
+
+        GLOMO_MsgFree(node, newMsg);
+    }
+
+    else /* data packet */
+    {
+        NODE_ADDR path[DSR_MAX_SR_LEN + 1];
+        int length;
+        int current;
+
+        ExtractIpSourceAndRecordedRoute(
+                newMsg, path, &length, &current);
+        assert(length <= (DSR_MAX_SR_LEN+1));
+
+        option = GetPtrToDsrIpOptionField(newMsg);
+        option->segmentLeft = option->segmentLeft - 1;
+
+        unreachableAddr = path[current - 1];
+
+        /* Delete the routes that use the broken link */
+        RoutingDsrDeleteRouteCache(node, node->nodeAddr, 
+                            unreachableAddr, &dsr->routeCacheTable);
+
+        targetAddr = ipHeader->ip_dst;
+
+        if (option->salvagedBit == TRUE && 
+            node->nodeAddr != path[0]) 
+        {
+            destAddr = path[0];
+
+            if (current > 3) 
+            {
+                for (i = current - 3, j = 0; i >= 0; i--, j++)
+                {
+                    errorPath[j] = path[i];
+                }
+                for (; j < DSR_MAX_SR_LEN; j++)
+                {
+                    errorPath[j] = ANY_DEST;
+                }
+            }
+
+            else
+            {
+                errorPath[0] = path[0];
+
+                for (j = 1; j < DSR_MAX_SR_LEN; j++)
+                {
+                    errorPath[j] = ANY_DEST;
+                }
+            }
+
+            RoutingDsrInitiateRERR(node, destAddr, unreachableAddr,
+                                   errorPath);
+        }
+
+        else if (option->salvagedBit == FALSE &&
+                 node->nodeAddr != ipHeader->ip_src)
+        {
+            destAddr = ipHeader->ip_src;
+
+            if (current > 2)
+            {
+                for (i = current - 3, j = 0; i >= 0; i--, j++)
+                {
+                    errorPath[j] = path[i];
+                }
+                errorPath[j] = ipHeader->ip_src;
+
+                j++;
+                for (; j < DSR_MAX_SR_LEN; j++)
+                {
+                    errorPath[j] = ANY_DEST;
+                }
+            }
+
+            else
+            {
+                errorPath[0] = ipHeader->ip_src;
+
+                for (j = 1; j < DSR_MAX_SR_LEN; j++)
+                {
+                    errorPath[j] = ANY_DEST;
+                }
+            }
+
+            RoutingDsrInitiateRERR(node, destAddr, unreachableAddr,
+                                   errorPath);
+        }
+
+        /* Salvage the data when other route is known */
+        if (RoutingDsrCheckRouteExist(targetAddr, 
+                                      &dsr->routeCacheTable) &&
+            option->salvagedBit == FALSE)
+        {
+            RoutingDsrSalvageData(node, newMsg);
+        }
+
+        else
+        {
+            GLOMO_MsgFree(node, newMsg);
+            dsr->stats.numDroppedPackets++;
+        }
+
+    } /* else - data packet */
+  
+} /* RoutingDsrMaclayerStatusHandler */
+
+/*
+ * RoutingDsrSetTimer
+ *
+ * Set timers for protocol events
+ */
+void RoutingDsrSetTimer(
+    GlomoNode *node, long eventType, DSR_CR cr, clocktype delay)
+{
+    Message *newMsg;
+    DSR_CR *info;
+
+    newMsg = GLOMO_MsgAlloc(node,
+                            GLOMO_NETWORK_LAYER,
+                            ROUTING_PROTOCOL_DSR,
+                            eventType);
+
+    GLOMO_MsgInfoAlloc(node, newMsg, sizeof(DSR_CR));
+    info = (DSR_CR *) GLOMO_MsgReturnInfo(newMsg);
+    *info = cr;
+    GLOMO_MsgSend(node, newMsg, delay);
+
+} /* RoutingDsrSetTimer */
+
+/*
+ * RoutingDsrInitiateRREQ
+ *
+ * Initiate a Route Request packet when no route to destination is known
+ */
+void RoutingDsrInitiateRREQ(GlomoNode *node, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteRequest *rreq;
+    DSR_CR cr;
+    char *pktPtr;
+    int pktSize = sizeof(DSR_RouteRequest);
+    int i;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rreq = (DSR_RouteRequest *) pktPtr;
+
+    rreq->pktType = DSR_ROUTE_REQUEST;
+    rreq->srcAddr = node->nodeAddr;
+    rreq->targetAddr = destAddr;
+    rreq->seqNumber = RoutingDsrGetSeq(node);
+    rreq->hopCount = 1;
+    for (i = 0; i < DSR_MAX_SR_LEN; i++)
+    {
+        rreq->path[i] = ANY_DEST;
+    }
+
+    NetworkIpSendRawGlomoMessage(
+          node, newMsg, ANY_DEST, CONTROL, IPPROTO_DSR, 1);
+
+    dsr->stats.numRequestSent++;
+
+    if (RoutingDsrCheckRequestTable(destAddr, &dsr->requestTable))
+    {
+        RoutingDsrUpdateTtl(destAddr, &dsr->requestTable);
+    }
+    else
+    {
+        RoutingDsrInsertRequestTable(destAddr, &dsr->requestTable);
+    }
+
+    RoutingDsrInsertRequestSeen(node, node->nodeAddr, rreq->seqNumber,
+                                &dsr->requestSeenTable);
+
+    cr.destAddr = destAddr;
+    cr.ttl = 1;
+
+    RoutingDsrSetTimer(node, MSG_NETWORK_CheckReplied, 
+                       cr, (clocktype)DSR_RING0_REQUEST_TO);
+
+} /* RoutingDsrInitiateRREQ */
+
+/*
+ * RoutingDsrRetryRREQ
+ *
+ * Send RREQ again after not receiving any RREP
+ */
+void RoutingDsrRetryRREQ(GlomoNode *node, NODE_ADDR destAddr, int ttl)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteRequest *rreq;
+    DSR_CR cr;
+    char *pktPtr;
+    clocktype backoff;
+    int pktSize = sizeof(DSR_RouteRequest);
+    int i;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rreq = (DSR_RouteRequest *) pktPtr;
+
+    rreq->pktType = DSR_ROUTE_REQUEST;
+    rreq->srcAddr = node->nodeAddr;
+    rreq->targetAddr = destAddr;
+    rreq->seqNumber = RoutingDsrGetSeq(node);
+    rreq->hopCount = 1;
+    for (i = 0; i < DSR_MAX_SR_LEN; i++)
+    {
+        rreq->path[i] = ANY_DEST;
+    }
+
+    NetworkIpSendRawGlomoMessage(
+          node, newMsg, ANY_DEST, CONTROL, IPPROTO_DSR, ttl);
+
+    dsr->stats.numRequestSent++;
+
+    RoutingDsrInsertRequestSeen(node, node->nodeAddr, rreq->seqNumber,
+                                &dsr->requestSeenTable);
+
+    if (ttl == DSR_MAX_TTL)
+    {
+          RoutingDsrUpdateRequestTable(destAddr, &dsr->requestTable);
+          backoff = RoutingDsrGetBackoff(destAddr, &dsr->requestTable);
+    }
+    else
+    {
+          RoutingDsrUpdateTtl(destAddr, &dsr->requestTable);
+          backoff = DSR_RING0_REQUEST_TO;
+    }
+
+    cr.destAddr = destAddr;
+    cr.ttl = ttl;
+
+    RoutingDsrSetTimer(node, MSG_NETWORK_CheckReplied, cr, backoff);
+
+} /* RoutingDsrRetryRREQ */
+
+/*
+ * RoutingDsrTransmitData
+ *
+ * Obtain the route from the cache and send the data thru the source route
+ */
+void RoutingDsrTransmitData(GlomoNode *node, Message *msg, NODE_ADDR destAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    DsrIpOptionType *option;
+    NODE_ADDR *route;
+    int hopCount;
+
+    GLOMO_MsgSetLayer(msg, GLOMO_MAC_LAYER, 0);
+    GLOMO_MsgSetEvent(msg, MSG_MAC_FromNetwork);
+
+    route = RoutingDsrGetRoute(destAddr, &dsr->routeCacheTable);
+    hopCount = RoutingDsrGetHop(destAddr, &dsr->routeCacheTable);
+    
+    if (route != NULL)
+    {
+        AddCustomDsrIpOptionFields(node, msg);
+        option = GetPtrToDsrIpOptionField(msg);
+        option->segmentLeft = hopCount;
+        option->salvagedBit = FALSE;
+ 
+        NetworkIpSendPacketToMacLayerWithNewStrictSourceRoute(
+            node, msg, route, hopCount, TRUE);
+
+        dsr->stats.numDataSent++;
+        dsr->stats.numDataTxed++;
+    }
+    else
+    {
+        GLOMO_MsgFree(node, msg);
+    }
+
+} /* RoutingDsrTransmitData */
+
+/*
+ * RoutingDsrRelayRREQ
+ *
+ * Forward (re-broadcast) the Route Request
+ */
+void RoutingDsrRelayRREQ(GlomoNode *node, Message *msg, int ttl)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteRequest *oldRreq;
+    DSR_RouteRequest *newRreq;
+    char *pktPtr;
+    int pktSize = sizeof(DSR_RouteRequest);
+    clocktype delay;
+    int i;
+
+    oldRreq = (DSR_RouteRequest *) GLOMO_MsgReturnPacket(msg);
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    newRreq = (DSR_RouteRequest *) pktPtr;
+
+    newRreq->pktType = oldRreq->pktType;
+    newRreq->srcAddr = oldRreq->srcAddr;
+    newRreq->targetAddr = oldRreq->targetAddr;
+    newRreq->seqNumber = oldRreq->seqNumber;
+    newRreq->hopCount = oldRreq->hopCount + 1;
+    for (i = 0; i < oldRreq->hopCount - 1; i++)
+    {
+        newRreq->path[i] = oldRreq->path[i];
+    }
+    newRreq->path[oldRreq->hopCount - 1] = node->nodeAddr;
+    for (i = oldRreq->hopCount; i < DSR_MAX_SR_LEN; i++)
+    {
+        newRreq->path[i] = ANY_DEST;
+    }
+
+    delay = pc_erand(node->seed) * DSR_BROADCAST_JITTER;
+
+    NetworkIpSendRawGlomoMessageWithDelay(
+                   node, newMsg, ANY_DEST, CONTROL, IPPROTO_DSR, ttl, delay);
+
+    dsr->stats.numRequestSent++;
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingDsrRelayRREQ */
+
+/*
+ * RoutingDsrInitiateRREP
+ *
+ * Destination of the route sends Route Reply in reaction to Route Request
+ */
+void RoutingDsrInitiateRREP(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *)ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteRequest *rreqPkt;
+    DSR_RouteReply *rrepPkt;
+    char *pktPtr;
+    int pktSize = sizeof(DSR_RouteReply);
+    int i;
+    clocktype delay;
+
+    rreqPkt = (DSR_RouteRequest *) GLOMO_MsgReturnPacket(msg);
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rrepPkt = (DSR_RouteReply *) pktPtr;
+
+    rrepPkt->pktType = DSR_ROUTE_REPLY;
+    rrepPkt->targetAddr = rreqPkt->srcAddr;
+    rrepPkt->srcAddr = node->nodeAddr;
+    rrepPkt->hopCount = 1;
+    rrepPkt->segLeft = rreqPkt->hopCount;
+    for (i = 0; i < rreqPkt->hopCount - 1; i++)
+    {
+        rrepPkt->path[i] = rreqPkt->path[i];
+    }
+    rrepPkt->path[rreqPkt->hopCount - 1] = node->nodeAddr;
+    for (i = rreqPkt->hopCount; i < DSR_MAX_SR_LEN; i++)
+    {
+        rrepPkt->path[i] = ANY_DEST;
+    }
+
+    delay = pc_erand(node->seed) * DSR_BROADCAST_JITTER;
+
+    if (rreqPkt->hopCount > 1)
+    {
+        NetworkIpSendRawGlomoMessageToMacLayerWithDelay(
+            node, newMsg, rrepPkt->path[rreqPkt->hopCount - 2], CONTROL, 
+            IPPROTO_DSR, 1, DEFAULT_INTERFACE, 
+            rrepPkt->path[rreqPkt->hopCount -2], delay);
+    }
+    else
+    {
+        NetworkIpSendRawGlomoMessageToMacLayerWithDelay(
+            node, newMsg, rrepPkt->targetAddr, CONTROL, IPPROTO_DSR, 1,
+            DEFAULT_INTERFACE, rrepPkt->targetAddr, delay);
+    }
+
+    dsr->stats.numReplySent++;
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingDsrInitiateRREP */
+
+/*
+ * RoutingDsrInitiateRREPbyIN
+ *
+ * An intermediate node that knows the route to the destination sends 
+ * the Route Reply
+ */
+void RoutingDsrInitiateRREPbyIN(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *)ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteRequest *rreqPkt;
+    DSR_RouteReply *rrepPkt;
+    char *pktPtr;
+    int pktSize = sizeof(DSR_RouteReply);
+    int seq;
+    NODE_ADDR *subPath;
+    int subCount;
+    int i, j;
+    clocktype delay;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rrepPkt = (DSR_RouteReply *) pktPtr;
+
+    rreqPkt = (DSR_RouteRequest *) GLOMO_MsgReturnPacket(msg);
+
+    subPath = RoutingDsrGetRoute(rreqPkt->targetAddr, &dsr->routeCacheTable);
+    subCount = RoutingDsrGetHop(rreqPkt->targetAddr, &dsr->routeCacheTable);
+
+    if ((subPath != NULL) && (subCount + rreqPkt->hopCount <= DSR_MAX_SR_LEN))
+    {
+        rrepPkt->pktType = DSR_ROUTE_REPLY;
+        rrepPkt->targetAddr = rreqPkt->srcAddr;
+        rrepPkt->srcAddr = rreqPkt->targetAddr;
+        rrepPkt->hopCount = 1 + subCount;
+        rrepPkt->segLeft = rreqPkt->hopCount;
+        for (i = 0; i < rreqPkt->hopCount - 1; i++)
+        {
+            assert(i < DSR_MAX_SR_LEN);
+            rrepPkt->path[i] = rreqPkt->path[i];
+        }
+        rrepPkt->path[rreqPkt->hopCount - 1] = node->nodeAddr;
+        for (i = rreqPkt->hopCount, j = 0; j < subCount; i++, j++)
+        {
+            assert(i < DSR_MAX_SR_LEN);
+            rrepPkt->path[i] = subPath[j];
+        }
+        for (; i < DSR_MAX_SR_LEN; i++)
+        {
+            rrepPkt->path[i] = ANY_DEST;
+        } 
+
+        delay = pc_erand(node->seed) * DSR_BROADCAST_JITTER;
+
+        if (rreqPkt->hopCount > 1)
+        {
+            NetworkIpSendRawGlomoMessageToMacLayerWithDelay(
+                node, newMsg, rrepPkt->path[rreqPkt->hopCount - 2], CONTROL, 
+                IPPROTO_DSR, 1, DEFAULT_INTERFACE, 
+                rrepPkt->path[rreqPkt->hopCount -2], delay);
+        }
+        else
+        {
+            NetworkIpSendRawGlomoMessageToMacLayerWithDelay(
+                node, newMsg, rrepPkt->targetAddr, CONTROL, IPPROTO_DSR, 1,
+                DEFAULT_INTERFACE, rrepPkt->targetAddr, delay);
+        }
+
+        dsr->stats.numReplySent++;
+    }
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingDsrInitiateRREPbyIN */
+
+/*
+ * RoutingDsrRelayRREP
+ *
+ * Forward the Route Reply
+ */
+void RoutingDsrRelayRREP(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteReply *oldRrep;
+    DSR_RouteReply *newRrep;
+    char *pktPtr;
+    int pktSize = sizeof(DSR_RouteReply);
+    int i;
+
+    oldRrep = (DSR_RouteReply *) GLOMO_MsgReturnPacket(msg);
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    newRrep = (DSR_RouteReply *) pktPtr;
+
+    newRrep->pktType = oldRrep->pktType;
+    newRrep->targetAddr = oldRrep->targetAddr;
+    newRrep->srcAddr = oldRrep->srcAddr;
+    newRrep->hopCount = oldRrep->hopCount + 1;
+    newRrep->segLeft = oldRrep->segLeft - 1;
+    for (i = 0; i < DSR_MAX_SR_LEN; i++)
+    {
+        newRrep->path[i] = oldRrep->path[i];
+    }
+
+    if (newRrep->segLeft > 1)
+    {
+        NetworkIpSendRawGlomoMessageToMacLayer(
+            node, newMsg, newRrep->path[newRrep->segLeft - 2], CONTROL, 
+            IPPROTO_DSR, 1, DEFAULT_INTERFACE, 
+            newRrep->path[newRrep->segLeft - 2]);
+    }
+    else
+    {
+        NetworkIpSendRawGlomoMessageToMacLayer(
+            node, newMsg, newRrep->targetAddr, CONTROL, IPPROTO_DSR, 1, 
+            DEFAULT_INTERFACE, newRrep->targetAddr);
+    }
+
+    dsr->stats.numReplySent++;
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingDsrRelayRREP */
+
+/*
+ * RoutingDsrInitiateRERR
+ *
+ * The node that detects the link break sends a Route Error back to the source
+ */
+void RoutingDsrInitiateRERR(GlomoNode *node, NODE_ADDR destAddr, 
+                            NODE_ADDR unreachableAddr, NODE_ADDR *errorPath)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *)ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteError *rerr;
+    char *pktPtr;
+    int pktSize = sizeof(DSR_RouteError);
+    int i;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rerr = (DSR_RouteError *) pktPtr;
+
+    rerr->pktType =  DSR_ROUTE_ERROR;
+    rerr->srcAddr = node->nodeAddr;
+    rerr->destAddr = destAddr;
+    rerr->unreachableAddr = unreachableAddr;
+    rerr->hopCount = 1;
+    rerr->salvaged = FALSE;
+    for (i = 0; i < DSR_MAX_SR_LEN; i++)
+    {
+        rerr->path[i] = errorPath[i];
+    }
+
+    NetworkIpSendRawGlomoMessageToMacLayer(
+        node, newMsg, rerr->path[0], CONTROL, IPPROTO_DSR, 1,
+        DEFAULT_INTERFACE, rerr->path[0]);
+
+    dsr->stats.numErrorSent++;
+} /* RoutingDsrInitiateRERR */
+
+/*
+ * RoutingDsrRelayRERR
+ *
+ * Forward the Route Error packet
+ */
+void RoutingDsrRelayRERR(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteError *oldRerr;
+    DSR_RouteError *newRerr;
+    char *pktPtr;
+    int pktSize = sizeof(DSR_RouteError);
+    int i;
+
+    oldRerr = (DSR_RouteError *) GLOMO_MsgReturnPacket(msg);
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    newRerr = (DSR_RouteError *) pktPtr;
+
+    newRerr->pktType = oldRerr->pktType;
+    newRerr->srcAddr = oldRerr->srcAddr;
+    newRerr->destAddr = oldRerr->destAddr;
+    newRerr->unreachableAddr = oldRerr->unreachableAddr;
+    newRerr->hopCount = oldRerr->hopCount + 1;
+    newRerr->salvaged = oldRerr->salvaged;
+    for (i = 0; i < DSR_MAX_SR_LEN; i++)
+    {
+        newRerr->path[i] = oldRerr->path[i];
+    }
+
+    NetworkIpSendRawGlomoMessageToMacLayer(
+        node, newMsg, newRerr->path[newRerr->hopCount], CONTROL, IPPROTO_DSR, 1,
+        DEFAULT_INTERFACE, newRerr->path[newRerr->hopCount]);
+
+    dsr->stats.numErrorSent++;
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingDsrRelayRERR */
+
+/*
+ * RoutingDsrSalvageData
+ *
+ * Node that detects the route break and knows another route to the destination
+ * salvages the data
+ */
+void RoutingDsrSalvageData(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+    DsrIpOptionType* option;
+    char *pktPtr;
+    NODE_ADDR newPath[DSR_MAX_SR_LEN+1];
+    NODE_ADDR *salvage;
+    int i, j;
+    int hop;
+
+    salvage = RoutingDsrGetRoute(ipHeader->ip_dst, &dsr->routeCacheTable);
+    hop = RoutingDsrGetHop(ipHeader->ip_dst, &dsr->routeCacheTable);
+
+    newPath[0] = node->nodeAddr;
+
+    for (i = 1, j = 0; j < hop; i++, j++)
+    {
+        newPath[i] = salvage[j];
+    }
+    for (; i < (DSR_MAX_SR_LEN+1); i++)
+    {
+        newPath[i] = ANY_DEST;
+    }
+
+    option = GetPtrToDsrIpOptionField(msg);
+    option->segmentLeft = hop;
+    option->salvagedBit = TRUE;
+
+    NetworkIpSendPacketToMacLayerWithNewStrictSourceRoute(
+        node, msg, newPath, hop + 1, TRUE);
+
+    dsr->stats.numDataTxed++;
+    dsr->stats.numSalvagedPackets++;
+
+} /* RoutingDsrSalvageData */
+
+/*
+ * RoutingDsrSalvageRERR
+ *
+ * Node that detects the route break and knows another route to the destination
+ * salvages the Route Error
+ */
+void RoutingDsrSalvageRERR(GlomoNode *node, NODE_ADDR targetAddr, 
+                           NODE_ADDR srcAddr, NODE_ADDR unreachableAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *) ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteError *rerr;
+    char *pktPtr;
+    NODE_ADDR *salvage;
+    int i, j;
+    int hop;
+    int pktSize = sizeof(DSR_RouteError);
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rerr = (DSR_RouteError *) pktPtr;
+
+    salvage = RoutingDsrGetRoute(targetAddr, &dsr->routeCacheTable);
+    hop = RoutingDsrGetHop(targetAddr, &dsr->routeCacheTable);
+
+    rerr->pktType = DSR_ROUTE_ERROR;
+    rerr->srcAddr = srcAddr;
+    rerr->destAddr = targetAddr;
+    rerr->unreachableAddr = unreachableAddr;
+    rerr->hopCount = 2;
+    rerr->salvaged = TRUE;
+    rerr->path[0] = node->nodeAddr;
+    for (i = 1, j = 0; j < hop; i++, j++)
+    {
+        rerr->path[i] = salvage[j];
+    }
+    for (; i < DSR_MAX_SR_LEN; i++)
+    {
+        rerr->path[i] = ANY_DEST;
+    }
+
+    NetworkIpSendRawGlomoMessageToMacLayer(
+        node, newMsg, rerr->path[1], CONTROL, IPPROTO_DSR, 1,
+        DEFAULT_INTERFACE, rerr->path[1]);
+
+    dsr->stats.numErrorSent++;
+
+} /* RoutingDsrSalvageRERR */
+
+/*
+ * RoutingDsrGratuitousRREP
+ *
+ * Send a reply to the source informing a shorter route to the destination
+ */
+void RoutingDsrGratuitousRREP(GlomoNode *node, NODE_ADDR srcAddr,
+                    NODE_ADDR destAddr, NODE_ADDR *old, int count, int length)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingDsr* dsr = (GlomoRoutingDsr *)ipLayer->routingProtocol;
+    Message *newMsg;
+    DSR_RouteReply *rrepPkt;
+    char *pktPtr;
+    int pktSize = sizeof(DSR_RouteReply);
+    int i, j, k;
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+    rrepPkt = (DSR_RouteReply *) pktPtr;
+
+    if (count > 0)
+    {
+        for (i = 0; i < count; i++)
+        {
+            rrepPkt->path[i] = old[i];
+        }
+    }
+
+    else
+    {
+        i = 0;
+    }
+
+    for (j = count + 1; j < DSR_MAX_SR_LEN; j++)
+    {
+        if (old[j] == node->nodeAddr)
+        {
+            break;
+        }
+    }
+    for (; j < length; j++, i++)
+    {
+        rrepPkt->path[i] = old[j];
+        if (rrepPkt->path[i] == destAddr)
+        {
+            k = i;
+        }
+    }
+
+    for (; i < DSR_MAX_SR_LEN; i++)
+    {
+        rrepPkt->path[i] = ANY_DEST;
+    }
+
+    rrepPkt->pktType = DSR_ROUTE_REPLY;
+    rrepPkt->targetAddr = srcAddr;
+    rrepPkt->srcAddr = destAddr;
+    rrepPkt->hopCount = k - count + 1;
+    rrepPkt->segLeft = count + 1;
+
+    if (count > 0)
+    {
+        NetworkIpSendRawGlomoMessageToMacLayer(
+            node, newMsg, rrepPkt->path[count - 1], CONTROL, IPPROTO_DSR, 1,
+            DEFAULT_INTERFACE, rrepPkt->path[count - 1]);
+    }
+
+    else
+    {
+        NetworkIpSendRawGlomoMessageToMacLayer(
+            node, newMsg, rrepPkt->targetAddr, CONTROL, IPPROTO_DSR, 1,
+            DEFAULT_INTERFACE, rrepPkt->targetAddr);
+    }
+
+    dsr->stats.numReplySent++;
+
+} /* RoutingDsrGratuitousRREP */
+
+/* 
+ * AddCustomDsrIpOptionFields
+ *
+ * Add optional IP header field specific for DSR
+ */
+void AddCustomDsrIpOptionFields(GlomoNode* node, Message* msg)
+{
+    IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+
+   /* Reuse unused IP Option "ptr" field.
+      (minimizes overhead to 4 bytes).
+   */
+   if (FindAnIpOptionField(ipHeader, IPOPT_DSR) == NULL) {
+      IpOptionsHeaderType* forSizeof;
+      AddIpOptionField(node, msg, IPOPT_DSR,
+         (sizeof(DsrIpOptionType) - sizeof(forSizeof->ptr)));
+   }
+} /* AddCustomDsrIpOptionFields */
+
+/*
+ * GetPtrToDsrIpOptionField
+ *
+ * Obtain pointer to the DSR specific IP option field
+ */
+DsrIpOptionType* GetPtrToDsrIpOptionField(Message* msg)
+{
+   IpHeaderType* ipHeader = (IpHeaderType*)msg->packet;
+   IpOptionsHeaderType* ipOption = FindAnIpOptionField(ipHeader, IPOPT_DSR);
+
+   /* Reuse unused IP Option "ptr" field */
+   return ((DsrIpOptionType*)&(ipOption->ptr));
+
+} /* GetPtrToDsrIpOptionField */
+
+

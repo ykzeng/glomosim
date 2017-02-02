@@ -1,0 +1,306 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: in_pcb.pc,v 1.3 1999/09/05 05:22:43 jmartin Exp $
+ *
+ * Ported from FreeBSD 2.2.2.
+ * This file contains Internet PCB management routine.
+ */
+
+/*
+ * Copyright (c) 1982, 1986, 1991, 1993, 1995
+ *  The Regents of the University of California.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *  This product includes software developed by the University of
+ *  California, Berkeley and its contributors.
+ * 4. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ *  @(#)in_pcb.c    8.2 (Berkeley) 1/4/94
+ * $Id: in_pcb.pc,v 1.3 1999/09/05 05:22:43 jmartin Exp $
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "transport.h"
+
+#include "in_pcb.h"
+
+static void insque(struct inpcb *, struct inpcb *);
+static void remque(struct inpcb *);
+static int fill_buf(struct inp_buf *, unsigned char *, int);
+
+
+/*
+ * Insert a pcb into the head of a queue.
+ */
+static void
+insque(struct inpcb *inp, struct inpcb *head)
+{
+    struct inpcb *next;
+
+    next = head->inp_next;
+    head->inp_next = inp;
+    inp->inp_next = next;
+    inp->inp_prev = head; 
+    if (next != head) next->inp_prev = inp;
+}
+
+/*
+ * Remove a pcb from a queue.
+ */
+static void
+remque(struct inpcb *inp)
+{
+   struct inpcb *prev, *next;
+
+    prev = inp->inp_prev;
+    next = inp->inp_next;
+    next->inp_prev = prev;
+    prev->inp_next = next;
+}
+
+/*
+ * Add length of data pointed to by content to buf.
+ */
+static int
+fill_buf(struct inp_buf *buf, unsigned char *content, int length)
+{
+    int len;
+    unsigned char *cur_pos;
+
+    if (length <= 0) return 0;
+    len = (int)(buf->hiwat - buf->cc);
+    if (length <= len) len = length;  /* actual length of bytes to add */
+    if (len > 0){
+        cur_pos = buf->buffer + buf->cc;
+        memcpy(cur_pos, content, len);   /* add len bytes to buffer */
+        buf->cc += (unsigned long)len;
+    }
+    return len;
+}  
+
+/*
+ * Allocate a pcb and insert it into a queue.
+ */
+struct inpcb *
+in_pcballoc(struct inpcb *head, int snd_bufsize, int rcv_bufsize)
+{
+    struct inpcb *inp;
+ 
+    inp = (struct inpcb *)pc_malloc(sizeof(struct inpcb));
+    assert(inp != NULL);
+
+    memset((char *)inp, 0, sizeof(struct inpcb));
+    inp->inp_head = (struct inpcb *) head;
+
+    if (snd_bufsize > 0){
+        inp->inp_snd.buffer = (unsigned char *) pc_malloc(snd_bufsize);
+        assert(inp->inp_snd.buffer != NULL);
+    }
+
+    inp->inp_rcv_hiwat = rcv_bufsize;
+    inp->inp_snd.hiwat = snd_bufsize;
+    insque(inp, head);
+    return inp;
+}
+
+/*
+ * Remove a pcb and delete it.
+ */
+void 
+in_pcbdetach(struct inpcb *inp)
+{
+    remque(inp);
+    if (inp->inp_snd.buffer) pc_free(inp->inp_snd.buffer);
+    pc_free(inp);
+}
+
+/*
+ * Look for a pcb in a queue using 4-tuple.
+ */
+struct inpcb *
+in_pcblookup(struct inpcb *head, NODE_ADDR local_addr, short local_port,
+             NODE_ADDR remote_addr, short remote_port, int flag)
+{
+
+    struct inpcb *inp;
+
+    for (inp = head->inp_next; inp != head; inp = inp->inp_next) {
+        if (inp->inp_local_port != local_port) continue;
+        if (inp->inp_local_addr != local_addr) continue;
+        if (inp->inp_remote_port == -1 && inp->inp_remote_addr == -1 
+            && flag == INPCB_WILDCARD)
+            return inp;
+        if (inp->inp_remote_port != remote_port) continue;
+        if (inp->inp_remote_addr != remote_addr) continue;
+        break;
+    }
+    return inp;
+}  
+
+/*
+ * Search a pcb in a queue using connection id.
+ */
+struct inpcb *
+in_pcbsearch(struct inpcb *head, int con_id)
+{
+    struct inpcb *inp;
+
+    for (inp = head->inp_next; inp != head; inp = inp->inp_next) {
+        if (inp->con_id != con_id) continue;
+        break;
+    }
+    return inp;
+}
+
+/*
+ * Try to add data from application to send buffer.
+ * If the buffer is full, record the pointer to the
+ * data in pending buffer.
+ */  
+int
+append_buf(GlomoNode *node, struct inpcb *inp, unsigned char *payload,
+           int length)
+ 
+{
+    unsigned char *tmp_ptr;
+    int len;
+    Message *msg;
+    TransportToAppDataSent *dataSent;
+
+    if (payload != NULL){
+        /* new data from the application */
+        if (inp->blocked_pkt.buffer != NULL){
+            /* there's a pending packet, can't send this one */ 
+            msg = GLOMO_MsgAlloc(node, GLOMO_APP_LAYER,
+                                 inp->app_proto_type, 
+                                 MSG_APP_FromTransDataSent);
+            GLOMO_MsgInfoAlloc(node, msg, sizeof(TransportToAppDataSent));
+            dataSent = (TransportToAppDataSent *) msg->info;
+            dataSent->connectionId = inp->con_id;
+            dataSent->length = 0;
+
+            GLOMO_MsgSend(node, msg, TRANSPORT_DELAY);
+            return 0;
+        }   
+        inp->blocked_pkt.buffer = (unsigned char *)pc_malloc(length);
+        assert(inp->blocked_pkt.buffer != NULL);
+
+        memcpy(inp->blocked_pkt.buffer, payload, length);
+        inp->blocked_pkt.hiwat = length;
+        inp->blocked_pkt.cc = 0;
+    }
+
+    if (inp->blocked_pkt.buffer == NULL) {
+        return 0;
+    }
+
+    /* move data from the blocked packet buffer to the send buffer */
+    tmp_ptr = inp->blocked_pkt.buffer + inp->blocked_pkt.cc;    
+    length = inp->blocked_pkt.hiwat - inp->blocked_pkt.cc;
+    len = fill_buf(&(inp->inp_snd), tmp_ptr, length);
+    inp->blocked_pkt.cc += len;
+    if (len == length){
+        /* 
+         * The pending packet has been moved to the send buffer.
+         * notify the sender 
+         */
+        msg = GLOMO_MsgAlloc(node, GLOMO_APP_LAYER,
+                             inp->app_proto_type, MSG_APP_FromTransDataSent);
+        GLOMO_MsgInfoAlloc(node, msg, sizeof(TransportToAppDataSent));
+        dataSent = (TransportToAppDataSent *) msg->info;
+        dataSent->connectionId = inp->con_id;
+        dataSent->length = inp->blocked_pkt.hiwat;
+        GLOMO_MsgSend(node, msg, TRANSPORT_DELAY);
+        pc_free(inp->blocked_pkt.buffer);
+        inp->blocked_pkt.buffer = NULL;
+        inp->blocked_pkt.cc = 0;
+        inp->blocked_pkt.hiwat = 0;
+    }
+    return len;
+}
+
+/*
+ * Delete length bytes of data from a buffer.
+ */
+void
+del_buf(GlomoNode *node, struct inpcb *inp, int length)
+{
+    unsigned char *cur_pos;
+
+    if (length == 0) return;
+    assert(length <= inp->inp_snd.cc);
+
+    /* delete length bytes from buffer */
+    inp->inp_snd.cc -= (unsigned long)length;
+    if (inp->inp_snd.cc) {
+        cur_pos = inp->inp_snd.buffer + length;
+        memcpy(inp->inp_snd.buffer, cur_pos, inp->inp_snd.cc);
+    }
+    (void)append_buf(node, inp, NULL, 0);
+}
+

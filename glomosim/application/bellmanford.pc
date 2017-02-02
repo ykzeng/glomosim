@@ -1,0 +1,965 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: bellmanford.pc,v 1.16 2001/02/15 03:17:26 mineo Exp $
+ *
+ * PURPOSE:         Simulate the Bellman-Ford routing protocol.
+ *
+ * NOTE:            This implementation has no notion of a "request" or
+ *                  "response" as described in RIP.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "nwcommon.h"
+#include "app_util.h"
+#include "bellmanford.h"
+
+
+#define noDEBUG
+
+/*
+ * NAME:        RoutingBellmanfordLayer.
+ *
+ * PURPOSE:     Handles all messages sent to bellmanford.
+ *
+ * PARAMETERS:  node, node receiving message.
+ *              msg, message for node to interpret.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordLayer(GlomoNode *node,
+                             Message *msg)
+{
+    GlomoRoutingBellmanford *bellmanford;
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    ctoa(simclock(), clockStr);
+
+    bellmanford = (GlomoRoutingBellmanford *)node->appData.routingVar;
+
+    switch(msg->eventType) 
+    {
+        /* Received packet from network layer. */
+        case MSG_APP_FromTransport:
+        {
+            RoutingBellmanfordHeader *header;
+            char *payload;
+
+            bellmanford->stats.numFromUdp++;
+            
+            header = (RoutingBellmanfordHeader *) msg->packet;
+
+            GLOMO_MsgRemoveHeader(node, msg,
+                                  sizeof(RoutingBellmanfordHeader));
+
+            payload = msg->packet;
+
+            RoutingBellmanfordHandleRTPacket(node, header, payload);
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        /* Received alarm to broadcast routing table. */
+        case MSG_APP_RTBroadcastAlarm:
+        {
+            /* Broadcast routing table to neighbors. */
+            RoutingBellmanfordBroadcastRoutingTable(node,
+                                                    &bellmanford->routeTable);
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        /* 
+         * Received alarm to check if any broadcast routing table 
+         * entry timeouts. 
+         */
+        case MSG_APP_CheckTimeoutAlarm:
+        {
+            /* Handle routing table entry timeouts. */
+            RoutingBellmanfordHandleRoutingTableTO(node, 
+                                                   &bellmanford->routeTable);
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        /* Received alarm to check for triggered updates. */
+        case MSG_APP_TriggerUpdateAlarm:
+        {
+            bellmanford->stats.numTriggerUpdate++;
+
+            /* Broadcast the trigger updates to neighbors. */
+            RoutingBellmanfordBroadcastTriggerUpdate(node, 
+                                                    &bellmanford->routeTable);
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }   
+        default:
+            fprintf(stderr, "RoutingBellmanford: Unknown MSG_APP type %d!\n", 
+                    msg->eventType);
+            assert(FALSE);
+    }
+}
+
+
+
+/*
+ * NAME:        RoutingBellmanfordInit.
+ *
+ * PURPOSE:     Handling all initializations needed by bellmanford.
+ *
+ * PARAMETERS:  node, node doing the initialization.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordInit(GlomoNode *node)
+{
+    clocktype randomTime;
+    Message *newMsg;
+
+    GlomoRoutingBellmanford *bellmanford;
+
+    bellmanford = (GlomoRoutingBellmanford *)
+                  pc_malloc(sizeof(GlomoRoutingBellmanford));
+
+    #ifdef DEBUG
+        printf("Initializing Bellmanford...\n");
+    #endif
+
+    if (bellmanford == NULL) 
+    {
+        fprintf(stderr,
+                "Bellmanford: Cannot alloc memory for BELLMANFORD struct!\n");
+        assert(FALSE);
+    }
+
+    node->appData.routingVar = (void *)bellmanford;
+
+    RoutingBellmanfordInitRoutingStats(node);
+
+    /* Initialize routing table for every node. */
+    RoutingBellmanfordInitRoutingTable(node,
+                        &bellmanford->routeTable);
+
+    /* Start broadcast and timeout timers. */
+    /* Used to avoid synchronization of routing table broadcasts. */
+    randomTime = (clocktype) (pc_nrand(node->seed) % 
+                              ROUTING_BELLMANFORD_RANDOM_TIMER); 
+
+    bellmanford->routeTable.nextRTBroadcast = simclock() + randomTime;
+                                            
+    newMsg = GLOMO_MsgAlloc(node,
+                            GLOMO_APP_LAYER,
+                            APP_ROUTING_BELLMANFORD,
+                            MSG_APP_RTBroadcastAlarm);
+
+    GLOMO_MsgSend(node, newMsg, randomTime);
+
+    newMsg = GLOMO_MsgAlloc(node,
+                            GLOMO_APP_LAYER,
+                            APP_ROUTING_BELLMANFORD,
+                            MSG_APP_CheckTimeoutAlarm);
+
+    GLOMO_MsgSend(node, newMsg, randomTime + ROUTING_BELLMANFORD_TIMEOUT);
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordFinalize.
+ *
+ * PURPOSE:     Handling all finalization needed by bellmanford.
+ *
+ * PARAMETERS:  node, node doing the finalization.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordFinalize(GlomoNode *node)
+{
+    if (node->appData.routingStats == TRUE)
+    {
+        RoutingBellmanfordPrintRoutingStats(node);
+    }
+}
+
+
+
+/*
+ * NAME:        RoutingBellmanfordHandleRTPacket.
+ *
+ * PURPOSE:     Decide what to do when a routing table packet arrives.
+ *
+ * PARAMETERS:  node, node handling the data packet.
+ *              header, header of routing table packet.
+ *              payload, routing table packet.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordHandleRTPacket(GlomoNode *node, 
+                                      RoutingBellmanfordHeader *header,
+                                      char *payload)
+{
+    int numOfRTEntries;
+    RoutingBellmanfordBroadcastRoutingTableRow *broadcastRouteTablePtr;
+    GlomoRoutingBellmanford *bellmanford;
+
+    bellmanford = (GlomoRoutingBellmanford *)node->appData.routingVar;
+
+    broadcastRouteTablePtr = (RoutingBellmanfordBroadcastRoutingTableRow *) 
+                    pc_malloc(ROUTING_BELLMANFORD_NUM_OF_BROADCAST_RT_ENTRY * 
+                    sizeof(RoutingBellmanfordBroadcastRoutingTableRow));
+    
+    if (broadcastRouteTablePtr == NULL)
+    {
+        fprintf(stderr, "Bellmanford: No more memory\n");
+        assert(FALSE);
+    }
+       
+    memset((void *)broadcastRouteTablePtr,
+          0,
+          (ROUTING_BELLMANFORD_NUM_OF_BROADCAST_RT_ENTRY * 
+          ROUTING_BELLMANFORD_BROADCAST_RT_ENTRY_SIZE));
+
+    memcpy((void *)(broadcastRouteTablePtr), 
+           (void *)payload, 
+           header->payloadSize);
+
+    /* 
+     * Find out the number of routing table entries
+     * that packet contains.
+     */
+    numOfRTEntries = header->payloadSize / 
+                     ROUTING_BELLMANFORD_BROADCAST_RT_ENTRY_SIZE;
+
+    /* 
+     * Update the nodes's routing table from neighbor's
+     * routing table broadcast.
+     */
+    RoutingBellmanfordUpdateRoutingTable(node,
+                                         header->sourceAddr,
+                                         numOfRTEntries,
+                                         &bellmanford->routeTable, 
+                                         broadcastRouteTablePtr);
+
+    bellmanford->stats.numRTUpdate++;
+
+    pc_free(broadcastRouteTablePtr);
+}
+
+
+
+/*
+ * NAME:        RoutingBellmanfordInitRoutingTable.
+ *
+ * PURPOSE:     Initialize the routing table of a node.
+ *
+ * PARAMETERS:  node, node which routing table is initialized.
+ *              routeTablePtr, routing table of this node.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordInitRoutingTable(GlomoNode *node, 
+                                RoutingBellmanfordRoutingTable *routeTablePtr)
+{
+    int i;
+    GlomoRoutingBellmanford *bellmanford;
+
+    bellmanford = (GlomoRoutingBellmanford *)node->appData.routingVar;
+
+    /* Empty IP forwarding table. */
+    NetworkEmptyForwardingTable(node);
+
+    /* Zero out routing table. */
+    memset((void*)routeTablePtr, 0, sizeof(RoutingBellmanfordRoutingTable));
+
+    routeTablePtr->row = (RoutingBellmanfordRoutingTableRow *) 
+                         pc_malloc(node->numNodes * 
+                         sizeof(RoutingBellmanfordRoutingTableRow));
+
+    routeTablePtr->nextRTBroadcast = 0;
+    routeTablePtr->triggeredUpdate = FALSE;
+
+    /* Fill default values in routing table. */
+    for (i = 0; i < node->numNodes; i++)
+    {
+        routeTablePtr->row[i].lastModified = simclock();
+        routeTablePtr->row[i].routeChanged = FALSE;
+
+        if (i != node->nodeAddr)
+        {
+            routeTablePtr->row[i].dist = ROUTING_BELLMANFORD_INFINITY;
+            routeTablePtr->row[i].nextHop = NETWORK_UNREACHABLE;
+        }
+        else
+        {
+            routeTablePtr->row[i].dist = 0;
+            routeTablePtr->row[i].nextHop = node->nodeAddr;
+        }
+    }
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordBuildHeader.
+ *
+ * PURPOSE:     Builds the routing layer header.
+ *
+ * PARAMETERS:  sourceAddr, source sending the packet.
+ *              destAddr, destination of the packet to be sent.
+ *              payloadSize, size of the payload.
+ *
+ * RETURN:      A routing header.
+ *
+ * ASSUMPTION:  None.
+ */
+
+RoutingBellmanfordHeader 
+RoutingBellmanfordBuildHeader(NODE_ADDR sourceAddr,
+                              NODE_ADDR destAddr,
+                              int payloadSize)
+{
+    RoutingBellmanfordHeader header;
+
+    header.sourceAddr = sourceAddr;
+    header.destAddr = destAddr;
+    header.payloadSize = payloadSize;
+
+    return header;
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordPrintBroadcastRoutingTable.
+ *
+ * PURPOSE:     Print the routing table that was broadcasted.
+ *              Used for debugging purposes only.
+ *
+ * PARAMETERS:  node, node that routing table belongs to.
+ *              neighRTPtr, routing table broadcasted by neighbor.
+ *              numOfRTEntries, number of routing table entreis in
+ *                              neighbor routing table.
+ *
+ * RETRUN: None. 
+ * 
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordPrintBroadcastRoutingTable(GlomoNode *node,
+                    RoutingBellmanfordBroadcastRoutingTableRow *neighRTPtr,
+                    int numOfRTEntries)
+{
+    int i;
+
+    printf("Node %ld's broadcast routing table.\n", node->nodeAddr);
+
+    for (i = 0; i < numOfRTEntries; i++)
+    {
+        printf("\tDest[%d]: NextHop:%d  Dist:%d\n", neighRTPtr[i].destAddr,
+                neighRTPtr[i].nextHop, neighRTPtr[i].dist);
+    }
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordPrintRoutingTable.
+ *
+ * PURPOSE:     Print the routing table entries of all nodes.  Used for
+ *              debugging purposes only.
+ *
+ * PARAMETERS:  node, node that routing table belongs to.
+ *              routeTablePtr, routing table to be printed.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordPrintRoutingTable(GlomoNode *node, 
+                                RoutingBellmanfordRoutingTable *routeTablePtr)
+{
+    int i;
+
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    ctoa(simclock(), clockStr);
+
+    printf("Node %u's routing table at time %s.\n",
+           node->nodeAddr, clockStr);
+
+    for (i = 0; i < node->numNodes; i++)
+    {
+        printf("\tDest[%d]: NextHop:%d  Dist:%d\n", i, 
+               routeTablePtr->row[i].nextHop, 
+               routeTablePtr->row[i].dist);
+    }
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordBroadcastTriggerUpdate.
+ *
+ * PURPOSE:     Broadcasts the routing table due to triggered updates.
+ *
+ * PARAMETERS:  node, node that is broadcasting the routing table.
+ *              routeTablePtr, routing table for all nodes.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordBroadcastTriggerUpdate(GlomoNode *node,
+                                RoutingBellmanfordRoutingTable *routeTablePtr)
+{
+    RoutingBellmanfordHeader header;
+    RoutingBellmanfordBroadcastRoutingTableRow *broadcastRouteTablePtr;
+
+    int RTIndex;
+
+    int currentBroadcastRTIndex;
+    int broadcastRTSize;
+    clocktype delay = 0;
+
+    RTIndex = 0;
+
+    broadcastRouteTablePtr = (RoutingBellmanfordBroadcastRoutingTableRow *) 
+                 pc_malloc(ROUTING_BELLMANFORD_NUM_OF_BROADCAST_RT_ENTRY *
+                 sizeof(RoutingBellmanfordBroadcastRoutingTableRow));
+    
+    if (broadcastRouteTablePtr == NULL)
+    {
+        fprintf(stderr, "Bellmanford: No more memory\n");
+        assert(FALSE);
+    }
+
+    /* Broadcast the triggered updates. */
+    while (RTIndex < node->numNodes)
+    {
+        memset((void*)broadcastRouteTablePtr, 0,
+              (ROUTING_BELLMANFORD_NUM_OF_BROADCAST_RT_ENTRY * 
+               ROUTING_BELLMANFORD_BROADCAST_RT_ENTRY_SIZE));
+
+        currentBroadcastRTIndex = 0;
+        broadcastRTSize = 0;
+
+        /* 
+         * Break routing table into smaller chunks and only the
+         * the routes that have changed.
+         */
+        while (((broadcastRTSize + 
+                ROUTING_BELLMANFORD_BROADCAST_RT_ENTRY_SIZE) <= 
+                ROUTING_BELLMANFORD_MAX_BROADCAST_RT_SIZE) && 
+                (RTIndex < node->numNodes))
+        {
+            if (routeTablePtr->row[RTIndex].routeChanged == TRUE)
+            {
+                broadcastRouteTablePtr[currentBroadcastRTIndex].destAddr
+                    = RTIndex;
+
+                broadcastRouteTablePtr[currentBroadcastRTIndex].nextHop 
+                    = routeTablePtr->row[RTIndex].nextHop;
+
+                broadcastRouteTablePtr[currentBroadcastRTIndex].dist
+                    = routeTablePtr->row[RTIndex].dist;
+
+                broadcastRTSize 
+                    += ROUTING_BELLMANFORD_BROADCAST_RT_ENTRY_SIZE;
+
+                routeTablePtr->row[RTIndex].routeChanged 
+                    = FALSE;
+
+                currentBroadcastRTIndex++;
+            }
+
+            RTIndex++;
+        }
+
+        if (broadcastRTSize > 0)
+        {
+            /* Build routing table packet. */
+            header = RoutingBellmanfordBuildHeader(node->nodeAddr,
+                                                  ANY_DEST, 
+                                                  broadcastRTSize);
+
+            /* Send to neighbors. */
+            AppUdpSendNewHeaderDataWithPriority(node,
+                                               APP_ROUTING_BELLMANFORD,
+                                               ANY_DEST,
+                                               (char *)&header,
+                                               sizeof(RoutingBellmanfordHeader),
+                                               (char *)broadcastRouteTablePtr,
+                                               broadcastRTSize,
+                                               CONTROL,
+                                               delay);
+        }
+    }
+
+    routeTablePtr->triggeredUpdate = FALSE;
+
+    pc_free(broadcastRouteTablePtr);
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordBroadcastRoutingTable.
+ *
+ * PURPOSE:     Broadcasts the routing table of the node to all its neighbors.
+ *
+ * PARAMETERS:  node, node that is broadcasting the routing table.
+ *              routeTablePtr, routing table for all nodes.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordBroadcastRoutingTable(GlomoNode *node,
+                                RoutingBellmanfordRoutingTable *routeTablePtr)
+{
+    RoutingBellmanfordHeader header;
+    RoutingBellmanfordBroadcastRoutingTableRow *broadcastRouteTablePtr;
+
+    int RTIndex;
+
+    int currentBroadcastRTIndex;
+    int broadcastRTSize;
+    clocktype randomTime;
+    clocktype delay = 0;
+    clocktype tmpNum;
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    Message *newMsg;
+    GlomoRoutingBellmanford *bellmanford;
+
+    bellmanford = (GlomoRoutingBellmanford *)node->appData.routingVar;
+
+    RTIndex = 0;
+
+    ctoa(simclock(), clockStr);
+
+    broadcastRouteTablePtr = (RoutingBellmanfordBroadcastRoutingTableRow *) 
+                pc_malloc(ROUTING_BELLMANFORD_NUM_OF_BROADCAST_RT_ENTRY * 
+                sizeof(RoutingBellmanfordBroadcastRoutingTableRow));
+                          
+    if (broadcastRouteTablePtr == NULL)
+    {
+        fprintf(stderr, "Bellmanford: No more memory\n");
+        assert(FALSE);
+    }
+
+    /* Broadcast routing table to neighbors. */
+    while (RTIndex < node->numNodes)
+    {
+        memset((void *)broadcastRouteTablePtr, 0,
+              (ROUTING_BELLMANFORD_NUM_OF_BROADCAST_RT_ENTRY * 
+               ROUTING_BELLMANFORD_BROADCAST_RT_ENTRY_SIZE));
+
+        currentBroadcastRTIndex = 0;
+        broadcastRTSize = 0;
+
+        /* Break routing table into smaller chunks. */
+        while (((broadcastRTSize + 
+                ROUTING_BELLMANFORD_BROADCAST_RT_ENTRY_SIZE) <= 
+                ROUTING_BELLMANFORD_MAX_BROADCAST_RT_SIZE) && 
+                (RTIndex < node->numNodes))
+        {   
+            broadcastRouteTablePtr[currentBroadcastRTIndex].destAddr
+                = RTIndex;
+
+            broadcastRouteTablePtr[currentBroadcastRTIndex].nextHop 
+                = routeTablePtr->row[RTIndex].nextHop;
+
+            broadcastRouteTablePtr[currentBroadcastRTIndex].dist
+                = routeTablePtr->row[RTIndex].dist;
+
+            broadcastRTSize
+                += ROUTING_BELLMANFORD_BROADCAST_RT_ENTRY_SIZE;
+
+            RTIndex++;
+
+            currentBroadcastRTIndex++;
+        }
+
+        if (broadcastRTSize > 0)
+        {
+            /* Build routing table packet. */
+            header = RoutingBellmanfordBuildHeader(node->nodeAddr,
+                                                   ANY_DEST, 
+                                                   broadcastRTSize);
+
+
+            /* Send each chunk separately. */
+            AppUdpSendNewHeaderDataWithPriority(node,
+                                               APP_ROUTING_BELLMANFORD,
+                                               ANY_DEST,
+                                               (char *)&header,
+                                               sizeof(RoutingBellmanfordHeader),
+                                               (char *)broadcastRouteTablePtr,
+                                               broadcastRTSize,
+                                               CONTROL,
+                                               delay);
+        }
+    }
+
+    /* 
+     * Broadcast after an interval.  Use random time to avoid
+     * synchronization.
+     */
+    randomTime = (clocktype) (pc_nrand(node->seed) % 
+                              ROUTING_BELLMANFORD_RANDOM_TIMER);
+
+    tmpNum = (clocktype) (ROUTING_BELLMANFORD_BC_TIMER);
+
+    routeTablePtr->nextRTBroadcast = simclock() + tmpNum + randomTime;
+
+    newMsg = GLOMO_MsgAlloc(node,
+                            GLOMO_APP_LAYER,
+                            APP_ROUTING_BELLMANFORD,
+                            MSG_APP_RTBroadcastAlarm);
+
+    GLOMO_MsgSend(node, newMsg, ROUTING_BELLMANFORD_BC_TIMER + randomTime);
+
+    bellmanford->stats.numRTBroadcast++;
+
+    pc_free(broadcastRouteTablePtr);
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordHandleRoutingTableTO.
+ *
+ * PURPOSE:     Takes care of routing table timeouts.
+ *
+ * PARAMETERS:  node, node that is handle the routing table
+ *                       timeouts.
+ *              routeTablePtr, routing table for all nodes.
+ *
+ * RETURN: None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordHandleRoutingTableTO(GlomoNode *node,
+                                RoutingBellmanfordRoutingTable *routeTablePtr)
+{
+    int i;
+    BOOL changed = FALSE;
+    int randomTime;
+    clocktype delay;
+    Message *newMsg;
+
+    /* Check each routing table entry to see if there is a timeout. */
+    for (i = 0; i < node->numNodes; i++) 
+    {
+        /* Check if old routing information to detect links going down. */
+        if (((simclock() - routeTablePtr->row[i].lastModified) >= 
+            ROUTING_BELLMANFORD_TIMEOUT) && (i != node->nodeAddr))
+        {
+            /* 
+             * If INFINITY to begin with, no timeout since route
+             * is unreachable already.  If not INFINITY, then
+             * route is now unreachable.
+             */
+            if (routeTablePtr->row[i].dist != ROUTING_BELLMANFORD_INFINITY)
+            {
+                routeTablePtr->row[i].dist = ROUTING_BELLMANFORD_INFINITY;
+                routeTablePtr->row[i].lastModified = simclock();
+                routeTablePtr->row[i].routeChanged = TRUE;
+                changed = TRUE;
+            }
+        }
+    }
+
+    /* Trigger routing table updates if routing information changed. */
+    if (changed == TRUE)
+    {
+        RoutingBellmanfordHandleRouteChange(node, routeTablePtr);
+    }
+
+    /* Check timeout again after an interval */
+    randomTime = (pc_nrand(node->seed) % ROUTING_BELLMANFORD_RANDOM_TIMER);
+
+    delay = (clocktype) (randomTime + ROUTING_BELLMANFORD_TIMEOUT);
+
+    newMsg = GLOMO_MsgAlloc(node,
+                            GLOMO_APP_LAYER,
+                            APP_ROUTING_BELLMANFORD,
+                            MSG_APP_CheckTimeoutAlarm);
+
+    GLOMO_MsgSend(node, newMsg, delay);
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordUpdateRoutingTable.
+ *
+ * PURPOSE:     Updates the routing table of the node using the neighor's 
+ *              routing table broadcast.
+ *
+ * PARAMETERS:  node, node that is going to update its routing table.
+ *              neighborId, neighboring node that broadcasted the
+ *                          routing table update.
+ *              numOfRTEntries, number of routing table entries in
+ *                              neighboring node's broadcasted
+ *                              routing table update.
+ *              routeTablePtr, routing table for all nodes.
+ *              neighRTPtr, routing table entries from neighbor node.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordUpdateRoutingTable(GlomoNode *node, 
+                    NODE_ADDR neighborAddr,
+                    int numOfRTEntries, 
+                    RoutingBellmanfordRoutingTable *routeTablePtr, 
+                    RoutingBellmanfordBroadcastRoutingTableRow *neighRTPtr)
+{
+    int i;
+
+    int destAddr;
+    BOOL changed = FALSE;
+
+    #ifdef DEBUG
+        printf("\nBefore routing table update\n");
+        RoutingBellmanfordPrintRoutingTable(node, routeTablePtr);
+    #endif
+
+    /* Update the routing table. */
+    for (i = 0; i < numOfRTEntries; i++) 
+    {
+        destAddr = neighRTPtr[i].destAddr;
+
+        if (neighRTPtr[i].nextHop == node->nodeAddr)
+        {
+            /* Split horizon with poisoned reverse. */
+            neighRTPtr[i].dist = ROUTING_BELLMANFORD_INFINITY;
+        }
+        else
+        {
+            /* 
+             * Update hop count since hop count was not incremented
+             * at the neighbor.
+             */
+            if (neighRTPtr[i].dist < ROUTING_BELLMANFORD_INFINITY)
+                neighRTPtr[i].dist++;
+        }
+
+        /* 
+         * Update table if found better metric or if the neighbor
+         * is the next hop.
+         */ 
+        if ((neighRTPtr[i].dist < routeTablePtr->row[destAddr].dist) || 
+            (neighborAddr == routeTablePtr->row[destAddr].nextHop))
+        {
+            routeTablePtr->row[destAddr].lastModified = simclock();
+
+            if (neighRTPtr[i].dist != routeTablePtr->row[destAddr].dist)
+            {
+                routeTablePtr->row[destAddr].routeChanged = TRUE;
+
+                changed = TRUE;
+            }
+
+            routeTablePtr->row[destAddr].dist = neighRTPtr[i].dist;
+            routeTablePtr->row[destAddr].nextHop = neighborAddr;
+
+            NetworkUpdateForwardingTable(node, destAddr, 
+                                         DEFAULT_INTERFACE, neighborAddr);
+        }
+    }
+
+    #ifdef DEBUG
+        printf("After routing table update\n");
+        RoutingBellmanfordPrintRoutingTable(node, routeTablePtr);
+    #endif
+
+    /* Trigger routing table updates if routing information changed. */
+    if (changed == TRUE)
+    {
+        RoutingBellmanfordHandleRouteChange(node, routeTablePtr);
+    }
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordHandleRouteChange.
+ *
+ * PURPOSE:     Trigger routing tabe updates to neighbors when route
+ *              is changed.
+ *
+ * PARAMETERS:  node, node that is handling the route change.
+ *              routeTablePtr, routing table for all nodes.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordHandleRouteChange(GlomoNode *node,
+                                RoutingBellmanfordRoutingTable *routeTablePtr)
+{
+    clocktype randomTime;
+    clocktype timeDiff;
+    Message *newMsg;
+
+    timeDiff = routeTablePtr->nextRTBroadcast - simclock();
+
+    /* 
+     * Don't broadcast route change to neighbor if routing table
+     * is going to be broadcasted soon anyway.
+     */
+    if (timeDiff >= ROUTING_BELLMANFORD_TRIGGER_UPDATE_TIMER)
+    {
+        if (routeTablePtr->triggeredUpdate == FALSE)
+        {
+            randomTime = (clocktype) (pc_nrand(node->seed) % 
+                                      ROUTING_BELLMANFORD_TRIGGER_UPDATE_TIMER);
+
+            /* Trigger update at random time to avoid synchronization. */
+            newMsg = GLOMO_MsgAlloc(node,
+                                    GLOMO_APP_LAYER,
+                                    APP_ROUTING_BELLMANFORD,
+                                    MSG_APP_TriggerUpdateAlarm);
+
+            GLOMO_MsgSend(node, newMsg, randomTime);
+
+            routeTablePtr->triggeredUpdate = TRUE;
+        }
+    }
+}
+
+
+/*
+ * NAME:        RoutingBellmanfordInitRoutingStats.
+ *
+ * PURPOSE:     Initialize all network layer statistics.
+ *
+ * PARAMETERS:  node, node keeping track of the statistics.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordInitRoutingStats(GlomoNode *node)
+{
+    GlomoRoutingBellmanford *bellmanford;
+
+    bellmanford = (GlomoRoutingBellmanford *)node->appData.routingVar;
+
+    /* Total number of routing table broadcasts. */
+    bellmanford->stats.numRTBroadcast = 0;   
+
+    /* Total number of triggered routing table updates. */
+    bellmanford->stats.numTriggerUpdate = 0;
+
+    /* Total number of routing table updates. */
+    bellmanford->stats.numRTUpdate = 0;      
+
+    /* Total number of packets received from UDP. */
+    bellmanford->stats.numFromUdp = 0;
+} 
+
+
+/*
+ * NAME:        RoutingBellmanfordPrintRoutingStats.
+ *
+ * PURPOSE:     Print networks layer statistics.
+ *
+ * PARAMETERS:  node, statistics of the node.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingBellmanfordPrintRoutingStats(GlomoNode *node)
+{
+    float averageHopCount;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    GlomoRoutingBellmanford *bellmanford;
+
+    bellmanford = (GlomoRoutingBellmanford *)node->appData.routingVar;
+
+    sprintf(buf, "Number of routing table broadcasts = %d", 
+            bellmanford->stats.numRTBroadcast);
+    GLOMO_PrintStat(node, "RoutingBellmanford", buf);
+
+    sprintf(buf, "Number of routing table trigger updates = %d", 
+            bellmanford->stats.numTriggerUpdate);
+    GLOMO_PrintStat(node, "RoutingBellmanford", buf);
+
+    sprintf(buf, "Number of routing table updates = %d", 
+            bellmanford->stats.numRTUpdate);
+    GLOMO_PrintStat(node, "RoutingBellmanford", buf);
+
+    sprintf(buf, "Number of routing packets received from UDP = %d",
+            bellmanford->stats.numFromUdp); 
+    GLOMO_PrintStat(node, "RoutingBellmanford", buf);
+}
+

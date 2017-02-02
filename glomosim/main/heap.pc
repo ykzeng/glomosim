@@ -1,0 +1,245 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "heap.h"
+
+#define HEAP_INCREMENT 10
+#define HEAP_PARENT(i) ((i) / 2)
+#define HEAP_LEFT(i) (2 * (i))
+#define HEAP_RIGHT(i) ((2 * (i)) + 1)
+
+static BOOL TimeGreaterThan(void *arg1, void *arg2);
+static BOOL NodeGreaterThan(void *arg1, void *arg2);
+
+static void HeapFixUp(Heap *heapPtr, int i, BOOL (*comp)(void *, void*));
+static void HeapFixDown(Heap *heapPtr, int i, BOOL (*comp)(void *, void*));
+static void HeapDelete(Heap *heapPtr, int i, BOOL (*comp)(void *, void*));
+static void HeapInsert(Heap *heapPtr, void *node, BOOL (*comp)(void *, void*));
+
+
+void GLOMO_HeapMobilityInternalInsert(Heap *heapPtr, GlomoNode *node)
+{
+    HeapInsert(heapPtr, node, NodeGreaterThan);
+    heapPtr->minTime =
+        ((GlomoNode *) heapPtr->heapNodePtr[1])->mobilityData.nextMoveTime;
+}
+
+void GLOMO_HeapMobilityInternalFixDown(Heap *heapPtr, int i)
+{
+    HeapFixDown(heapPtr, i, NodeGreaterThan);
+    heapPtr->minTime =
+        ((GlomoNode *) heapPtr->heapNodePtr[1])->mobilityData.nextMoveTime;
+}
+
+void GLOMO_HeapMobilityInternalDelete(Heap *heapPtr, GlomoNode *node)
+{
+    assert(heapPtr->heapNodePtr[1] == node);
+    HeapDelete(heapPtr, 1, NodeGreaterThan);
+    if (heapPtr->heapSize == 0) {
+        heapPtr->minTime = CLOCKTYPE_MAX;
+    } else {
+        heapPtr->minTime =
+            ((GlomoNode *) heapPtr->heapNodePtr[1])->mobilityData.nextMoveTime;
+    }
+}
+
+
+
+void GLOMO_HeapMobilityInsert(Heap *heapPtr, clocktype timeValue)
+{
+    clocktype *inValue;
+
+    inValue = (clocktype *) pc_malloc(sizeof(clocktype));
+    *inValue = timeValue;
+
+    HeapInsert(heapPtr, inValue, TimeGreaterThan);
+    heapPtr->minTime = *((clocktype *) heapPtr->heapNodePtr[1]);
+}
+
+clocktype GLOMO_HeapMobilityDelete(Heap *heapPtr)
+{
+    clocktype retVal;
+
+    retVal = *((clocktype *) heapPtr->heapNodePtr[1]);
+    pc_free(heapPtr->heapNodePtr[1]);
+    HeapDelete(heapPtr, 1, TimeGreaterThan);
+
+    if (heapPtr->heapSize >= 1) {
+        heapPtr->minTime = *((clocktype *) heapPtr->heapNodePtr[1]);
+    }
+    else {
+        heapPtr->minTime = CLOCKTYPE_MAX;
+    }
+
+    return retVal;
+}
+
+
+
+
+static void HeapDelete(Heap *heapPtr, int i, BOOL (*comp)(void *, void*))
+{
+    void **heapNodePtr;
+    heapNodePtr = heapPtr->heapNodePtr;
+
+    heapNodePtr[i] = heapNodePtr[heapPtr->heapSize];
+    heapNodePtr[heapPtr->heapSize] = NULL;
+    heapPtr->heapSize--;
+
+    HeapFixDown(heapPtr, i, comp);
+}
+
+
+static void HeapInsert(Heap *heapPtr, void *node,
+                       BOOL (*comp)(void *, void*))
+{
+    int i;
+
+    heapPtr->heapSize++;
+
+    if (heapPtr->heapSize >= heapPtr->length) {
+        void **tempPtr;
+        heapPtr->length += HEAP_INCREMENT;
+
+        tempPtr = (void **) pc_malloc(heapPtr->length * sizeof(void *));
+        memset(tempPtr, 0, heapPtr->length * sizeof(void *));
+        assert(tempPtr != NULL);
+
+        memcpy(tempPtr, heapPtr->heapNodePtr,
+               sizeof(void *) * (heapPtr->length - HEAP_INCREMENT));
+
+        if (heapPtr->heapNodePtr != NULL) {
+            pc_free(heapPtr->heapNodePtr);
+        }
+
+        heapPtr->heapNodePtr = tempPtr;
+    }
+
+    assert(heapPtr->heapSize < heapPtr->length);
+
+    heapPtr->heapNodePtr[heapPtr->heapSize] = node;
+    HeapFixUp(heapPtr, heapPtr->heapSize, comp);
+}
+
+
+static void HeapFixUp(Heap *heapPtr, int i, BOOL (*comp)(void *, void*))
+{
+    void **heapNodePtr;
+    void *inNode;
+
+    heapNodePtr = heapPtr->heapNodePtr;
+    inNode = heapNodePtr[i];
+
+    while ((i > 1) && comp(heapNodePtr[HEAP_PARENT(i)], inNode)) {
+        heapNodePtr[i] = heapNodePtr[HEAP_PARENT(i)];
+        i = HEAP_PARENT(i);
+    }
+
+    heapNodePtr[i] = inNode;
+}
+
+
+static void HeapFixDown(Heap *heapPtr, int i, BOOL (*comp)(void *, void*))
+{
+    int lval, rval;
+    int small;
+    void **heapNodePtr;
+
+    heapNodePtr = heapPtr->heapNodePtr;
+    lval = HEAP_LEFT(i);
+    rval = HEAP_RIGHT(i);
+
+    if ((lval <= heapPtr->heapSize) &&
+        comp(heapNodePtr[i], heapNodePtr[lval])) {
+        small = lval;
+    }
+    else {
+        small = i;
+    }
+
+    if ((rval <= heapPtr->heapSize) &&
+        comp(heapNodePtr[small], heapNodePtr[rval])) {
+        small = rval;
+    }
+
+    if (small != i) {
+        void *tempNode;
+        tempNode = heapNodePtr[small];
+        heapNodePtr[small] = heapNodePtr[i];
+        assert(small != 1);
+        heapNodePtr[i] = tempNode;
+        HeapFixDown(heapPtr, small, comp);
+    }
+}
+
+
+static BOOL TimeGreaterThan(void *arg1, void *arg2)
+{
+    clocktype value1 = *((clocktype *) arg1);
+    clocktype value2 = *((clocktype *) arg2);
+
+    if (value1 > value2) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+/* is node1 "greater than" node2 */
+static BOOL NodeGreaterThan(void *arg1, void *arg2)
+{
+    GlomoNode *node1 = arg1;
+    GlomoNode *node2 = arg2;
+
+    if ((node1->mobilityData.nextMoveTime >
+                                        node2->mobilityData.nextMoveTime) ||
+        ((node1->mobilityData.nextMoveTime ==
+                                        node2->mobilityData.nextMoveTime) &&
+         (node1->id > node2->id))) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+

@@ -1,0 +1,102 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+//------------------------------------------------------------------------
+//
+// File: user_application.pc
+// By: Jay Martin (jmartin@cs.ucla.edu) 
+// Objectives: Provide simple skeletion routines so that users can
+//             more easily hook their protocols and applications into
+//             GloMoSim without modifying the "application.pc" file itself.
+//             This file should not change in the GloMoSim distribution
+//             and should replaced by the user modified file after each
+//             GloMoSim update.
+//
+// Problems: The application layer is too ad-hock and provides little
+//           in the way of general services to individual applications. 
+//           It probably needs to be reorganized, so this file is
+//           very tentative.
+//           
+//------------------------------------------------------------------------
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+
+#include "application.h"
+
+// Must be unique GloMoSim 0..65K protocol number. 
+                                      
+#define USER_DEFINED_APPLICATION_NUMBER 12345
+
+
+void AppLayerInitUserApplications(
+   GlomoNode *node,
+   const GlomoNodeInput *nodeInput,
+   void** userApplicationData) 
+{
+   *userApplicationData = NULL;
+   // Put function to create your datastructures and 
+   // initialize your applications here.  
+}      
+   
+      
+void AppLayerHandleUserAppEvent(
+   GlomoNode* node, 
+   void* userApplicationData,
+   Message* msg) 
+{
+   // Put function to create your datastructures and 
+   // initialize your applications here.  
+   if (msg->protocolType == USER_DEFINED_APPLICATION_NUMBER) {
+      // Put function to handle GlomoSim Events for your application here.  
+   } else {
+      printf("GloMoSim: Application type# %d Not Handled\n", 
+             msg->protocolType);
+      assert(FALSE); abort();
+   }
+}
+
+void AppLayerFinalizeUserApps(
+   GlomoNode* node,
+   void* userApplicationData) 
+{
+   // Call function to finalize the user's applications.
+}
+
+
+

@@ -1,0 +1,490 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: radio.pc,v 1.29 2001/08/31 19:25:35 jmartin Exp $
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+#include "fileio.h"
+
+#include "propagation.h"
+#include "radio.h"
+#include "radio_accnoise.h"
+#include "radio_nonoise.h"
+
+
+int GLOMO_RadioGetRadioNumberForWavelength(GlomoNode* node, double wavelength) {
+   int I;
+   for(I = 0; I < node->numberRadios; I++) {
+      if (node->radioData[I]->wavelength == wavelength) {
+         return I;
+      }//if//
+   }//for//
+   return -1; // No radio for that waveLength found.
+}
+
+int GLOMO_RadioGetBandwidthBits(GlomoNode* node, int radioNum) {
+   return node->radioData[radioNum]->bandwidth;
+}
+
+
+void GLOMO_RadioInit(
+    GlomoNode *node, 
+    const GlomoNodeInput *nodeInput)
+{
+    node->numberRadios = 0;
+}
+   
+
+
+/*
+ * FUNCTION    GLOMO_RadioCreateARadioForMacLayer
+ * PURPOSE     Initialization function for the radio layer.
+ *
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+void GLOMO_RadioCreateARadioForMacLayer(
+    GlomoNode *node, 
+    const GlomoNodeInput *nodeInput,
+    const int interfaceIndex,
+    int* radioNumber)
+ {
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    BOOL wasFound;
+    double txPower_dBm;
+    double rxSensitivity_dBm;
+    double rxThreshold_dBm;
+    double antennaGain_dB;
+    double antennaHeight;
+    double frequency;
+    int bandwidth;
+    int radioIndex = node->numberRadios;
+    
+    node->numberRadios++;
+    *radioNumber = radioIndex;
+    assert(radioIndex < MAX_NUM_RADIOS);
+    
+    node->radioData[radioIndex] = checked_pc_malloc(sizeof(GlomoRadio));
+    node->radioData[radioIndex]->radioNumber = radioIndex;
+    node->radioData[radioIndex]->macInterfaceIndex = interfaceIndex;
+   
+    GLOMO_ReadStringInstance(
+        node->nodeAddr,
+        nodeInput,
+        "RADIO-TYPE",
+        radioIndex,
+        (radioIndex == 0),
+        &wasFound,
+        buf);
+    
+    if (!wasFound) { 
+       fprintf(stderr, "RADIO-TYPE was not specified for radio: %d\n",
+          radioIndex);
+       abort();
+    }//if//
+
+    if (strcmp(buf, "RADIO-ACCNOISE") == 0) {
+        node->radioData[radioIndex]->radioType = RADIO_ACCNOISE;
+    }
+    else if (strcmp(buf, "RADIO-NONOISE") == 0) {
+        node->radioData[radioIndex]->radioType = RADIO_NONOISE;
+    }
+    else {
+        fprintf(stderr, "CONFIG.IN Error: Unknown Radio Type %s.\n", buf);
+        assert(FALSE); abort();
+    }//if//
+
+    
+    // Channel Variables (should be "RADIO-" variables).                           
+    
+    GLOMO_ReadDoubleInstance(
+        node->nodeAddr,
+        nodeInput,
+        "RADIO-FREQUENCY",
+        radioIndex,
+        (radioIndex == 0),
+        &wasFound,
+        &frequency);
+        
+    if (!wasFound) {
+       fprintf(stderr, "Error: RADIO-FREQUENCY is not specified for "
+                       "radio: %d\n", radioIndex);
+       abort();
+    }//if//
+    
+    node->radioData[radioIndex]->wavelength = SPEED_OF_LIGHT / frequency;
+    
+    
+    GLOMO_ReadIntInstance(
+        node->nodeAddr,
+        nodeInput,
+        "RADIO-BANDWIDTH",
+        radioIndex,
+        TRUE,
+        &wasFound,
+        &bandwidth);
+
+    if (!wasFound) {
+        fprintf(stderr, "Error: RADIO-BANDWIDTH not specified\n");
+        abort();
+    }//if//
+
+    node->radioData[radioIndex]->bandwidth = bandwidth;
+    
+    node->radioData[radioIndex]->backgroundNoise_dBm =
+       GLOMO_PropBackgroundNoise_dBm(node, bandwidth);
+    
+    node->radioData[radioIndex]->backgroundNoise_mW =
+       GLOMO_PropBackgroundNoise_mW(node, bandwidth);
+
+   
+    //
+    // Set RADIO-TX-POWER
+    //
+    GLOMO_ReadDoubleInstance(node->nodeAddr,
+                             nodeInput,
+                             "RADIO-TX-POWER",
+                             radioIndex,
+                             TRUE,
+                             &wasFound,
+                             &txPower_dBm);
+
+    if (wasFound) {
+        node->radioData[radioIndex]->txPower_dBm = txPower_dBm;
+        node->radioData[radioIndex]->txPower_mW = NON_DB(txPower_dBm);
+    }
+    else {
+        node->radioData[radioIndex]->txPower_dBm = RADIO_DEFAULT_TX_POWER;
+        node->radioData[radioIndex]->txPower_mW
+            = NON_DB(RADIO_DEFAULT_TX_POWER);
+    }
+
+    //
+    // Set RADIO-RX-SENSITIVITY
+    //
+    GLOMO_ReadDoubleInstance(node->nodeAddr,
+                             nodeInput,
+                             "RADIO-RX-SENSITIVITY",
+                             radioIndex,
+                             TRUE,
+                             &wasFound,
+                             &rxSensitivity_dBm);
+
+    if (wasFound) {
+        node->radioData[radioIndex]->rxSensitivity_dBm
+            = rxSensitivity_dBm;
+        node->radioData[radioIndex]->rxSensitivity_mW
+            = NON_DB(rxSensitivity_dBm);
+    }
+    else {
+        node->radioData[radioIndex]->rxSensitivity_dBm
+            = RADIO_DEFAULT_RX_SENSITIVITY;
+        node->radioData[radioIndex]->rxSensitivity_mW
+            = NON_DB(RADIO_DEFAULT_RX_SENSITIVITY);
+    }
+
+    //
+    // Set RADIO-RX-THRESHOLD
+    //
+    GLOMO_ReadDoubleInstance(node->nodeAddr,
+                             nodeInput,
+                             "RADIO-RX-THRESHOLD",
+                             radioIndex,
+                             TRUE,
+                             &wasFound,
+                             &rxThreshold_dBm);
+
+    if (wasFound) {
+        node->radioData[radioIndex]->rxThreshold_dBm
+            = rxThreshold_dBm;
+        node->radioData[radioIndex]->rxThreshold_mW
+            = NON_DB(rxThreshold_dBm);
+    }
+    else {
+        node->radioData[radioIndex]->rxThreshold_dBm
+            = RADIO_DEFAULT_RX_THRESHOLD;
+        node->radioData[radioIndex]->rxThreshold_mW
+            = NON_DB(RADIO_DEFAULT_RX_THRESHOLD);
+    }
+
+    //
+    // Set RADIO-ANTENNA-GAIN
+    //
+    GLOMO_ReadDoubleInstance(node->nodeAddr,
+                             nodeInput,
+                             "RADIO-ANTENNA-GAIN",
+                             radioIndex,
+                             TRUE,
+                             &wasFound,
+                             &antennaGain_dB);
+
+    if (wasFound) {
+        node->radioData[radioIndex]->antennaGain_dB = (float)antennaGain_dB;
+    }
+    else {
+        node->radioData[radioIndex]->antennaGain_dB
+            = RADIO_DEFAULT_ANTENNA_GAIN;
+    }
+
+    //
+    // Set RADIO-ANTENNA-HEIGHT
+    //
+    GLOMO_ReadDoubleInstance(node->nodeAddr,
+                             nodeInput,
+                             "RADIO-ANTENNA-HEIGHT",
+                             radioIndex,
+                             TRUE,
+                             &wasFound,
+                             &antennaHeight);
+
+    if (wasFound) {
+        node->radioData[radioIndex]->antennaHeight = (float)antennaHeight;
+    }
+    else {
+        node->radioData[radioIndex]->antennaHeight
+            = RADIO_DEFAULT_ANTENNA_HEIGHT;
+    }
+
+    GLOMO_ReadStringInstance(node->nodeAddr,
+                             nodeInput,
+                             "RADIO-LAYER-STATISTICS",
+                             radioIndex,
+                             TRUE,
+                             &wasFound,
+                             buf);
+
+    if (wasFound) {
+        if (strcmp(buf, "YES") == 0) {
+            node->radioData[radioIndex]->radioStats = TRUE;
+        }
+        else if (strcmp(buf, "NO") == 0) {
+            node->radioData[radioIndex]->radioStats = FALSE;
+        }
+        else {
+            fprintf(stderr, "%s is not a valid choice.\n", buf);
+            assert(FALSE);
+        }
+    }
+    else {
+        node->radioData[radioIndex]->radioStats = FALSE;
+    }
+
+    GLOMO_ReadStringInstance(node->nodeAddr,
+                             nodeInput,
+                             "GUI-RADIO",
+                             radioIndex,
+                             TRUE,
+                             &wasFound,
+                             buf);
+    if (wasFound) {
+        if (strcmp(buf, "YES") == 0) {
+            node->radioData[radioIndex]->guiOption = TRUE;
+        }
+        else if (strcmp(buf, "NO") == 0) {
+            node->radioData[radioIndex]->guiOption = FALSE;
+        }
+        else {
+            fprintf(stderr, "Error: %s is not a valid choice.\n", buf);
+            assert(FALSE);
+        }
+    }
+    else {
+        node->radioData[radioIndex]->guiOption = FALSE;
+    }//if//
+    
+    
+   
+    
+    switch(node->radioData[radioIndex]->radioType) {
+        case RADIO_ACCNOISE:
+            RadioAccnoiseInit(node, radioIndex, nodeInput);
+            break;
+            
+        case RADIO_NONOISE:
+            RadioNonoiseInit(node, radioIndex, nodeInput);
+            break;
+            
+        default:
+            assert(FALSE);
+            abort();
+            break;
+    }/*switch*/
+    
+}//GLOMO_RadioCreateARadioForMacLayer//
+
+
+/*
+ * FUNCTION    GLOMO_RadioFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of 
+ *             the simulation of the Radio Layer.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+void GLOMO_RadioFinalize(GlomoNode *node) {
+    int radioNum;
+    for (radioNum = 0; (radioNum < node->numberRadios); radioNum++) {
+        switch(node->radioData[radioNum]->radioType) {
+            case RADIO_ACCNOISE:
+                RadioAccnoiseFinalize(node, radioNum);
+                break;
+
+            case RADIO_NONOISE:
+                RadioNonoiseFinalize(node, radioNum);
+                break;
+
+            default:
+                assert(FALSE); abort();
+        }
+    }
+}
+
+
+/*
+ * FUNCTION    GLOMO_RadioLayer
+ * PURPOSE     Models the behaviour of the Radio Layer on receiving the
+ *             message encapsulated in msgHdr
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msgHdr:   message received by the layer
+ */
+void GLOMO_RadioLayer(GlomoNode *node, Message *msg) {
+    /*
+     * Based on the radio type call the appropriate function for
+     * executing the message.
+     */
+    int radioNum = GLOMO_MsgGetInstanceId(msg);
+    
+    switch(node->radioData[radioNum]->radioType) {
+        case RADIO_ACCNOISE:
+            RadioAccnoiseLayer(node, radioNum, msg);
+            break;
+            
+        case RADIO_NONOISE:
+            RadioNonoiseLayer(node, radioNum, msg);
+            break;
+            
+        default:
+            assert(FALSE); abort();
+    }
+}
+
+
+BOOL GLOMO_RadioCanReceive(GlomoNode *node, int radioNum, double rxPower_dBm) 
+{
+    double backgroundNoise_dBm = node->radioData[radioNum]->backgroundNoise_dBm;
+    double rxThreshold_dBm = node->radioData[radioNum]->rxThreshold_dBm;
+
+    if (rxPower_dBm < MAX(backgroundNoise_dBm, rxThreshold_dBm)) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+
+
+
+//
+// FUNCTION    GLOMO_RadioGetStatus
+// PURPOSE     Retrieves the Radio's current status.
+//
+
+RadioStatusType GLOMO_RadioGetStatus(GlomoNode* node, int radioNum) {
+    switch(node->radioData[radioNum]->radioType) {
+        case RADIO_ACCNOISE:
+            return RadioAccnoiseGetStatus(node, radioNum);
+            break;
+            
+        case RADIO_NONOISE:
+            return RadioNonoiseGetStatus(node, radioNum);
+            break;
+            
+        default:
+            assert(FALSE); abort(); return 0;
+    }
+}
+
+
+//
+// FUNCTION    GLOMO_RadioStartTransmitting
+// PURPOSE     Starts transmitting a packet.
+//
+
+
+void GLOMO_RadioStartTransmittingPacket(
+   GlomoNode* node, 
+   int radioNum, 
+   Message* msg,
+   NODE_ADDR destinationNode,
+   BOOL useMacLayerSpecifiedDelay,
+   clocktype delayUntilAirborne)
+{
+    switch(node->radioData[radioNum]->radioType) {
+        case RADIO_ACCNOISE: {
+            RadioAccnoiseStartTransmittingPacket(
+                node, radioNum, msg, destinationNode,
+                useMacLayerSpecifiedDelay, delayUntilAirborne);
+            break;
+        }
+
+        case RADIO_NONOISE: {
+            RadioNonoiseStartTransmittingPacket(
+                node, radioNum, msg, 
+                useMacLayerSpecifiedDelay, delayUntilAirborne);
+            break;
+        }            
+
+        default:
+            assert(FALSE); abort();
+    }//switch//
+}
+
+

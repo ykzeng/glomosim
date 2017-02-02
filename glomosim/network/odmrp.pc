@@ -1,0 +1,4005 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * Name: odmrp.pc
+ * Purpose: To simulate On-Demand Multicast Routing Protocol (ODMRP) 
+ */
+
+/* 
+ * Notes: The implementation followed the latest specification in the Internet
+ *        Draft (draft-ietf-manet-odmrp-02.txt). 
+ *
+ *        The mobility prediction using GPS is not included in this 
+ *        implementation.
+ *       
+ *        We assumed that nodes sending multicast data packets are also
+ *        multicast members (i.e., non-members cannot be multicast sources
+ *
+ *        In statistic collection, Join Query packets that piggybacked data
+ *        are counted as control packets as well as data packets
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "main.h"
+#include "message.h"
+#include "network.h"
+#include "ip.h"
+#include "nwip.h"
+#include "nwcommon.h"
+#include "application.h"
+#include "transport.h"
+#include "java_gui.h"
+
+#include "mac.h"
+#include "odmrp.h"
+
+#define noDEBUG
+
+//long McastReturnMemberCount(GlomoNode *node, NODE_ADDR groupAddr, clocktype theTime);
+
+/*
+ * FUNCTION     RoutingOdmrpInit
+ * PURPOSE      Initialization function for ODMRP protocol of NETWORK layer
+ *
+ * Parameters:
+ *     node:       Node being initialized
+ *     odmrpPtr:   Reference to ODMRP data structure.
+ *     nodeInput:  Reference to input file.
+ */
+void RoutingOdmrpInit(GlomoNode *node,
+                      GlomoRoutingOdmrp **odmrpPtr,
+                      const GlomoNodeInput *nodeInput)
+{
+    GlomoNodeInput memberInput;
+    BOOL retVal;
+    int i;
+
+    char joinTimeStr[GLOMO_MAX_STRING_LENGTH];
+    char leaveTimeStr[GLOMO_MAX_STRING_LENGTH];
+    clocktype joinTime, leaveTime;
+    NODE_ADDR srcAddr, mcastAddr;
+
+    GlomoRoutingOdmrp *odmrp =
+        (GlomoRoutingOdmrp *)checked_pc_malloc (sizeof(GlomoRoutingOdmrp));
+
+    (*odmrpPtr) = odmrp;
+
+    if (odmrp == NULL)
+    {
+        fprintf(stderr, "ODMRP: Cannot alloc memory for ODMRP struct!\n");
+        assert (FALSE);
+    }
+
+    NetworkIpSetRouterFunction(node, &RoutingOdmrpRouterFunction);
+
+    RoutingOdmrpInitStats(node);
+    RoutingOdmrpInitMembership(&odmrp->memberFlag);
+    RoutingOdmrpInitFgFlag(&odmrp->fgFlag);
+    RoutingOdmrpInitMemberTable(&odmrp->memberTable);
+    RoutingOdmrpInitTempTable(&odmrp->tempTable);
+    RoutingOdmrpInitRouteTable(&odmrp->routeTable);
+    RoutingOdmrpInitMessageCache(&odmrp->messageCache);
+    RoutingOdmrpInitSeqTable(node);
+    RoutingOdmrpInitSent(&odmrp->sentTable);
+    RoutingOdmrpInitAckTable(&odmrp->ackTable);
+    RoutingOdmrpInitResponseTable(&odmrp->responseTable);
+
+    retVal = GLOMO_ReadCachedFile(nodeInput, "MCAST-CONFIG-FILE", &memberInput);
+
+    if (retVal == FALSE) 
+    {
+        fprintf(stderr, "ODMRP: Needs MCAST-CONFIG-FILE.\n");
+        assert(FALSE);
+    }
+
+    /* Processing node membership. */
+    for (i = 0; i < memberInput.numLines; i++) 
+    {
+        retVal = sscanf(memberInput.inputStrings[i],
+                        "%ld %ld %s %s",
+                        &srcAddr, &mcastAddr,
+                        joinTimeStr, leaveTimeStr);
+                        
+
+        if (retVal != 4) 
+        {
+            fprintf(stderr, "Application: Wrong configuration format!\n");
+            assert(0); abort();
+        }
+
+        joinTime = GLOMO_ConvertToClock(joinTimeStr);
+        leaveTime = GLOMO_ConvertToClock(leaveTimeStr);
+
+        if (node->nodeAddr == srcAddr)
+        {
+            RoutingOdmrpSetTimer(
+                            node, MSG_NETWORK_JoinGroup, mcastAddr, joinTime);
+
+            RoutingOdmrpSetTimer(
+                            node, MSG_NETWORK_LeaveGroup, mcastAddr, leaveTime);
+        }
+    }
+} /* RoutingOdmrpInit */
+
+/*
+ * FUNCTION     RoutingOdmrpHandelProtocolEvent
+ * PURPOSE      Handles ODMRP specific events only.
+ *
+ * Parameters: 
+ *     node: Node that is handling the ODMRP event.
+ *     msg:  Event that needs to be handled.
+ */
+void RoutingOdmrpHandleProtocolEvent(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp= (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+
+    switch (msg->eventType)
+    {
+        case MSG_NETWORK_CheckAcked:
+        {
+            NODE_ADDR *mcastAddr = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+            clocktype jitterTime;
+
+            if (RoutingOdmrpCheckAckTable(*mcastAddr, &odmrp->ackTable))
+            {
+#ifdef DEBUG
+  printf("Node %ld not acked. Retx!\n", node->nodeAddr);
+#endif
+                RoutingOdmrpRetxReply(node, *mcastAddr, &odmrp->ackTable);
+            } 
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        } 
+
+        /* Check expiration timers. */
+        case MSG_NETWORK_CheckTimeoutAlarm:
+        {
+            NODE_ADDR *mcastAddr = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+
+            /* If I'm source for the group. */
+            if (RoutingOdmrpLookupSentTable(*mcastAddr, &odmrp->sentTable))
+            {
+                if (RoutingOdmrpCheckMinExpTime(
+                                     *mcastAddr, &odmrp->sentTable) &&
+                    RoutingOdmrpCheckCongestionTime(
+                                     *mcastAddr, &odmrp->memberTable) &&
+                    !RoutingOdmrpCheckSendQuery(*mcastAddr, &odmrp->sentTable))
+                {
+#ifdef DEBUG
+ printf("HERE\n");
+#endif
+                    RoutingOdmrpSetSendQuery(*mcastAddr, &odmrp->sentTable);
+                }
+
+                RoutingOdmrpSetTimer(
+                             node, MSG_NETWORK_CheckTimeoutAlarm, 
+                             *mcastAddr, ODMRP_TIMER_INTERVAL);
+            }
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+      
+        case MSG_NETWORK_FlushTables:
+        {
+            RoutingOdmrpDeleteMsgCache(&odmrp->messageCache);
+            GLOMO_MsgFree(node, msg);
+            break;
+        }
+
+        /* Join Multicast group. */
+        case MSG_NETWORK_JoinGroup:
+        {
+            NODE_ADDR *mcastAddr = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+            RoutingOdmrpJoinGroup(node, *mcastAddr);
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        /* Leave Multicast group. */
+        case MSG_NETWORK_LeaveGroup:
+        {
+            NODE_ADDR *mcastAddr = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+            RoutingOdmrpLeaveGroup(node, *mcastAddr);
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+
+        case MSG_NETWORK_SendReply:
+        {
+            NODE_ADDR *mcastAddr = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+
+            RoutingOdmrpSendReply(
+                    node, *mcastAddr, &odmrp->memberTable, &odmrp->tempTable);
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        } /* case - send reply */
+
+        /* Check if FG flag has been expired. */
+        case MSG_NETWORK_CheckFg:
+        {
+            NODE_ADDR *mcastAddr = (NODE_ADDR *)GLOMO_MsgReturnInfo(msg);
+
+            /* Check only if the node is a FG member. */
+            if (RoutingOdmrpLookupFgFlag(*mcastAddr, &odmrp->fgFlag))
+            {
+                /* If FG expired, reset the flag. */
+                if (RoutingOdmrpCheckFgExpired(*mcastAddr, &odmrp->fgFlag))
+                {
+                    RoutingOdmrpResetFgFlag(*mcastAddr, &odmrp->fgFlag);
+                }
+                else
+                {
+                    RoutingOdmrpSetTimer(
+                       node, MSG_NETWORK_CheckFg, *mcastAddr, ODMRP_FG_TIMEOUT);
+                }
+            } /* if fg */
+
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        } /* case - check fg */
+
+        default:
+            printf("Time %s: Node %ld received message of unknown type %d.\n",
+                   clockStr, node->nodeAddr, msg->eventType);
+            assert(FALSE);
+    } 
+}
+
+/*
+ * FUNCTION     RoutingOdmrpHandelProtocolPacket
+ * PURPOSE      Handles ODMRP packet that was received from the MAC layer
+ *              with destination being some other node.
+ *
+ * Parameters: 
+ *     node:       node that is handling the ODMRP packet.
+ *     msg:        msg, that event that needs to be handled.
+ *     srcAddr:    The address of the source that sent the packet.
+ *     destAddr:   The multicast address that the packet belongs to.
+ *
+ * Note:           This function is called when packets are received
+ *                 from MAC.  The IP header is already removed.
+ */
+void RoutingOdmrpHandleProtocolPacket(
+          GlomoNode *node, Message *msg, NODE_ADDR srcAddr, NODE_ADDR destAddr)
+{
+    ODMRP_PacketType *odmrpHeader = (ODMRP_PacketType *)
+                                     GLOMO_MsgReturnPacket(msg);
+
+    switch (*odmrpHeader)
+    {
+        case ODMRP_ACK:
+            RoutingOdmrpHandleAck(node, msg, srcAddr, destAddr);
+            break;
+
+        case ODMRP_JOIN_REPLY:
+            RoutingOdmrpHandleReply(node, msg, srcAddr, destAddr);
+            break;
+
+        default:
+            printf("ODMRP received packet of unknown type\n");
+            assert (FALSE);
+    }
+}
+
+/*
+ * FUNCTION     RoutingOdmrpRouterFunction
+ * PURPOSE      Handles ODMRP packet that was from the transport
+ *              layer or from the MAC layer with this node as the
+ *              destination.
+ *
+ * Parameters:
+ *     node:       node that is handling the ODMRP event.
+ *     msg:        msg, that event that needs to be handled.
+ *     destAddr:   The multicast address that the packet belongs to.
+ *
+ * Note: Packet is from IP with IP header already created.
+ *       ipHeader->ip_dst specifies the multicast destination.
+ */
+void RoutingOdmrpRouterFunction(GlomoNode *node,
+                                Message *msg,
+                                NODE_ADDR destAddr,
+                                BOOL *packetWasRouted)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    IpHeaderType *ipHeader = (IpHeaderType *) msg->packet;
+    OdmrpIpOptionType option;
+
+    /*
+     * The case where packet came from MAC but belongs to this node.
+     */
+
+    if (ipHeader->ip_p == IPPROTO_ODMRP) 
+    {
+        if (ipHeader->ip_dst >= IP_MIN_MULTICAST_ADDRESS) 
+        {
+            NODE_ADDR sourceAddress;
+            NODE_ADDR destinationAddress;
+            unsigned char IpProtocol;
+            unsigned int ttl;
+            NetworkQueueingPriorityType priority;
+        
+            NetworkIpRemoveIpHeader(node, msg, &sourceAddress, 
+                            &destinationAddress, &priority, &IpProtocol, &ttl);
+            RoutingOdmrpHandleProtocolPacket(
+                                node, msg, sourceAddress,destinationAddress);
+            *packetWasRouted = TRUE;
+            return;
+        } 
+        else 
+        {
+            *packetWasRouted = FALSE;
+            return;
+        }
+    }
+
+    *packetWasRouted = TRUE;
+
+    /* Packet from UDP */
+    if (FindAnIpOptionField(ipHeader, IPOPT_ODMRP) == NULL &&
+        ipHeader->ip_src == node->nodeAddr)
+    {
+
+#ifdef DEBUG
+    printf("Node %ld has data to send\n", node->nodeAddr);
+#endif  
+
+        /*
+         * Check if the node is the member of the group.
+         * Send packet only if the nodes is member of the group 
+         */
+        if (RoutingOdmrpLookupMembership(destAddr, &odmrp->memberFlag))
+        {
+            /* 
+             * If group membership information is known,
+             * send data packet right away 
+             */
+            if (RoutingOdmrpLookupSentTable(destAddr, &odmrp->sentTable) &&
+                !RoutingOdmrpCheckSendQuery(destAddr, &odmrp->sentTable))
+            {
+#ifdef DEBUG
+    printf("    Sending Data\n");
+#endif
+                RoutingOdmrpSendData(node, msg, destAddr);
+            } /* If group membership info. known */
+
+            /* If no group info is known, send Join Query */
+            else 
+            {
+#ifdef DEBUG
+    printf("    Sending Join Query\n");
+#endif
+                RoutingOdmrpSendQuery(node, msg, destAddr);
+            } /* else - no group membership known */
+        } /* If Member of the group */
+    } /* if source */
+
+    else
+    {
+        RoutingOdmrpHandleData(node, msg);
+    }
+}
+
+/* 
+ * FUNCTION     RoutingOdmrpFinalize
+ * PURPOSE      Called at the end of simulation to collect the results of
+ *              the simulation of ODMRP protocol of the NETWORK layer.
+ *
+ * Parameter:
+ *     node:    node for which results are to be collected
+ */
+void RoutingOdmrpFinalize(GlomoNode *node)
+{
+    GlomoNetworkIp *ipLayer = (GlomoNetworkIp *)node->networkData.networkVar;
+    GlomoRoutingOdmrp *odmrp = (GlomoRoutingOdmrp *)ipLayer->routingProtocol;
+    FILE *statOut;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+    sprintf(buf, "Number of Join Queries Txed = %d",
+                 odmrp->stats.numQueryTxed);
+    GLOMO_PrintStat(node, "RoutingOdmrp", buf);
+    sprintf(buf, "Number of Join Replies Txed = %d",
+                 odmrp->stats.numReplySent);
+    GLOMO_PrintStat(node, "RoutingOdmrp", buf);
+    sprintf(buf, "Number of Acks Txed = %d",
+                 odmrp->stats.numAckSent);
+    GLOMO_PrintStat(node, "RoutingOdmrp", buf);
+
+    sprintf(buf, "Number of CTRL Packets Txed = %d",
+                 odmrp->stats.numQueryTxed + odmrp->stats.numReplySent +
+                 odmrp->stats.numAckSent);
+    GLOMO_PrintStat(node, "RoutingOdmrp", buf);
+
+    sprintf(buf, "Number of Data Txed = %d",
+                 odmrp->stats.numDataTxed);
+    GLOMO_PrintStat(node, "RoutingOdmrp", buf);
+
+    sprintf(buf, "Number of Data Packets Originated = %d",
+                 odmrp->stats.numDataSent);
+    GLOMO_PrintStat(node, "RoutingOdmrp", buf);
+
+    sprintf(buf, "Number of Data Packets Supposed to be Received = %d",
+                 odmrp->stats.numDataToReceive);
+    GLOMO_PrintStat(node, "RoutingOdmrp", buf);
+
+    sprintf(buf, "Number of Data Packets Received = %d",
+                 odmrp->stats.numDataReceived);
+    GLOMO_PrintStat(node, "RoutingOdmrp", buf);
+
+} /* RoutingOdmrpFinalize */
+
+/*
+ * FUNCTION     RoutingOdmrpHandleData
+ * PURPOSE      Processing procedure when Data and Join Query is received.
+ *
+ * Paremeters:
+ *     node:  Node handling the data packet.
+ *     msg:   The data packet.
+ */
+
+void RoutingOdmrpHandleData(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    IpHeaderType *ipHdr = (IpHeaderType *)GLOMO_MsgReturnPacket(msg);
+    NODE_ADDR sourceAddress;
+    NODE_ADDR destinationAddress;
+    unsigned char IpProtocol;
+    unsigned int ttl;
+    NetworkQueueingPriorityType priority;
+    clocktype delay;
+    NODE_ADDR srcAddr = ipHdr->ip_src;
+    NODE_ADDR mcastAddr = ipHdr->ip_dst;
+    OdmrpIpOptionType option = GetOdmrpIpOptionField(msg);
+    Message *newMsg = NULL;
+
+    if (option.query == TRUE)
+    {
+        RoutingOdmrpHandleJoinQuery(node, msg);
+        return;
+    }
+
+    /* Handle the packet only if not a duplicate */
+    if (!RoutingOdmrpLookupMessageCache(
+                          srcAddr, option.seqNumber, &odmrp->messageCache))
+    {
+        RoutingOdmrpInsertMessageCache(
+                    node, srcAddr, option.seqNumber, &odmrp->messageCache);
+
+        /* Check if the node is the member of the group */
+        if (RoutingOdmrpLookupMembership(mcastAddr, &odmrp->memberFlag))
+        {
+#ifdef DEBUG
+        printf("Node %ld received DATA\n", node->nodeAddr);
+#endif
+
+#ifdef DEBUG
+    printf("    Member got it!\n");
+#endif
+            odmrp->stats.numDataReceived++;
+
+            newMsg = GLOMO_MsgCopy(node, msg);
+            NetworkIpRemoveIpHeader(node, newMsg, &sourceAddress, 
+                        &destinationAddress, &priority, &IpProtocol, &ttl);
+
+            SendToUdp(
+                  node, newMsg, priority, sourceAddress, destinationAddress);
+        }
+
+        /* If the node is FG, forward the packet. */
+        if (RoutingOdmrpLookupFgFlag(mcastAddr, &odmrp->fgFlag))
+        {
+#ifdef DEBUG
+        printf("Node %ld received DATA\n", node->nodeAddr);
+#endif
+
+#ifdef DEBUG
+    printf("    FG. Forwarding it\n");
+#endif
+            option.lastAddr = node->nodeAddr;
+            option.hopCount++;
+            SetOdmrpIpOptionField(msg, &option);
+
+            delay = pc_erand(node->seed) * ODMRP_BROADCAST_JITTER;
+
+            NetworkIpSendPacketToMacLayerWithDelay(
+                                node, msg, DEFAULT_INTERFACE, ANY_DEST, delay);
+
+            odmrp->stats.numDataTxed++;
+        } /* If FG */
+    } /* if not duplicate */
+
+    else
+    {
+        GLOMO_MsgFree(node, msg);
+    }
+} /* RoutingOdmrpHandleData */
+
+/*
+ * FUNCTION     RoutingOdmrpHandleJoinQuery
+ * PURPOSE      Processing procedure when Data Join is received.
+ *
+ * Paremeters:
+ *     node:  Node handling the data join packet.
+ *     msg:   The data join packet.
+ */
+void RoutingOdmrpHandleJoinQuery(GlomoNode *node, Message *msg)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    IpHeaderType *ipHdr = (IpHeaderType *)GLOMO_MsgReturnPacket(msg);
+    NODE_ADDR sourceAddress;
+    NODE_ADDR destinationAddress;
+    unsigned char IpProtocol;
+    unsigned int ttl;
+    NetworkQueueingPriorityType priority;
+    clocktype delay, jrDelay;
+    ODMRP_MT_Node *mcastEntry;
+    ODMRP_RPT_Node *mEntry;
+    NODE_ADDR srcAddr = ipHdr->ip_src;
+    NODE_ADDR mcastAddr = ipHdr->ip_dst;
+    OdmrpIpOptionType option = GetOdmrpIpOptionField(msg);
+    Message *newMsg = NULL;
+
+    /* Process packet only if not duplicate. */
+    if (!RoutingOdmrpLookupMessageCache(
+                         srcAddr, option.seqNumber, &odmrp->messageCache))
+    {
+#ifdef DEBUG
+    printf("Node %ld received Join Query from %d\n", node->nodeAddr, option.lastAddr);
+#endif
+
+        RoutingOdmrpInsertMessageCache(
+                     node, srcAddr, option.seqNumber, &odmrp->messageCache);
+
+        RoutingOdmrpInsertRouteTable(
+            srcAddr, option.lastAddr, option.hopCount, &odmrp->routeTable);
+
+        /* If the node is a member of the group */
+        if (RoutingOdmrpLookupMembership(mcastAddr, &odmrp->memberFlag))
+        {
+#ifdef DEBUG
+                printf("        Member got it!\n");
+#endif
+
+            odmrp->stats.numDataReceived++;
+
+            /* Relay the Query if hop does not exceed TTL. */
+            if (option.hopCount < ODMRP_MAX_HOP)
+            {
+                option.lastAddr = node->nodeAddr;
+                option.hopCount++;
+                SetOdmrpIpOptionField(msg, &option);
+
+                delay = pc_erand(node->seed) * ODMRP_BROADCAST_JITTER; 
+
+                NetworkIpSendPacketToMacLayerWithDelay(
+                                node, msg, DEFAULT_INTERFACE, ANY_DEST, delay);
+
+                odmrp->stats.numDataTxed++;
+                odmrp->stats.numQueryTxed++;
+
+#ifdef DEBUG
+                printf("    Relaying it\n");
+#endif
+
+            } /* If hop is less than TTL */
+          
+            newMsg = GLOMO_MsgCopy(node, msg);
+            NetworkIpRemoveIpHeader(node, newMsg, &sourceAddress, 
+                        &destinationAddress, &priority, &IpProtocol, &ttl);
+
+            SendToUdp(
+                node, newMsg, priority, sourceAddress, destinationAddress);
+
+            /*
+             * Insert the source member to the table and send 
+             * a Join Reply.
+             */
+            mcastEntry = RoutingOdmrpGetMTEntry(mcastAddr, &odmrp->memberTable);
+            if (mcastEntry == NULL)
+            {
+                RoutingOdmrpInsertMemberTable(
+                                     mcastAddr, srcAddr, &odmrp->memberTable);
+            }
+            else
+            {
+                RoutingOdmrpInsertMemberSource(srcAddr, mcastEntry);
+            }
+            RoutingOdmrpCheckSourceExpired(mcastAddr, &odmrp->memberTable);
+
+            mEntry = RoutingOdmrpGetRPTEntry(mcastAddr, &odmrp->responseTable);
+            if (mEntry == NULL)
+            {
+                RoutingOdmrpInsertResponseTable(
+                                  mcastAddr, srcAddr, &odmrp->responseTable);
+            }
+            else
+            {
+                RoutingOdmrpInsertResponseSource(srcAddr, mEntry);
+            }
+
+            jrDelay = pc_erand(node->seed) * ODMRP_JR_JITTER;
+
+            RoutingOdmrpSetTimer(
+                            node, MSG_NETWORK_SendReply, mcastAddr, jrDelay);
+        } /* If multicast member */
+
+        /* Relay the Query if hop does not exceed TTL. */
+        else if (option.hopCount < ODMRP_MAX_HOP)
+        {
+            option.lastAddr = node->nodeAddr;
+            option.hopCount++;
+            SetOdmrpIpOptionField(msg, &option);
+
+            delay = pc_erand(node->seed) * ODMRP_BROADCAST_JITTER; 
+
+            NetworkIpSendPacketToMacLayerWithDelay(
+                                node, msg, DEFAULT_INTERFACE, ANY_DEST, delay);
+
+            odmrp->stats.numDataTxed++;
+            odmrp->stats.numQueryTxed++;
+
+#ifdef DEBUG
+                printf("    Relaying it\n");
+#endif
+
+        } /* If hop is less than TTL */
+
+        else
+        {
+            GLOMO_MsgFree(node, msg);
+        }
+    } /* If not duplicate */
+
+    else
+    {
+        GLOMO_MsgFree(node, msg);
+    }
+} /* RoutingOdmrpHandleJoinQuery */
+
+/*
+ * FUNCTION     RoutingOdmrpHandleReply
+ * PURPOSE      Processing procedure when Join Table is received.
+ *
+ * Paremeters:
+ *     node: Node handling the packet.
+ *     msg:  The join reply packet.
+ */
+
+void RoutingOdmrpHandleReply(
+        GlomoNode *node, Message *msg, NODE_ADDR lastAddr, NODE_ADDR mcastAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    Message *newMsg;
+    ODMRP_Ack *ackPkt;
+    ODMRP_JoinReply *replyPkt = (ODMRP_JoinReply *)GLOMO_MsgReturnPacket(msg);
+    ODMRP_TT_Node *mcastEntry;
+    ODMRP_RPT_Node *mEntry;
+    clocktype delay;
+    int i;
+    char *pktPtr;
+    int pktSize = sizeof(ODMRP_Ack);
+    BOOL changed = FALSE;
+
+    for (i = 0; i < replyPkt->count; i++)
+    {
+        /* if an explicit ack is required. */
+        if (replyPkt->ackReq[i] && replyPkt->nextAddr[i] == node->nodeAddr)
+        {
+            newMsg = GLOMO_MsgAlloc(
+                             node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+            GLOMO_MsgPacketAlloc(node, newMsg, pktSize);
+
+            pktPtr = (char *) GLOMO_MsgReturnPacket(newMsg);
+            ackPkt = (ODMRP_Ack *) pktPtr;
+
+            ackPkt->pktType = ODMRP_ACK;
+            ackPkt->mcastAddr = mcastAddr;
+            ackPkt->srcAddr = replyPkt->srcAddr[i];
+
+            NetworkIpSendRawGlomoMessageToMacLayer(
+                        node, newMsg, lastAddr, CONTROL, IPPROTO_ODMRP, 1,
+                        DEFAULT_INTERFACE, lastAddr);
+
+            odmrp->stats.numAckSent++;
+#ifdef DEBUG
+        printf("Node %ld received a Join Reply from node %ld\n", node->nodeAddr, lastAddr);
+#endif
+
+#ifdef DEBUG
+    printf("    sending Exp Ack to node %ld\n", lastAddr);
+    printf("    mcast = %u, src = %d\n", ackPkt->mcastAddr, ackPkt->srcAddr);
+#endif
+        }
+
+        /* Update the ack table entries if the table comes from a FG. */
+        if (replyPkt->IAmFG) 
+        {
+            RoutingOdmrpDeleteAckTable(mcastAddr, 
+                        replyPkt->srcAddr[i], lastAddr, &odmrp->ackTable);
+        }
+
+        /* If the node is a forwarding group. */
+        if (replyPkt->nextAddr[i] == node->nodeAddr && 
+            replyPkt->srcAddr[i] != node->nodeAddr) 
+        {
+#ifdef DEBUG
+        printf("Node %ld received a Join Reply from node %ld\n", node->nodeAddr, lastAddr);
+#endif
+
+#ifdef DEBUG
+    printf("    I'm a FG!\n");
+#endif 
+
+            if (RoutingOdmrpLookupFgFlag(mcastAddr, &odmrp->fgFlag))
+            {
+                RoutingOdmrpUpdateFgFlag(mcastAddr, &odmrp->fgFlag);
+            }
+            else
+            {
+                RoutingOdmrpSetFgFlag(mcastAddr, &odmrp->fgFlag);
+            }
+
+            mcastEntry = RoutingOdmrpGetTTEntry(
+                                       mcastAddr, &odmrp->tempTable);
+            if (mcastEntry == NULL)
+            {
+#ifdef DEBUG
+//    printf("  Insert temp table\n");
+#endif 
+                RoutingOdmrpInsertTempTable(
+                          mcastAddr, replyPkt->srcAddr[i], &odmrp->tempTable);
+            }
+            else
+            {
+#ifdef DEBUG
+//    printf("  Insert temp source\n");
+#endif 
+                RoutingOdmrpInsertTempSource(replyPkt->srcAddr[i], mcastEntry);
+            }
+
+/*
+            if (RoutingOdmrpCheckTempChanged(
+                                      mcastAddr, &odmrp->tempTable))
+            {
+#ifdef DEBUG
+    printf("      Temp changed!\n");
+#endif 
+*/
+                mEntry = RoutingOdmrpGetRPTEntry(
+                                   mcastAddr, &odmrp->responseTable);
+                if (mEntry == NULL)
+                {
+                    RoutingOdmrpInsertResponseTable(mcastAddr,
+                                replyPkt->srcAddr[i], &odmrp->responseTable);
+                }
+                else
+                {
+                    RoutingOdmrpInsertResponseSource(
+                                              replyPkt->srcAddr[i], mEntry);
+                }
+
+                changed = TRUE;
+/*
+            }
+*/
+
+            RoutingOdmrpCheckTempExpired(
+                                  mcastAddr, &odmrp->tempTable);
+        }
+    } /* for */
+
+    /* If table content has changed and i'm not collecting anymore. */
+    if (changed && !RoutingOdmrpCheckTempSent(
+                                    mcastAddr, &odmrp->tempTable))
+    {
+#ifdef DEBUG
+    printf("  Changed and temp sent!\n");
+#endif 
+        /* Start collecting. */
+        RoutingOdmrpSetTempSent(mcastAddr, &odmrp->tempTable);
+                   /* Unset */
+
+        delay = pc_erand(node->seed) * ODMRP_JR_JITTER + ODMRP_JR_PAUSE_TIME;
+
+        RoutingOdmrpSetTimer(
+                   node, MSG_NETWORK_SendReply, mcastAddr, delay);
+    }
+
+    if (RoutingOdmrpLookupFgFlag(mcastAddr, &odmrp->fgFlag))
+    {
+        RoutingOdmrpSetTimer(
+             node, MSG_NETWORK_CheckFg, mcastAddr, ODMRP_FG_TIMEOUT);
+    }
+
+    GLOMO_MsgFree(node, msg);
+
+} /* RoutingOdmrpHandleReply */
+
+/*
+ * FUNCTION     RoutingOdmrpHandleAck
+ * PURPOSE      Processing explicit ack when received.
+ *
+ * Paremeters:
+ *     node:  Node handling the ACK packet.
+ *     msg:   The ack packet.
+ *
+ */
+void RoutingOdmrpHandleAck(
+        GlomoNode *node, Message *msg, NODE_ADDR lastAddr, NODE_ADDR targetAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    ODMRP_Ack *ackPkt = (ODMRP_Ack *)GLOMO_MsgReturnPacket(msg);
+
+    /* Process only if I'm the target. */
+    if (targetAddr == node->nodeAddr)
+    {
+#ifdef DEBUG
+        printf("Node %ld got Ack from node %ld\n", node->nodeAddr, lastAddr);
+#endif
+       /* Update the ack table entries. */
+       RoutingOdmrpDeleteAckTable(
+               ackPkt->mcastAddr, ackPkt->srcAddr, lastAddr, &odmrp->ackTable);
+    } 
+
+    GLOMO_MsgFree(node, msg);
+} /* RoutingOdmrpHandleAck */
+
+/*
+ * FUNCTION     RoutingOdmrpInitMembership
+ * PURPOSE      Initialize the Membership flag.
+ *
+ * Parameters:
+ *     memberFlag: Member flag.
+ */
+
+void RoutingOdmrpInitMembership(ODMRP_Membership *memberFlag)
+{
+    memberFlag->head = NULL;
+    memberFlag->size = 0;
+} /* RoutingOdmrpInitMembership */
+
+/*
+ * FUNCTION     RoutingOdmrpInitFgFlag
+ * PURPOSE      Initialize the Fg flag.
+ *
+ * Parameters:
+ *     fgFlag: Fg flag.
+ */
+
+void RoutingOdmrpInitFgFlag(ODMRP_FgFlag *fgFlag)
+{
+    fgFlag->head = NULL;
+    fgFlag->size = 0;
+} /* RoutingOdmrpInitFgFlag */
+
+/*
+ * FUNCTION     RoutingOdmrpInitMemberTable
+ * PURPOSE      Initialize the Member Table. Only group members maintain
+ *              the member table .
+ *
+ * Parameters:
+ *     node:           Node that is initializing the member table.
+ *     memberTable: Member table.
+ */
+
+void RoutingOdmrpInitMemberTable(ODMRP_MT *memberTable)
+{
+    memberTable->head = NULL;
+    memberTable->size = 0;
+} /* RoutingOdmrpInitMemberTable */
+
+/* 
+ * FUNCTION     RoutingOdmrpInitResponseTable
+ * PURPOSE      Initialize the response table.
+ *
+ * Parameters:
+ *     responseTable: Response table.
+ */
+
+void RoutingOdmrpInitResponseTable(ODMRP_RPT *responseTable)
+{
+    responseTable->head = NULL;
+    responseTable->size = 0;
+} /* RoutingOdmrpInitResponseTable */
+
+/* 
+ * FUNCTION     RoutingOdmrpInitTempTable
+ * PURPOSE      Initialize the temp table.
+ *
+ * Parameters:
+ *     tempTable: Temp table.
+ */
+void RoutingOdmrpInitTempTable(ODMRP_TT *tempTable)
+{
+    tempTable->head = NULL;
+    tempTable->size = 0;
+} /* RoutingOdmrpInitTempTable */
+
+/*
+ * FUNCTION     RoutingOdmrpInitRouteTable
+ * PURPOSE      Initialize the route table.
+ *
+ * Parameters:
+ *     routeTable: Route table.
+ */
+void RoutingOdmrpInitRouteTable(ODMRP_RT *routeTable)
+{
+    routeTable->head = NULL;
+    routeTable->size = 0;
+} /* RoutingOdmrpInitRouteTable */
+
+/*
+ * FUNCTION     RoutingOdmrpInitMessageCache
+ * PURPOSE      Initialize the message cache.
+ *
+ * Parameters:
+ *     messageCache:  Message cache.
+ */
+void RoutingOdmrpInitMessageCache(ODMRP_MC *messageCache)
+{
+    messageCache->front = NULL;
+    messageCache->rear = NULL;
+    messageCache->size = 0;
+} /* RoutingOdmrpInitMessageCache */
+
+/*
+ * FUNCTION     RoutingOdmrpInitSeqTable
+ * PURPOSE      Initialize the sequence table.
+ *
+ * Parameters:
+ *     node:         Node that is initializing the sequence table.
+ */
+void RoutingOdmrpInitSeqTable(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+
+    odmrp->seqTable = 0;
+} /* RoutingOdmrpInitSeqTable */
+
+/*
+ * FUNCTION     RoutingOdmrpInitSent
+ * PURPOSE      Initialize the source sent table.
+ *
+ * Parameters:
+ *     sentTable: Source sent table.
+ */
+void RoutingOdmrpInitSent(ODMRP_SS *sentTable)
+{
+    sentTable->head = NULL;
+    sentTable->size = 0;
+} /* RoutingOdmrpInitSent */
+
+/* 
+ * FUNCTION     RoutingOdmrpInitStats
+ * PURPOSE      Initialize all the stats variables.
+ *
+ * Parameters:
+ *     node: Node that is initializing the stats variables.
+ */
+void RoutingOdmrpInitStats(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+
+    /* Total number of data join packets sent. */
+    odmrp->stats.numQueryTxed = 0;
+
+    /* Total number of join table packets sent. */
+    odmrp->stats.numReplySent = 0;
+
+    /* Total number of explicit acks sent. */
+    odmrp->stats.numAckSent = 0;
+
+    /* Total number of data packets sent by the source. */
+    odmrp->stats.numDataSent = 0;
+
+    /* Total number of data packets received by the destination. */
+    odmrp->stats.numDataReceived = 0;
+
+    /* Total number of data packets should be received by the destination. */
+    odmrp->stats.numDataToReceive = 0;
+
+    odmrp->stats.numDataTxed = 0;
+
+} /* RoutingOdmrpInitStats */
+
+/*
+ * FUNCTION     RoutingOdmrpDeleteMsgCache
+ * PURPOSE      Remove an entry from the message cache
+ *
+ * Parameters:
+ *     messageCache:  Message cache table.
+ */
+
+void RoutingOdmrpDeleteMsgCache(ODMRP_MC *messageCache)
+{
+    ODMRP_MC_Node *toFree;
+
+    toFree = messageCache->front;
+    messageCache->front = toFree->next;
+    pc_free(toFree);
+    --(messageCache->size);
+
+    if (messageCache->size == 0)
+    {
+        messageCache->rear = NULL;
+    }
+} /* RoutingOdmrpDeleteMsgCache */
+
+/*
+ * FUNCTION     RoutingOdmrpLookupMessageCache
+ * PURPOSE      Check if the join query/data packet is seen before.
+ *
+ * Parameters:
+ *     sourceAddr:      Originating node of the packet.
+ *     seqNumber:       Sequece number of the packet.
+ *     messageCache: Message cache table.
+ *
+ * Return: TRUE if seen before; FALSE otherwise.
+ */
+
+BOOL RoutingOdmrpLookupMessageCache(
+            NODE_ADDR srcAddr, int seqNumber, ODMRP_MC *messageCache)
+{
+    ODMRP_MC_Node *current;
+
+    if (messageCache->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = messageCache->front;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->srcAddr == srcAddr && current->seqNumber == seqNumber)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+} /* OdmrpLookupMessageCache */
+
+/*
+ * FUNCTION     RoutingOdmrpLookupMembership
+ * PURPOSE      Check if the node is a member of the multicast group.
+ *
+ * Parameters:
+ *     mcastAddr:     Multicast group to check.
+ *     memberFlag: Membership flag.
+ *
+ * Return: TRUE if member; FALSE otherwise.
+ */
+
+BOOL RoutingOdmrpLookupMembership(NODE_ADDR mcastAddr,
+                                  ODMRP_Membership *memberFlag)
+{
+    ODMRP_M_Node *current;
+
+    if (memberFlag->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = memberFlag->head;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+} /* RoutingOdmrpLookupMembership */
+
+/* 
+ * FUNCTION     RoutingOdmrpLookupFgFlag
+ * PURPOSE      Check if the node is a forwarding group.
+ *
+ * Parameters:
+ *     mcastAddr: Multicast group to check.
+ *     fgFlag: Forwarding group flag.
+ *
+ * Return: TRUE if member; FALSE otherwise.
+ */
+
+BOOL RoutingOdmrpLookupFgFlag(NODE_ADDR mcastAddr, ODMRP_FgFlag *fgFlag)
+{
+    ODMRP_FF_Node *current;
+
+    if (fgFlag->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = fgFlag->head;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+
+} /* RoutingOdmrpLookupFgFlag */
+
+/*
+ * FUNCTION     RoutingOdmrpLookupMemberTable
+ * PURPOSE      Check if there exists valid sources for the multicast group.
+ *
+ * Parameters:
+ *     mcastAddr:      Multicast group to check.
+ *     memberTable: Member table.
+ *
+ * Return: TRUE if exists; FALSE otherwise.
+ */
+BOOL RoutingOdmrpLookupMemberTable(NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Node *current;
+
+    if (memberTable->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = memberTable->head;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr && current->size > 0)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+
+} /* RoutingOdmrpLookupMemberTable */
+
+/*
+ * FUNCTION     RoutingOdmrpLookupSentTable
+ * PURPOSE      Check if sent initial data for multicast group.
+ *
+ * Parameters:
+ *     mcastAddr:    Multicast group.
+ *     sentTable: Source sent table.
+ *
+ * Return: TRUE if sent; FALSE otherwise.
+ */
+BOOL RoutingOdmrpLookupSentTable(NODE_ADDR mcastAddr, ODMRP_SS *sentTable)
+{
+    ODMRP_SS_Node *current;
+
+    if (sentTable->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = sentTable->head;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+} /* RoutingOdmrpLookupSentTable */
+
+/*
+ * FUNCTION     RoutingOdmrpCheckFgExpired
+ * PURPOSE      Check if FG Flag has been updated within timeout.
+ *
+ * Parameters:
+ *     mcastAddr:  Multicast group.
+ *     fgFlag:  Fg flag.
+ *
+ * Return: TRUE if expired; FALSE otherwise.
+ */
+BOOL RoutingOdmrpCheckFgExpired(NODE_ADDR mcastAddr, 
+                                ODMRP_FgFlag *fgFlag)
+{
+    ODMRP_FF_Node *current;
+
+    if (fgFlag->size == 0 || fgFlag->head == NULL)
+    {
+        return (FALSE);
+    }
+
+    for (current = fgFlag->head;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr &&
+            simclock() - current->timestamp >= ODMRP_FG_TIMEOUT)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+} /* RoutingOdmrpCheckFgExpired */
+
+/*
+ * FUNCTION     RoutingOdmrpSetMemberFlag
+ * PURPOSE      Set membership flag for a particular multicast group.
+ *
+ * Parameters:
+ *     mcastAddr:     Multicast group.
+ *     memberFlag: Membership flag.
+ */
+void RoutingOdmrpSetMemberFlag(NODE_ADDR mcastAddr,
+                               ODMRP_Membership *memberFlag)
+{
+    ++(memberFlag->size);
+    memberFlag->head = RoutingOdmrpSetMemFlagInOrder(
+                                            mcastAddr, memberFlag->head);
+} /* RoutingOdmrpSetMemberFlag */
+
+/*
+ */
+ODMRP_M_Node *RoutingOdmrpSetMemFlagInOrder(
+                             NODE_ADDR mcastAddr, ODMRP_M_Node *old)
+{
+    ODMRP_M_Node *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_M_Node *)pc_malloc(sizeof(ODMRP_M_Node));
+        assert(newOne != NULL);
+ 
+        newOne->mcastAddr = mcastAddr;
+        newOne->timestamp = simclock();
+        newOne->next = NULL;
+    }
+    else if (old->mcastAddr > mcastAddr)
+    {
+        newOne = (ODMRP_M_Node *)pc_malloc(sizeof(ODMRP_M_Node));
+        assert(newOne != NULL);
+ 
+        newOne->mcastAddr = mcastAddr;
+        newOne->timestamp = simclock();
+        newOne->next = old;
+    }
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpSetMemFlagInOrder(mcastAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/*
+ * FUNCTION     RoutingOdmrpResetMemberFlag
+ * PURPOSE      Reset membership flag for a particular multicast group.
+ *
+ * Parameters:
+ *     mcastAddr:     Multicast group.
+ *     memberFlag: Membership flag.
+ */
+void RoutingOdmrpResetMemberFlag(NODE_ADDR mcastAddr,
+                                 ODMRP_Membership *memberFlag)
+{
+    ODMRP_M_Node *toFree;
+    ODMRP_M_Node *current;
+
+    if (memberFlag->size == 0)
+    {
+        return;
+    }
+    else if (memberFlag->head->mcastAddr == mcastAddr)
+    {
+        toFree = memberFlag->head;
+        memberFlag->head = toFree->next;
+        pc_free(toFree);
+        --(memberFlag->size);
+    }
+    else
+    {
+        for (current = memberFlag->head;
+             current->next != NULL && current->next->mcastAddr < mcastAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->mcastAddr == mcastAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(memberFlag->size);
+        }
+    }
+
+} /* RoutingOdmrpResetMemberFlag */
+
+/*
+ */
+void RoutingOdmrpUpdateFgFlag(NODE_ADDR mcastAddr, ODMRP_FgFlag *fgFlag)
+{
+    ODMRP_FF_Node *current;
+
+    for (current = fgFlag->head; current != NULL; current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            current->timestamp = simclock();
+            break;
+        }
+    }
+}
+
+/*
+ * FUNCTION     RoutingOdmrpSetFgFlag
+ * PURPOSE      Set fg flag for a particular multicast group.
+ *
+ * Parameters:
+ *     mcastAddr: Multicast group.
+ *     fgFlag: Fg flag.
+ */
+void RoutingOdmrpSetFgFlag(NODE_ADDR mcastAddr, ODMRP_FgFlag *fgFlag)
+{
+    ++(fgFlag->size);
+    fgFlag->head = RoutingOdmrpSetFgFlagInOrder(mcastAddr, fgFlag->head);
+} /* RoutingOdmrpSetFgFlag */
+
+/*
+ */
+ODMRP_FF_Node *RoutingOdmrpSetFgFlagInOrder(
+                             NODE_ADDR mcastAddr, ODMRP_FF_Node *old)
+{
+    ODMRP_FF_Node *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_FF_Node *)pc_malloc(sizeof(ODMRP_FF_Node));
+        assert(newOne != NULL);
+ 
+        newOne->mcastAddr = mcastAddr;
+        newOne->timestamp = simclock();
+        newOne->next = NULL;
+    }
+    else if (old->mcastAddr > mcastAddr)
+    {
+        newOne = (ODMRP_FF_Node *)pc_malloc(sizeof(ODMRP_FF_Node));
+        assert(newOne != NULL);
+ 
+        newOne->mcastAddr = mcastAddr;
+        newOne->timestamp = simclock();
+        newOne->next = old;
+    }
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpSetFgFlagInOrder(mcastAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/*
+ * FUNCTION     RoutingOdmrpResetFgFlag
+ * PURPOSE      Reset fg flag for a particular multicast group.
+ *
+ * Parameters:
+ *     mcastAddr: Multicast group.
+ *     fgFlag: Fg flag.
+ */
+void RoutingOdmrpResetFgFlag(NODE_ADDR mcastAddr, ODMRP_FgFlag *fgFlag)
+{
+    ODMRP_FF_Node *toFree;
+    ODMRP_FF_Node *current;
+
+    if (fgFlag->size == 0)
+    {
+        return;
+    }
+    else if (fgFlag->head->mcastAddr == mcastAddr)
+    {
+        toFree = fgFlag->head;
+        fgFlag->head = toFree->next;
+        pc_free(toFree);
+        --(fgFlag->size);
+    }
+    else
+    {
+        for (current = fgFlag->head;
+             current->next != NULL && current->next->mcastAddr < mcastAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->mcastAddr == mcastAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(fgFlag->size);
+        }
+    }
+
+} 
+
+/*
+ * FUNCTION     RoutingOdmrpSetSent
+ * PURPOSE      Set sent flag for a particular multicast group.
+ *
+ * Parameters:
+ *     mcastAddr:    Multicast group.
+ *     sentTable: Source sent table.
+ */
+void RoutingOdmrpSetSent(NODE_ADDR mcastAddr, ODMRP_SS *sentTable)
+{
+    ++(sentTable->size);
+    sentTable->head = RoutingOdmrpSetSentInOrder(mcastAddr, sentTable->head);
+}
+
+/*
+ */
+ODMRP_SS_Node *RoutingOdmrpSetSentInOrder(
+                             NODE_ADDR mcastAddr, ODMRP_SS_Node *old)
+{
+    ODMRP_SS_Node *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_SS_Node *)pc_malloc(sizeof(ODMRP_SS_Node));
+        assert(newOne != NULL);
+ 
+        newOne->mcastAddr = mcastAddr;
+        newOne->minExpireTime = simclock() + ODMRP_JR_REFRESH;
+        newOne->lastSent = simclock();
+        newOne->nextQuerySend = FALSE;
+        newOne->next = NULL;
+    }
+    else if (old->mcastAddr > mcastAddr)
+    {
+        newOne = (ODMRP_SS_Node *)pc_malloc(sizeof(ODMRP_SS_Node));
+        assert(newOne != NULL);
+ 
+        newOne->mcastAddr = mcastAddr;
+        newOne->minExpireTime = simclock() + ODMRP_JR_REFRESH;
+        newOne->lastSent = simclock();
+        newOne->nextQuerySend = FALSE;
+        newOne->next = old;
+    }
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpSetSentInOrder(mcastAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/*
+ */
+void RoutingOdmrpDeleteSourceSent(NODE_ADDR mcastAddr, ODMRP_SS *sentTable)
+{
+    ODMRP_SS_Node *toFree;
+    ODMRP_SS_Node *current;
+
+    if (sentTable->size == 0 || sentTable->head == NULL)
+    {
+        return;
+    }
+    else if (sentTable->head->mcastAddr == mcastAddr)
+    {
+        toFree = sentTable->head;
+        sentTable->head = toFree->next;
+        pc_free(toFree);
+        --(sentTable->size);
+    }
+    else
+    {
+        for (current = sentTable->head;
+             current->next != NULL && current->next->mcastAddr < mcastAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->mcastAddr == mcastAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(sentTable->size);
+        }
+    }
+}
+
+/*
+ */
+ODMRP_MT_Node *RoutingOdmrpGetMTEntry(
+                  NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Node *current;
+
+    if (memberTable->size == 0 || memberTable->head == NULL)
+    {
+        return (NULL);
+    }
+
+    for (current = memberTable->head; current != NULL; current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current);
+        }
+    }
+
+    return (NULL);
+}
+
+/*
+ * FUNCTION     RoutingOdmrpInsertMemberTable
+ * PURPOSE      Insert new multicast source entry.
+ *
+ * Parameters:
+ *     mcastAddr:      Multicast group.
+ *     sourceAddr:     Originating node of the packet.
+ *     memberTable: Request seen table.
+ */
+void RoutingOdmrpInsertMemberTable(NODE_ADDR mcastAddr,
+                                   NODE_ADDR srcAddr,
+                                   ODMRP_MT *memberTable)
+{
+    ++(memberTable->size);
+    memberTable->head = RoutingOdmrpInsertMTInOrder(
+                                       mcastAddr, srcAddr, memberTable->head);
+}
+
+/*
+ */
+ODMRP_MT_Node *RoutingOdmrpInsertMTInOrder(
+                   NODE_ADDR mcastAddr, NODE_ADDR srcAddr, ODMRP_MT_Node *old)
+{
+    ODMRP_MT_Node *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_MT_Node *)pc_malloc(sizeof(ODMRP_MT_Node));
+        assert(newOne != NULL);
+
+        newOne->mcastAddr = mcastAddr;
+        newOne->sent = FALSE;
+        newOne->lastSent = 0;
+        newOne->queryLastReceived = simclock();
+        newOne->head = NULL;
+        newOne->size = 0;
+        newOne->next = NULL;
+
+        newOne->head = RoutingOdmrpInsertMemberSource(srcAddr, newOne);
+    }
+
+    else if (old->mcastAddr > mcastAddr)
+    {
+        newOne = (ODMRP_MT_Node *)pc_malloc(sizeof(ODMRP_MT_Node));
+        assert(newOne != NULL);
+
+        newOne->mcastAddr = mcastAddr;
+        newOne->sent = FALSE;
+        newOne->lastSent = 0;
+        newOne->queryLastReceived = simclock();
+        newOne->head = NULL;
+        newOne->size = 0;
+        newOne->next = old;
+
+        newOne->head = RoutingOdmrpInsertMemberSource(srcAddr, newOne);
+    }
+
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertMTInOrder(
+                                             mcastAddr, srcAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckMSExist(NODE_ADDR srcAddr, ODMRP_MT_Node *mcast)
+{
+    ODMRP_MT_Snode *current;
+
+    if (mcast->size == 0 || mcast->head == NULL)
+    {
+        return (FALSE);
+    }
+
+    for (current = mcast->head; 
+         current != NULL && current->srcAddr <= srcAddr;
+         current = current->next)
+    {
+        if (current->srcAddr == srcAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ */
+ODMRP_MT_Snode *RoutingOdmrpInsertMemberSource(
+                                     NODE_ADDR srcAddr, ODMRP_MT_Node *mcast)
+{
+    ODMRP_MT_Snode *current;
+
+    if (!RoutingOdmrpCheckMSExist(srcAddr, mcast))
+    {
+        ++(mcast->size);
+        mcast->queryLastReceived = simclock();
+        mcast->head = RoutingOdmrpInsertMSInOrder(srcAddr, mcast->head, NULL);
+
+        return (mcast->head);
+    }
+
+    else
+    {
+        mcast->queryLastReceived = simclock();
+        for (current = mcast->head; 
+             current != NULL; 
+             current = current->next)
+        {
+            if (current->srcAddr == srcAddr)
+            {
+                current->timestamp = simclock();
+                break;
+            }
+        }
+        return (NULL);
+    }
+}
+
+/*
+ */
+ODMRP_MT_Snode *RoutingOdmrpInsertMSInOrder(
+                  NODE_ADDR srcAddr, ODMRP_MT_Snode *old, ODMRP_MT_Snode *last)
+{
+    ODMRP_MT_Snode *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_MT_Snode *)pc_malloc(sizeof(ODMRP_MT_Snode));
+        assert(newOne != NULL);
+
+        newOne->srcAddr = srcAddr;
+        newOne->timestamp = simclock();
+        newOne->prev = last;
+        newOne->next = NULL;
+    }
+
+    else if (old->srcAddr > srcAddr)
+    {
+        newOne = (ODMRP_MT_Snode *)pc_malloc(sizeof(ODMRP_MT_Snode));
+        assert(newOne != NULL);
+
+        newOne->srcAddr = srcAddr;
+        newOne->timestamp = simclock();
+        newOne->prev = old->prev;
+        if (old->prev != NULL)
+        {
+            old->prev->next = newOne;
+        }
+        old->prev = newOne;
+        newOne->next = old;
+    }
+
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertMSInOrder(srcAddr, old->next, old);
+    }
+
+    return (newOne);
+}
+
+/*
+ * FUNCTION     RoutingOdmrpCheckSourceExpired
+ * PURPOSE      Check if source has sent msg within timeout.
+ *
+ * Parameters:
+ *     mcastAddr:      Multicast group.
+ *     memberTable: Member table.
+ */
+void RoutingOdmrpCheckSourceExpired(NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Snode *toFree;
+    ODMRP_MT_Snode *curSrc;
+
+    ODMRP_MT_Node *current;
+
+    BOOL zero = FALSE;
+
+    for (current = memberTable->head;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            if (current->size == 0 || current->head == NULL)
+            {
+                return;
+            }
+
+            for (curSrc = current->head;
+                 curSrc != NULL;
+                 curSrc = curSrc->next)
+            {
+                if (simclock() - curSrc->timestamp >= ODMRP_MEM_TIMEOUT)
+                {
+                    toFree = curSrc;
+
+                    if (curSrc->prev == NULL && curSrc->next == NULL)
+                    {
+                        current->head = curSrc->next;
+                    }
+                    else if (curSrc->prev == NULL)
+                    {
+                        curSrc->next->prev = curSrc->prev;
+                        current->head = curSrc->next;
+                    }
+                    else if (curSrc->next == NULL)
+                    {
+                        curSrc->prev->next = curSrc->next;
+                    }
+                    else
+                    {
+                        curSrc->prev->next = curSrc->next;
+                        curSrc->next->prev = curSrc->prev;
+                    }
+
+                    pc_free(toFree);
+                    --(current->size);
+
+                    if (current->size == 0)
+                    {
+                        zero = TRUE;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if (zero == TRUE)
+    {
+        RoutingOdmrpDeleteMemberTable(mcastAddr, memberTable);
+    }
+
+} /* RoutingOdmrpCheckSourceExpired */
+
+/*
+ */
+ODMRP_TT_Node *RoutingOdmrpGetTTEntry(NODE_ADDR mcastAddr, ODMRP_TT *tempTable)
+{
+    ODMRP_TT_Node *current;
+
+    if (tempTable->size == 0 || tempTable->head == NULL)
+    {
+        return (NULL);
+    }
+
+    for (current = tempTable->head; current != NULL; current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current);
+        }
+    }
+
+    return (NULL);
+}
+
+/*
+ * FUNCTION     RoutingOdmrpInsertTempTable
+ * PURPOSE      Insert new entry into temp table.
+ *
+ * Parameters:
+ *     mcastAddr:    Multicast group.
+ *     sourceAddr:   Sources for the multicast.
+ *     tempTable: Temp table.
+ *
+ */
+void RoutingOdmrpInsertTempTable(NODE_ADDR mcastAddr,
+                                 NODE_ADDR srcAddr,
+                                 ODMRP_TT *tempTable)
+{
+    ++(tempTable->size);
+    tempTable->head = RoutingOdmrpInsertTTInOrder(
+                                       mcastAddr, srcAddr, tempTable->head);
+} /* RoutingOdmrpInsertTempTable */
+
+/*
+ */
+ODMRP_TT_Node *RoutingOdmrpInsertTTInOrder(
+                   NODE_ADDR mcastAddr, NODE_ADDR srcAddr, ODMRP_TT_Node *old)
+{
+    ODMRP_TT_Node *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_TT_Node *)pc_malloc(sizeof(ODMRP_TT_Node));
+        assert(newOne != NULL);
+
+        newOne->mcastAddr = mcastAddr;
+        newOne->sent = /*TRUE*/ FALSE;
+        newOne->head = NULL;
+        newOne->size = 0;
+        newOne->next = NULL;
+
+        newOne->head = RoutingOdmrpInsertTempSource(srcAddr, newOne);
+    }
+
+    else if (old->mcastAddr > mcastAddr)
+    {
+        newOne = (ODMRP_TT_Node *)pc_malloc(sizeof(ODMRP_TT_Node));
+        assert(newOne != NULL);
+
+        newOne->mcastAddr = mcastAddr;
+        newOne->sent = /*TRUE*/ FALSE;
+        newOne->head = NULL;
+        newOne->size = 0;
+        newOne->next = old;
+
+        newOne->head = RoutingOdmrpInsertTempSource(srcAddr, newOne);
+    }
+
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertTTInOrder(
+                                               mcastAddr, srcAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckTSExist(NODE_ADDR srcAddr, ODMRP_TT_Node *mcast)
+{
+    ODMRP_TT_Snode *current;
+
+    if (mcast->size == 0 || mcast->head == NULL)
+    {
+        return (FALSE);
+    }
+
+    for (current = mcast->head; 
+         current != NULL && current->srcAddr <= srcAddr;
+         current = current->next)
+    {
+        if (current->srcAddr == srcAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ */
+ODMRP_TT_Snode *RoutingOdmrpInsertTempSource(
+                                     NODE_ADDR srcAddr, ODMRP_TT_Node *mcast)
+{
+    ODMRP_TT_Snode *current;
+
+    if (!RoutingOdmrpCheckTSExist(srcAddr, mcast))
+    {
+        ++(mcast->size);
+        mcast->sent = FALSE;
+        mcast->head = RoutingOdmrpInsertTSInOrder(srcAddr, mcast->head, NULL);
+        return (mcast->head);
+    }
+
+    else
+    {
+        for (current = mcast->head; 
+             current != NULL; 
+             current = current->next)
+        {
+            if (current->srcAddr == srcAddr)
+            {
+                current->timestamp = simclock();
+                current->FGExpireTime = simclock() + ODMRP_FG_TIMEOUT;
+                break;
+            }
+        }
+        return (NULL);
+    }
+}
+
+/*
+ */
+ODMRP_TT_Snode *RoutingOdmrpInsertTSInOrder(
+                  NODE_ADDR srcAddr, ODMRP_TT_Snode *old, ODMRP_TT_Snode *last)
+{
+    ODMRP_TT_Snode *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_TT_Snode *)pc_malloc(sizeof(ODMRP_TT_Snode));
+        assert(newOne != NULL);
+
+        newOne->srcAddr = srcAddr;
+        newOne->timestamp = simclock();
+        newOne->FGExpireTime = simclock() + ODMRP_FG_TIMEOUT;
+        newOne->prev = last;
+        newOne->next = NULL;
+    }
+
+    else if (old->srcAddr > srcAddr)
+    {
+        newOne = (ODMRP_TT_Snode *)pc_malloc(sizeof(ODMRP_TT_Snode));
+        assert(newOne != NULL);
+
+        newOne->srcAddr = srcAddr;
+        newOne->timestamp = simclock();
+        newOne->FGExpireTime = simclock() + ODMRP_FG_TIMEOUT;
+        newOne->prev = old->prev;
+        if (old->prev != NULL)
+        {
+            old->prev->next = newOne;
+        }
+        old->prev = newOne;
+        newOne->next = old;
+    }
+
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertTSInOrder(srcAddr, old->next, old);
+    }
+
+    return (newOne);
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckTempChanged(NODE_ADDR mcastAddr, ODMRP_TT *tempTable)
+{
+    ODMRP_TT_Node *current;
+    ODMRP_TT_Snode *curSrc;
+    BOOL changed = FALSE;
+
+    for (current = tempTable->head; current != NULL; current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            if (current->size == 0 || current->head == NULL)
+            {
+                changed = TRUE;
+            }
+            else
+            {
+                for (curSrc = current->head; 
+                     curSrc != NULL; 
+                     curSrc = curSrc->next)
+                {
+                    if (simclock() - curSrc->timestamp >= ODMRP_JR_PAUSE_TIME)
+                    {
+                        changed = TRUE;
+                        curSrc->timestamp = simclock();
+                        curSrc->FGExpireTime = simclock() + ODMRP_FG_TIMEOUT;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    return (changed);
+}
+
+/*
+ */
+void RoutingOdmrpCheckTempExpired(NODE_ADDR mcastAddr, ODMRP_TT *tempTable)
+{
+    ODMRP_TT_Snode *toFree;
+    ODMRP_TT_Snode *curSrc;
+
+    ODMRP_TT_Node *current;
+
+    BOOL zero = FALSE;
+
+    for (current = tempTable->head;
+         current != NULL;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            if (current->size == 0 || current->head == NULL)
+            {
+                return;
+            }
+
+            for (curSrc = current->head;
+                 curSrc != NULL;
+                 curSrc = curSrc->next)
+            {
+                if (simclock() - curSrc->timestamp >= ODMRP_JR_LIFETIME)
+                {
+                    toFree = curSrc;
+
+                    if (curSrc->prev == NULL && curSrc->next == NULL)
+                    {
+                        current->head = curSrc->next;
+                    }
+                    else if (curSrc->prev == NULL)
+                    {
+                        curSrc->next->prev = curSrc->prev;
+                        current->head = curSrc->next;
+                    }
+                    else if (curSrc->next == NULL)
+                    {
+                        curSrc->prev->next = curSrc->next;
+                    }
+                    else
+                    {
+                        curSrc->prev->next = curSrc->next;
+                        curSrc->next->prev = curSrc->prev;
+                    }
+
+                    pc_free(toFree);
+                    --(current->size);
+
+                    if (current->size == 0)
+                    {
+                        zero = TRUE;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if (zero == TRUE)
+    {
+        RoutingOdmrpDeleteTempTable(mcastAddr, tempTable);
+    }
+}
+
+/*
+ */
+ODMRP_RPT_Node *RoutingOdmrpGetRPTEntry(
+                                NODE_ADDR mcastAddr, ODMRP_RPT *rspnsTable)
+{
+    ODMRP_RPT_Node *current;
+
+    if (rspnsTable->size == 0 || rspnsTable->head == NULL)
+    {
+        return (NULL);
+    }
+
+    for (current = rspnsTable->head; current != NULL; current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current);
+        }
+    }
+
+    return (NULL);
+}
+
+/* 
+ * FUNCTION     RoutingOdmrpInsertResponseTable
+ * PURPOSE      Insert the source into the response table. 
+ *
+ * Parameters:
+ *     mcastAddr:        Multicast address
+ *     sourceID:         Source to add.
+ *     responseTable: Response table.
+ */
+void RoutingOdmrpInsertResponseTable(
+                NODE_ADDR mcastAddr, NODE_ADDR srcAddr, ODMRP_RPT *rspnsTable)
+{
+    ++(rspnsTable->size);
+    rspnsTable->head = RoutingOdmrpInsertRPTInOrder(
+                                       mcastAddr, srcAddr, rspnsTable->head);
+} /* RoutingOdmrpInsertResponseTable */
+
+/*
+ */
+ODMRP_RPT_Node *RoutingOdmrpInsertRPTInOrder(
+                   NODE_ADDR mcastAddr, NODE_ADDR srcAddr, ODMRP_RPT_Node *old)
+{
+    ODMRP_RPT_Node *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_RPT_Node *)pc_malloc(sizeof(ODMRP_RPT_Node));
+        assert(newOne != NULL);
+
+        newOne->mcastAddr = mcastAddr;
+        newOne->head = NULL;
+        newOne->size = 0;
+        newOne->next = NULL;
+
+        newOne->head = RoutingOdmrpInsertResponseSource(srcAddr, newOne);
+    }
+
+    else if (old->mcastAddr > mcastAddr)
+    {
+        newOne = (ODMRP_RPT_Node *)pc_malloc(sizeof(ODMRP_RPT_Node));
+        assert(newOne != NULL);
+
+        newOne->mcastAddr = mcastAddr;
+        newOne->head = NULL;
+        newOne->size = 0;
+        newOne->next = old;
+
+        newOne->head = RoutingOdmrpInsertResponseSource(srcAddr, newOne);
+    }
+
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertRPTInOrder(
+                                             mcastAddr, srcAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckRPSExist(NODE_ADDR srcAddr, ODMRP_RPT_Node *mcast)
+{
+    ODMRP_RPT_Snode *current;
+
+    if (mcast->size == 0 || mcast->head == NULL)
+    {
+        return (FALSE);
+    }
+
+    for (current = mcast->head; 
+         current != NULL && current->srcAddr <= srcAddr;
+         current = current->next)
+    {
+        if (current->srcAddr == srcAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ */
+ODMRP_RPT_Snode *RoutingOdmrpInsertResponseSource(
+                                      NODE_ADDR srcAddr, ODMRP_RPT_Node *mcast)
+{
+    if (!RoutingOdmrpCheckRPSExist(srcAddr, mcast))
+    {
+        ++(mcast->size);
+        mcast->head = RoutingOdmrpInsertRPSInOrder(srcAddr, mcast->head);
+        return (mcast->head);
+    }
+    else
+    {
+        return (NULL);
+    }
+}
+
+/*
+ */
+ODMRP_RPT_Snode *RoutingOdmrpInsertRPSInOrder(
+                                   NODE_ADDR srcAddr, ODMRP_RPT_Snode *old)
+{
+    ODMRP_RPT_Snode *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_RPT_Snode *)pc_malloc(sizeof(ODMRP_RPT_Snode));
+        assert(newOne != NULL);
+
+        newOne->srcAddr = srcAddr;
+        newOne->next = NULL;
+    }
+    else if (old->srcAddr > srcAddr)
+    {
+        newOne = (ODMRP_RPT_Snode *)pc_malloc(sizeof(ODMRP_RPT_Snode));
+        assert(newOne != NULL);
+
+        newOne->srcAddr = srcAddr;
+        newOne->next = old;
+    }
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertRPSInOrder(srcAddr, old->next);
+    }
+
+    return (newOne);
+}
+
+/* 
+ */
+ODMRP_AT_Node *RoutingOdmrpGetATEntry(NODE_ADDR mcastAddr, ODMRP_AT *ackTable)
+{
+    ODMRP_AT_Node *current;
+
+    if (ackTable->size == 0 || ackTable->head == NULL)
+    {
+        return (NULL);
+    }
+
+    for (current = ackTable->head; current != NULL; current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current);
+        }
+    }
+
+    return (NULL);
+
+}
+
+/*
+ */
+void RoutingOdmrpInsertAckTable(
+              NODE_ADDR mcastAddr, ODMRP_AT *ackTable, ODMRP_JoinReply *reply)
+{
+    ++(ackTable->size);
+    ackTable->head = RoutingOdmrpInsertATInOrder(
+                                       mcastAddr, ackTable->head, reply);
+
+}
+
+/*
+ */
+ODMRP_AT_Node *RoutingOdmrpInsertATInOrder(
+              NODE_ADDR mcastAddr, ODMRP_AT_Node *old, ODMRP_JoinReply *reply)
+{
+    ODMRP_AT_Node *newOne;
+    int i;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_AT_Node *)pc_malloc(sizeof(ODMRP_AT_Node));
+        assert(newOne != NULL);
+
+        newOne->mcastAddr = mcastAddr;
+        newOne->lastSent = simclock();
+        newOne->head = NULL;
+        newOne->size = 0;
+        newOne->next = NULL;
+
+        newOne->head = RoutingOdmrpInsertAckSource(
+                           reply->srcAddr[0], reply->nextAddr[0], newOne);
+
+        if (reply->count > 0)
+        {
+            for (i = 1; i < reply->count; i++)
+            {
+                RoutingOdmrpInsertAckSource(
+                            reply->srcAddr[i], reply->nextAddr[i], newOne);
+            }
+        }
+    }
+
+    else if (old->mcastAddr > mcastAddr)
+    {
+        newOne = (ODMRP_AT_Node *)pc_malloc(sizeof(ODMRP_AT_Node));
+        assert(newOne != NULL);
+
+        newOne->mcastAddr = mcastAddr;
+        newOne->lastSent = simclock();
+        newOne->head = NULL;
+        newOne->size = 0;
+        newOne->next = old;
+
+        newOne->head = RoutingOdmrpInsertAckSource(
+                           reply->srcAddr[0], reply->nextAddr[0], newOne);
+
+        if (reply->count > 0)
+        {
+            for (i = 1; i < reply->count; i++)
+            {
+                RoutingOdmrpInsertAckSource(
+                            reply->srcAddr[i], reply->nextAddr[i], newOne);
+            }
+        }
+    }
+
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertATInOrder(mcastAddr, old->next, reply);
+    }
+
+    return (newOne);
+
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckASExist(NODE_ADDR srcAddr, ODMRP_AT_Node *mcast)
+{
+    ODMRP_AT_Snode *current;
+
+    if (mcast->size == 0 || mcast->head == NULL)
+    {
+        return (FALSE);
+    }
+
+    for (current = mcast->head; 
+         current != NULL && current->srcAddr <= srcAddr;
+         current = current->next)
+    {
+        if (current->srcAddr == srcAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+
+}
+
+/*
+ */
+ODMRP_AT_Snode *RoutingOdmrpInsertAckSource(
+                  NODE_ADDR srcAddr, NODE_ADDR nextAddr, ODMRP_AT_Node *mcast)
+{
+    ODMRP_AT_Snode *current;
+
+    if (!RoutingOdmrpCheckASExist(srcAddr, mcast))
+    {
+        ++(mcast->size);
+        mcast->lastSent = simclock();
+        mcast->head = RoutingOdmrpInsertASInOrder(
+                                      srcAddr, nextAddr, mcast->head, NULL);
+        return (mcast->head);
+    }
+
+    else
+    {
+        for (current = mcast->head; 
+             current != NULL; 
+             current = current->next)
+        {
+            if (current->srcAddr == srcAddr)
+            {
+                current->nextAddr = nextAddr;
+                current->numTx++;
+                break;
+            }
+        }
+        return (NULL);
+    }
+
+}
+
+/*
+ */
+ODMRP_AT_Snode *RoutingOdmrpInsertASInOrder(NODE_ADDR srcAddr,
+                 NODE_ADDR nextAddr, ODMRP_AT_Snode *old, ODMRP_AT_Snode *last)
+{
+    ODMRP_AT_Snode *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_AT_Snode *)pc_malloc(sizeof(ODMRP_AT_Snode));
+        assert(newOne != NULL);
+
+        newOne->srcAddr = srcAddr;
+        newOne->nextAddr = nextAddr;
+        newOne->numTx = 1;
+        newOne->prev = last;
+        newOne->next = NULL;
+    }
+
+    else if (old->srcAddr > srcAddr)
+    {
+        newOne = (ODMRP_AT_Snode *)pc_malloc(sizeof(ODMRP_AT_Snode));
+        assert(newOne != NULL);
+
+        newOne->srcAddr = srcAddr;
+        newOne->nextAddr = nextAddr;
+        newOne->numTx = 1;
+        newOne->prev = old->prev;
+        if (old->prev != NULL)
+        {
+            old->prev->next = newOne;
+        }
+        old->prev = newOne;
+        newOne->next = old;
+    }
+
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertASInOrder(
+                                   srcAddr, nextAddr, old->next, old);
+    }
+
+    return (newOne);
+
+}
+
+/*
+ * FUNCTION     RoutingOdmrpInsertRouteTable
+ * PURPOSE      Insert new entry into route table.
+ *
+ * Parameters:
+ *     destAddr:      Destination node.
+ *     nextAddr:      Next node towards the destination.
+ *     hopCount:      Hop count to destination.
+ *     routeTable: Route table.
+ */
+void RoutingOdmrpInsertRouteTable(
+    NODE_ADDR destAddr, NODE_ADDR nextAddr, int hopCount, ODMRP_RT *routeTable)
+{
+    ODMRP_RT_Node *current;
+
+    if (!RoutingOdmrpCheckRouteExist(destAddr, routeTable))
+    {
+        ++(routeTable->size);
+        routeTable->head = RoutingOdmrpInsertRTInOrder(
+                             destAddr, nextAddr, hopCount, routeTable->head);
+    }
+
+    else
+    {
+        for (current = routeTable->head; 
+             current != NULL && current->destAddr <= destAddr; 
+             current = current->next)
+        {
+            if (current->destAddr == destAddr)
+            {
+                current->nextAddr = nextAddr;
+                current->hopCount = hopCount;
+                current->timestamp = simclock();
+                break;
+            }
+        }
+    }
+} /* RoutingOdmrpInsertRouteTable */
+
+/*
+ */
+ODMRP_RT_Node *RoutingOdmrpInsertRTInOrder(
+    NODE_ADDR destAddr, NODE_ADDR nextAddr, int hopCount, ODMRP_RT_Node *old)
+{
+    ODMRP_RT_Node *newOne;
+
+    if (old == NULL)
+    {
+        newOne = (ODMRP_RT_Node *)pc_malloc(sizeof(ODMRP_RT_Node));
+        assert(newOne != NULL);
+
+        newOne->destAddr = destAddr;
+        newOne->nextAddr = nextAddr;
+        newOne->hopCount = hopCount;
+        newOne->timestamp = simclock();
+        newOne->next = NULL;
+    }
+    else if (old->destAddr > destAddr)
+    {
+        newOne = (ODMRP_RT_Node *)pc_malloc(sizeof(ODMRP_RT_Node));
+        assert(newOne != NULL);
+
+        newOne->destAddr = destAddr;
+        newOne->nextAddr = nextAddr;
+        newOne->hopCount = hopCount;
+        newOne->timestamp = simclock();
+        newOne->next = old;
+    }
+    else
+    {
+        newOne = old;
+        newOne->next = RoutingOdmrpInsertRTInOrder(
+                               destAddr, nextAddr, hopCount, old->next);
+    }
+
+    return (newOne); 
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckRouteExist(NODE_ADDR destAddr, ODMRP_RT *routeTable)
+{
+    ODMRP_RT_Node *current;
+
+    if (routeTable->size == 0)
+    {
+        return (FALSE);
+    }
+
+    for (current = routeTable->head; 
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ * FUNCTION     RoutingOdmrpInsertMessageCache
+ * PURPOSE      Insert new entry into message cache.
+ *
+ * Parameters:
+ *     node:            Node that is inserting the new entry into message cache.
+ *     sourceAddr:      Packet originator.
+ *     seqNumber:       Packet sequence number.
+ *     messageCache: Message cache.
+ */
+void RoutingOdmrpInsertMessageCache(GlomoNode *node,
+                               NODE_ADDR srcAddr,
+                               int seqNumber,
+                               ODMRP_MC *messageCache)
+{
+    if (messageCache->size == 0)
+    {
+        messageCache->rear = (ODMRP_MC_Node *)pc_malloc(sizeof(ODMRP_MC_Node));
+        assert(messageCache->rear != NULL);
+
+        messageCache->front = messageCache->rear;
+    }
+    else
+    {
+        messageCache->rear->next = (ODMRP_MC_Node *)
+                                   pc_malloc(sizeof(ODMRP_MC_Node));
+        assert(messageCache->rear->next != NULL);
+
+        messageCache->rear = messageCache->rear->next;
+    }
+
+    messageCache->rear->srcAddr = srcAddr;
+    messageCache->rear->seqNumber = seqNumber;
+    messageCache->rear->sent = FALSE;
+    messageCache->rear->next = NULL;
+
+    ++(messageCache->size);
+
+    RoutingOdmrpSetTimer(
+            node, MSG_NETWORK_FlushTables, ANY_DEST, ODMRP_FLUSH_INTERVAL); 
+
+} /* RoutingOdmrpInsertMessageCache */
+
+/*
+ * FUNCTION     RoutingOdmrpGetSeq
+ * PURPOSE      Get the sequence number of the packet to send.
+ *
+ *
+ * Return: a sequence number.
+ */
+int RoutingOdmrpGetSeq(GlomoNode *node)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp *odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    int number;
+
+    number = odmrp->seqTable % 256;
+    odmrp->seqTable++;
+
+    return (number);
+} /* RoutingOdmrpGetSeq */
+
+/*
+ * FUNCTION     RoutingOdmrpGetNextNode
+ * PURPOSE      Extract next node to destination from route table.
+ *
+ * Parameters:
+ *     destAddr:      Destination node.
+ *     routeTable: Route table.
+ *
+ * Return: Next node.
+ */
+NODE_ADDR RoutingOdmrpGetNextNode(NODE_ADDR destAddr, ODMRP_RT *routeTable)
+{
+    ODMRP_RT_Node *current;
+
+    for (current = routeTable->head;
+         current != NULL && current->destAddr <= destAddr;
+         current = current->next)
+    {
+        if (current->destAddr == destAddr)
+        {
+            return (current->nextAddr);
+        }
+    }
+
+    return (ANY_DEST);
+} /* RoutingOdmrpGetNextNode */
+
+/*
+ */
+int RoutingOdmrpGetTempCount(NODE_ADDR mcastAddr, ODMRP_TT *tempTable)
+{
+    ODMRP_TT_Node *current;
+
+    if (tempTable->size == 0 || tempTable->head == NULL)
+    {
+        return (0);
+    }
+    
+    for (current = tempTable->head;
+         current != NULL && current->mcastAddr <= mcastAddr;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current->size);
+        }
+    }
+
+    return (0);
+}
+
+/*
+ */
+int RoutingOdmrpGetMemberCount(NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Node *current;
+
+    if (memberTable->size == 0 || memberTable->head == NULL)
+    {
+        return (0);
+    }
+    
+    for (current = memberTable->head;
+         current != NULL && current->mcastAddr <= mcastAddr;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current->size);
+        }
+    }
+
+    return (0);
+}
+
+/*
+ */
+int RoutingOdmrpGetAckCount(NODE_ADDR mcastAddr, ODMRP_AT *ackTable)
+{
+    ODMRP_AT_Node *current;
+
+    if (ackTable->size == 0 || ackTable->head == NULL)
+    {
+        return (0);
+    }
+    
+    for (current = ackTable->head;
+         current != NULL && current->mcastAddr <= mcastAddr;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current->size);
+        }
+    }
+
+    return (0);
+}
+
+/*
+ * FUNCTION     RoutingOdmrpJoinGroup
+ * PURPOSE      Join a new multicast group.
+ *
+ * Parameters:
+ *     node:          Node that is joining the group.
+ *     mcastAddr:     Multicast group to join.
+ */
+void RoutingOdmrpJoinGroup(GlomoNode *node, NODE_ADDR mcastAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+
+    /* Join group if not already a member. */
+    if (!RoutingOdmrpLookupMembership(mcastAddr, &odmrp->memberFlag))
+    {
+#ifdef DEBUG
+            printf("Node %ld joined group %u\n", node->nodeAddr, mcastAddr);
+#endif
+
+        RoutingOdmrpSetMemberFlag(mcastAddr, &odmrp->memberFlag); 
+
+    }
+} /* RoutingOdmrpJoinGroup */
+
+/*
+ * FUNCTION     RoutingOdmrpLeaveGroup
+ * PURPOSE      Leave a multicast group
+ *
+ * Parameters:
+ *     node:          Node that is leaving the group.
+ *     mcastAddr:     Multicast group to leave.
+ */
+void RoutingOdmrpLeaveGroup(GlomoNode *node, NODE_ADDR mcastAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+
+    /* Leave group if a member */
+    if (RoutingOdmrpLookupMembership(mcastAddr, &odmrp->memberFlag))
+    {
+#ifdef DEBUG
+            printf("Node %ld left group %u\n", node->nodeAddr, mcastAddr);
+#endif
+
+        RoutingOdmrpResetMemberFlag(mcastAddr, &odmrp->memberFlag);
+
+        RoutingOdmrpDeleteSourceSent(mcastAddr, &odmrp->sentTable);
+
+        RoutingOdmrpDeleteMemberTable(mcastAddr, &odmrp->memberTable);
+    }
+
+} /* RoutingOdmrpLeaveGroup */
+
+/*
+ * FUNCTION      RoutingOdmrpCheckLastSent
+ * PURPOSE       Check to make sure not to send table too often.
+ *
+ * Parameters:
+ *     mcastAddr:      Multicast group.
+ *     memberTable: Member table.
+ *
+ * Return: TRUE if sending is allowed; FALSE otherwise
+ */
+BOOL RoutingOdmrpCheckLastSent(NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Node *current;
+
+    for (current = memberTable->head;
+         current != NULL && current->mcastAddr <= mcastAddr;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr && 
+            simclock() - current->lastSent > ODMRP_JR_PAUSE_TIME)
+        {
+            return(TRUE);
+        }
+    }
+
+    return(FALSE);
+} /* RoutingOdmrpCheckLastSent */
+
+/*
+ * FUNCTION      RoutingOdmrpUpdateLastSent
+ * PURPOSE       Update last sent entry of member table.
+ *
+ *     mcastAddr:      Multicast group.
+ *     memberTable: Member table.
+ */
+void RoutingOdmrpUpdateLastSent(NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Node *current;
+
+    for (current = memberTable->head;
+         current != NULL && current->mcastAddr <= mcastAddr;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            current->lastSent = simclock();
+        }
+    }
+
+    return;
+} /* RoutingOdmrpUpdateLastSent */
+
+/*
+ * FUNCTION     RoutingOdmrpCheckAckTable
+ * PURPOSE      Check to see if sending a join table is necessary.
+ *              For each entry of the ack table, see if number of retx
+ *              is less than the number of max tx allowed. If alrealdy
+ *              maximum, remove entry.
+ *
+ * Parameters:
+ *     mcastAddr: Multicast group
+ *     ackTable:  Ack table
+ *
+ * Return TRUE if retx is required, FALSE otherwise.
+ */
+BOOL RoutingOdmrpCheckAckTable(NODE_ADDR mcastAddr, ODMRP_AT *ackTable)
+{
+    ODMRP_AT_Node *current;
+    ODMRP_AT_Snode *curSrc;
+
+    if (ackTable->size == 0 || ackTable->head == NULL)
+    {
+        return (FALSE);
+    }
+    
+    for (current = ackTable->head; current != NULL; current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            if (current->size == 0 || current->head == NULL)
+            {
+                return (FALSE);
+            }
+                
+            for (curSrc = current->head;
+                 curSrc != NULL;
+                 curSrc = curSrc->next)
+            {
+                if (curSrc->numTx < ODMRP_MAX_NUM_TX)
+                {
+                    return (TRUE);
+                }
+            }
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ */
+void RoutingOdmrpDeleteAckTable(NODE_ADDR mcastAddr, NODE_ADDR srcAddr,
+                                NODE_ADDR lastAddr, ODMRP_AT *ackTable)
+{
+    ODMRP_AT_Node *current;
+    ODMRP_AT_Snode *curSrc;
+    ODMRP_AT_Snode *toFree;
+
+    for (current = ackTable->head; current != NULL; current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            if (current->size == 0 || current->head == NULL)
+            {
+                return;
+            }
+            
+            for (curSrc = current->head;
+                 curSrc != NULL;
+                 curSrc = curSrc->next)
+            {
+                if (curSrc->srcAddr == srcAddr && 
+                    curSrc->nextAddr == lastAddr)
+                {
+                    toFree = curSrc;
+
+                    if (curSrc->prev == NULL && curSrc->next == NULL)
+                    {
+                        current->head = curSrc->next;
+                    }
+                    else if (curSrc->prev == NULL)
+                    {
+                        curSrc->next->prev = curSrc->prev;
+                        current->head = curSrc->next;
+                    }
+                    else if (curSrc->next == NULL)
+                    {
+                        curSrc->prev->next = curSrc->next;
+                    }
+                    else
+                    {
+                        curSrc->prev->next = curSrc->next;
+                        curSrc->next->prev = curSrc->prev;
+                    }
+
+                    pc_free(toFree);
+                    --(current->size);
+                }
+
+                else if (curSrc->numTx >= ODMRP_MAX_NUM_TX)
+                {
+                    toFree = curSrc;
+
+                    if (curSrc->prev == NULL && curSrc->next == NULL)
+                    {
+                        current->head = curSrc->next;
+                    }
+                    else if (curSrc->prev == NULL)
+                    {
+                        curSrc->next->prev = curSrc->prev;
+                        current->head = curSrc->next;
+                    }
+                    else if (curSrc->next == NULL)
+                    {
+                        curSrc->prev->next = curSrc->next;
+                    }
+                    else
+                    {
+                        curSrc->prev->next = curSrc->next;
+                        curSrc->next->prev = curSrc->prev;
+                    }
+
+                    pc_free(toFree);
+                    --(current->size);
+                }
+            }
+        }
+    }
+} 
+
+/* 
+ * FUNCTION     RoutingOdmrpInitAckTable
+ * PURPOSE      Initialize the ack table.
+ *
+ * Parameters:
+ *     ackTable: Ack table.
+ */
+
+void RoutingOdmrpInitAckTable(ODMRP_AT *ackTable)
+{
+    ackTable->head = NULL;
+    ackTable->size = 0;
+}
+
+/*
+ */
+void RoutingOdmrpDeleteMemberTable(NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Node *toFree;
+    ODMRP_MT_Node *current;
+
+    if (memberTable->size == 0 || memberTable->head == NULL)
+    {
+        return;
+    }
+    else if (memberTable->head->mcastAddr == mcastAddr)
+    {
+        toFree = memberTable->head;
+        memberTable->head = toFree->next;
+        pc_free(toFree);
+        --(memberTable->size);
+    }
+    else
+    {
+        for (current = memberTable->head;
+             current->next != NULL && current->next->mcastAddr < mcastAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->mcastAddr == mcastAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(memberTable->size);
+        }
+    }
+}
+
+/*
+ */
+void RoutingOdmrpDeleteTempTable(NODE_ADDR mcastAddr, ODMRP_TT *tempTable)
+{
+    ODMRP_TT_Node *toFree;
+    ODMRP_TT_Node *current;
+
+    if (tempTable->size == 0 || tempTable->head == NULL)
+    {
+        return;
+    }
+    else if (tempTable->head->mcastAddr == mcastAddr)
+    {
+        toFree = tempTable->head;
+        tempTable->head = toFree->next;
+        pc_free(toFree);
+        --(tempTable->size);
+    }
+    else
+    {
+        for (current = tempTable->head;
+             current->next != NULL && current->next->mcastAddr < mcastAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->mcastAddr == mcastAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(tempTable->size);
+        }
+    }
+}
+
+/*
+ */
+void RoutingOdmrpDeleteResponseTable(
+                                 NODE_ADDR mcastAddr, ODMRP_RPT *rspnsTable)
+{
+    ODMRP_RPT_Node *toFree;
+    ODMRP_RPT_Node *current;
+
+    if (rspnsTable->size == 0 || rspnsTable->head == NULL)
+    {
+        return;
+    }
+    else if (rspnsTable->head->mcastAddr == mcastAddr)
+    {
+        toFree = rspnsTable->head;
+        rspnsTable->head = toFree->next;
+        pc_free(toFree);
+        --(rspnsTable->size);
+    }
+    else
+    {
+        for (current = rspnsTable->head;
+             current->next != NULL && current->next->mcastAddr < mcastAddr;
+             current = current->next)
+        {
+        }
+
+        if (current->next != NULL && current->next->mcastAddr == mcastAddr)
+        {
+            toFree = current->next;
+            current->next = toFree->next;
+            pc_free(toFree);
+            --(rspnsTable->size);
+        }
+    }
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckResponseMatch(
+                 NODE_ADDR mcastAddr, NODE_ADDR srcAddr, ODMRP_RPT *rspnsTable)
+{
+    ODMRP_RPT_Node *current;
+    ODMRP_RPT_Snode *curSrc;
+
+    if (rspnsTable->size == 0 || rspnsTable->head == NULL)
+    {
+        return (FALSE);
+    }
+    
+    for (current = rspnsTable->head;
+         current != NULL && current->mcastAddr <= mcastAddr;
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            if (current->size == 0 || current->head == NULL)
+            {
+                return (FALSE);
+            }
+                
+            for (curSrc = current->head;
+                 curSrc != NULL;
+                 curSrc = curSrc->next)
+            {
+                if (curSrc->srcAddr == srcAddr)
+                {
+                    return (TRUE);
+                }
+            }
+        }
+    }
+    return (FALSE);
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckMinExpTime(NODE_ADDR mcastAddr, ODMRP_SS *sentTable)
+{
+    ODMRP_SS_Node *current;
+
+    if (sentTable->size == 0 || sentTable->head == NULL)
+    {
+        return (FALSE);
+    }
+    
+    for (current = sentTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr &&
+            simclock() > current->minExpireTime)
+        {
+            return (TRUE);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckCongestionTime(
+                               NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Node *current;
+
+    if (memberTable->size == 0 || memberTable->head == NULL)
+    {
+        return (TRUE);
+    }
+    
+    for (current = memberTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr &&
+            simclock() - current->queryLastReceived < 
+            ODMRP_CONGESTION_TIME)
+        {
+            return (FALSE);
+        }
+    }
+
+    return (TRUE);
+
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckSendQuery(NODE_ADDR mcastAddr, ODMRP_SS *sentTable)
+{
+    ODMRP_SS_Node *current;
+
+    if (sentTable->size == 0 || sentTable->head == NULL)
+    {
+        return (FALSE);
+    }
+    
+    for (current = sentTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current->nextQuerySend);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ */
+void RoutingOdmrpSetSendQuery(NODE_ADDR mcastAddr, ODMRP_SS *sentTable)
+{
+    ODMRP_SS_Node *current;
+
+    if (sentTable->size == 0 || sentTable->head == NULL)
+    {
+        return;
+    }
+    
+    for (current = sentTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            current->nextQuerySend = TRUE;
+            return;
+        }
+    }
+
+    return;
+}
+
+/*
+ */
+void RoutingOdmrpUnsetSendQuery(NODE_ADDR mcastAddr, ODMRP_SS *sentTable)
+{
+    ODMRP_SS_Node *current;
+
+    if (sentTable->size == 0 || sentTable->head == NULL)
+    {
+        return;
+    }
+    
+    for (current = sentTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            current->nextQuerySend = FALSE;
+            return;
+        }
+    }
+
+    return;
+}
+
+/*
+ */
+void RoutingOdmrpSetMinExpireTime(NODE_ADDR mcastAddr, ODMRP_SS *sentTable)
+{
+    ODMRP_SS_Node *current;
+
+    if (sentTable->size == 0 || sentTable->head == NULL)
+    {
+        return;
+    }
+    
+    for (current = sentTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            current->minExpireTime = simclock() + ODMRP_JR_REFRESH;
+            return;
+        }
+    }
+
+    return;
+}
+
+/*
+ */
+BOOL RoutingOdmrpCheckTempSent(NODE_ADDR mcastAddr, ODMRP_TT *tempTable)
+{
+    ODMRP_TT_Node *current;
+
+    if (tempTable->size == 0 || tempTable->head == NULL)
+    {
+        return (FALSE);
+    }
+    
+    for (current = tempTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            return (current->sent);
+        }
+    }
+
+    return (FALSE);
+}
+
+/*
+ */
+void RoutingOdmrpSetTempSent(NODE_ADDR mcastAddr, ODMRP_TT *tempTable)
+{
+    ODMRP_TT_Node *current;
+
+    if (tempTable->size == 0 || tempTable->head == NULL)
+    {
+        return;
+    }
+    
+    for (current = tempTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            current->sent = TRUE;
+            return;
+        }
+    }
+
+    return;
+}
+
+/*
+ */
+void RoutingOdmrpUnsetTempSent(NODE_ADDR mcastAddr, ODMRP_TT *tempTable)
+{
+    ODMRP_TT_Node *current;
+
+    if (tempTable->size == 0 || tempTable->head == NULL)
+    {
+        return;
+    }
+    
+    for (current = tempTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            current->sent = FALSE;
+            return;
+        }
+    }
+
+    return;
+}
+
+/*
+ */
+void RoutingOdmrpSetMemberSent(NODE_ADDR mcastAddr, ODMRP_MT *memberTable)
+{
+    ODMRP_MT_Node *current;
+
+    if (memberTable->size == 0 || memberTable->head == NULL)
+    {
+        return;
+    }
+    
+    for (current = memberTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            current->sent = TRUE;
+            return;
+        }
+    }
+
+    return;
+}
+
+/*
+ */
+void RoutingOdmrpSetTimer(
+    GlomoNode *node, long eventType, NODE_ADDR mcastAddr, clocktype delay)
+{
+    Message *msg;
+    NODE_ADDR *info;
+
+    msg = GLOMO_MsgAlloc
+              (node, GLOMO_NETWORK_LAYER, ROUTING_PROTOCOL_ODMRP, eventType);
+
+    GLOMO_MsgInfoAlloc(node, msg, sizeof(NODE_ADDR));
+    info = (NODE_ADDR *) GLOMO_MsgReturnInfo(msg);
+    *info = mcastAddr;
+    GLOMO_MsgSend(node, msg, delay);
+}
+
+/*
+ */
+void RoutingOdmrpSendReply(GlomoNode *node, NODE_ADDR mcastAddr,
+                           ODMRP_MT *memberTable, ODMRP_TT *tempTable)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    Message *msg;
+    ODMRP_JoinReply *replyPkt;
+    ODMRP_AT_Node *mcastEntry;
+    ODMRP_MT_Node *current;
+    ODMRP_MT_Snode *curSrc;
+    ODMRP_TT_Node *curNode;
+    ODMRP_TT_Snode *curSrcNode;
+    BOOL match;
+    BOOL done;
+    int i, j, k, l, m, n;
+    char *pktPtr;
+    int pktSize = sizeof(ODMRP_JoinReply);
+    clocktype delay;
+BOOL needAck = FALSE;
+
+    msg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, msg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(msg);
+    replyPkt = (ODMRP_JoinReply *) pktPtr;
+
+    replyPkt->pktType = ODMRP_JOIN_REPLY;
+
+    /* Stop collecting JR from down stream. */
+    RoutingOdmrpSetTempSent(mcastAddr, &odmrp->tempTable);
+
+    /* if the node is a member of the group. */
+    if (RoutingOdmrpLookupMembership(mcastAddr, &odmrp->memberFlag))
+    {
+#ifdef DEBUG
+    printf("Member node %ld sending a Join Reply\n", node->nodeAddr);
+#endif
+
+        /* Remove sources that have been expired. */
+        RoutingOdmrpCheckSourceExpired(mcastAddr, &odmrp->memberTable);
+
+        /* Send table only if valid source members exist in table. */
+        if (RoutingOdmrpLookupMemberTable(mcastAddr, &odmrp->memberTable) &&
+            RoutingOdmrpCheckLastSent(mcastAddr, &odmrp->memberTable))
+        {
+#ifdef DEBUG
+ printf("       There are members!\n");
+#endif
+            replyPkt->count = RoutingOdmrpGetMemberCount(
+                                            mcastAddr, &odmrp->memberTable);
+#ifdef DEBUG
+// printf("     count is %d\n", replyPkt->count);
+#endif
+
+            /* Used for implicit ACK */
+            replyPkt->IAmFG = RoutingOdmrpLookupFgFlag(
+                                                 mcastAddr, &odmrp->fgFlag);
+
+            for (current = memberTable->head; 
+                 current != NULL && current->mcastAddr <= mcastAddr; 
+                 current = current->next)
+            {
+                if (current->mcastAddr == mcastAddr)
+                {
+                    for (i = 0, curSrc = current->head; 
+                         i < current->size && curSrc != NULL; 
+                         i++, curSrc = curSrc->next)
+                    {
+                        replyPkt->srcAddr[i] = curSrc->srcAddr;
+#ifdef DEBUG
+// printf("     src is %d\n", replyPkt->srcAddr[i]);
+#endif
+                    }
+                }
+            }
+
+            for (j = 0; j < replyPkt->count; j++)
+            {
+                replyPkt->nextAddr[j] = 
+                              RoutingOdmrpGetNextNode(
+                                      replyPkt->srcAddr[j], &odmrp->routeTable);
+
+#ifdef DEBUG
+// printf("     next is %d\n", replyPkt->nextAddr[j]);
+#endif
+                /* If next hop is source, always require explicit ACK. */
+                if (replyPkt->nextAddr[j] == replyPkt->srcAddr[j])
+                {
+                    replyPkt->ackReq[j] = TRUE /*FALSE*/;
+needAck = TRUE;
+                }
+                else
+                {
+                    replyPkt->ackReq[j] =  FALSE; 
+needAck = TRUE;
+                }
+            }
+
+            if (tempTable->size == 0 || tempTable->head == NULL)
+            {
+            }
+            else
+            {
+                for (curNode = tempTable->head; 
+                     curNode != NULL && curNode->mcastAddr <= mcastAddr; 
+                     curNode = curNode->next)
+                {
+                    if (curNode->mcastAddr == mcastAddr)
+                    {
+                        if (curNode->size == 0 || curNode->head == NULL)
+                        {
+                        }
+                        else
+                        {
+                            for (curSrcNode = curNode->head;
+                                 curSrcNode != NULL;
+                                 curSrcNode = curSrcNode->next)
+                            {
+                                done = FALSE;
+                                for (k = 0; k < replyPkt->count; k++)
+                                {
+                                    if (replyPkt->srcAddr[k] == 
+                                        curSrcNode->srcAddr)
+                                    {
+                                        done = TRUE;
+                                        break;
+                                    }
+                                }
+
+                                if (done == FALSE)
+                                {
+                                    replyPkt->srcAddr[replyPkt->count] = 
+                                                        curSrcNode->srcAddr;
+                                    replyPkt->nextAddr[replyPkt->count] = 
+                                     RoutingOdmrpGetNextNode(
+                                      curSrcNode->srcAddr, &odmrp->routeTable);
+
+                                    if (replyPkt->nextAddr[replyPkt->count] == 
+                                        curSrcNode->srcAddr)
+                                    {
+                                        replyPkt->ackReq[replyPkt->count] = 
+                                                                         TRUE;
+                                    }
+                                    else
+                                    {
+                                        replyPkt->ackReq[replyPkt->count] = 
+                                                                         FALSE;
+                                    }
+
+                                    replyPkt->count++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Prevent join reply flood storm. */
+            l = 0;
+
+#ifdef DEBUG
+// printf("     count now is %d\n", replyPkt->count);
+#endif
+            /* Check each entry in JR if in response. */
+            while (l < replyPkt->count)
+            {
+                match = FALSE;
+
+                match = RoutingOdmrpCheckResponseMatch(
+                       mcastAddr, replyPkt->srcAddr[l], &odmrp->responseTable);
+        
+                /* Not found in response table, delete source. */
+                if (!match) 
+                {
+                    for (m = l; m < replyPkt->count; m++) 
+                    {
+                        replyPkt->srcAddr[m] = replyPkt->srcAddr[m+1];
+                        replyPkt->nextAddr[m] = replyPkt->nextAddr[m+1];
+                        replyPkt->ackReq[m] = replyPkt->ackReq[m+1];
+                    }
+
+                    replyPkt->count--;
+                }
+       
+                if (match)
+                {
+                    l++;
+                }
+            }
+
+#ifdef DEBUG
+// printf("     count NOW is %d\n", replyPkt->count);
+#endif
+
+            if (replyPkt->count > 0)
+            {
+                /* Clear response table. */
+                RoutingOdmrpDeleteResponseTable(
+                                        mcastAddr, &odmrp->responseTable);
+
+#ifdef DEBUG
+for (l = 0; l < replyPkt->count; l++)
+printf("src[%d] = %d, nxt[%d] = %d\n", l, replyPkt->srcAddr[l], l, replyPkt->nextAddr[l]);
+#endif
+
+                NetworkIpSendRawGlomoMessageToMacLayer(
+                          node, msg, mcastAddr, CONTROL, IPPROTO_ODMRP, 1,
+                          DEFAULT_INTERFACE, ANY_DEST);
+
+                odmrp->stats.numReplySent++;
+
+                /* Set sent flag to true (stop collecting route). */
+                RoutingOdmrpSetMemberSent(mcastAddr, &odmrp->memberTable);
+
+                /* Record when the table was sent last. */
+                RoutingOdmrpUpdateLastSent(mcastAddr, &odmrp->memberTable);
+
+if (needAck){
+                mcastEntry = RoutingOdmrpGetATEntry(
+                                             mcastAddr, &odmrp->ackTable);
+                if (mcastEntry == NULL)
+                {
+                    RoutingOdmrpInsertAckTable(
+                                     mcastAddr, &odmrp->ackTable, replyPkt);
+                }
+                else
+                {
+                    for (n = 0; n < replyPkt->count; n++)
+                    {
+                        RoutingOdmrpInsertAckSource(replyPkt->srcAddr[n],
+                                        replyPkt->nextAddr[n], mcastEntry);
+                    }
+                }
+
+                RoutingOdmrpSetTimer(
+                        node, MSG_NETWORK_CheckAcked, mcastAddr, 
+                        ODMRP_CHECKACK_INTERVAL);
+}
+            }
+        } /* If member exist and not sent recently*/
+
+        else if (RoutingOdmrpLookupMemberTable(mcastAddr, &odmrp->memberTable))
+        {
+#ifdef DEBUG
+ printf("Node %ld send Join Reply recently. Sending DELAYED\n", node->nodeAddr);
+#endif
+            RoutingOdmrpSetTimer(
+                  node, MSG_NETWORK_SendReply, mcastAddr, ODMRP_JR_PAUSE_TIME);
+        }
+    } /* If member */
+
+    /* Send joing table for forwarding group. */
+    else if (RoutingOdmrpLookupFgFlag(mcastAddr, &odmrp->fgFlag))
+    {
+#ifdef DEBUG
+    printf("FG node %ld sending a Join Reply\n", node->nodeAddr);
+#endif
+
+        replyPkt->count = RoutingOdmrpGetTempCount(
+                                            mcastAddr, &odmrp->tempTable);
+
+        /* Used for implicit ACK. */
+        replyPkt->IAmFG = RoutingOdmrpLookupFgFlag(mcastAddr, &odmrp->fgFlag);
+
+        for (curNode = tempTable->head; 
+             curNode != NULL && curNode->mcastAddr <= mcastAddr; 
+             curNode = curNode->next)
+        {
+            if (curNode->mcastAddr == mcastAddr)
+            {
+                for (i = 0, curSrcNode = curNode->head; 
+                     i < curNode->size && curSrcNode != NULL; 
+                     i++, curSrcNode = curSrcNode->next)
+                {
+                    replyPkt->srcAddr[i] = curSrcNode->srcAddr;
+                }
+            }
+        }
+
+        for (j = 0; j < replyPkt->count; j++)
+        {
+            replyPkt->nextAddr[j] = RoutingOdmrpGetNextNode(
+                                    replyPkt->srcAddr[j], &odmrp->routeTable);
+
+            /* If next hop is source, always require explicit ACK. */
+            if (replyPkt->nextAddr[j] == replyPkt->srcAddr[j])
+            {
+                replyPkt->ackReq[j] = TRUE /*FALSE*/;
+needAck = TRUE;
+            }
+            else
+            {
+                replyPkt->ackReq[j] =  FALSE;
+needAck = TRUE;
+            }
+        }
+
+        /* Prevent join table flood storm. */
+        k = 0;
+
+        /* Check each entry in JR if in response. */
+        while (k < replyPkt->count)
+        {
+            match = FALSE;
+
+            match = RoutingOdmrpCheckResponseMatch(
+                       mcastAddr, replyPkt->srcAddr[k], &odmrp->responseTable);
+        
+            /* Not found in response table, delete source. */
+            if (!match) 
+            {
+                for (l = k; l < replyPkt->count; l++) 
+                {
+                    replyPkt->srcAddr[l] = replyPkt->srcAddr[l+1];
+                    replyPkt->nextAddr[l] = replyPkt->nextAddr[l+1];
+                    replyPkt->ackReq[l] = replyPkt->ackReq[l+1];
+                }
+         
+                replyPkt->count--;
+            }
+
+            if (match)
+            {
+                k++;
+            }
+        }
+
+        if (replyPkt->count > 0)
+        {
+            /* Clean response table. */
+            RoutingOdmrpDeleteResponseTable(mcastAddr, &odmrp->responseTable);
+
+#ifdef DEBUG
+for (l = 0; l < replyPkt->count; l++)
+printf("src[%d] = %d, nxt[%d] = %d\n", l, replyPkt->srcAddr[l], l, replyPkt->nextAddr[l]);
+#endif
+            NetworkIpSendRawGlomoMessageToMacLayer(
+                          node, msg, mcastAddr, CONTROL, IPPROTO_ODMRP, 1,
+                          DEFAULT_INTERFACE, ANY_DEST);
+
+            odmrp->stats.numReplySent++;
+
+if (needAck){
+            mcastEntry = RoutingOdmrpGetATEntry(mcastAddr, &odmrp->ackTable);
+            if (mcastEntry == NULL)
+            {
+                RoutingOdmrpInsertAckTable(
+                          mcastAddr, &odmrp->ackTable, replyPkt);
+            }
+            else
+            {
+                for (m = 0; m < replyPkt->count; m++)
+                {
+                    RoutingOdmrpInsertAckSource(
+                      replyPkt->srcAddr[m], replyPkt->nextAddr[m], mcastEntry);
+                }
+            }
+
+            RoutingOdmrpSetTimer(
+                        node, MSG_NETWORK_CheckAcked, mcastAddr, 
+                        ODMRP_CHECKACK_INTERVAL);
+}
+        }
+
+    }
+}
+
+/*
+ */
+void RoutingOdmrpRetxReply(
+                     GlomoNode *node, NODE_ADDR mcastAddr, ODMRP_AT *ackTable)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    Message *msg;
+    ODMRP_JoinReply *replyPkt;
+    ODMRP_AT_Node *mcastEntry;
+    ODMRP_AT_Node *current;
+    ODMRP_AT_Snode *curSrc;
+    int i, j;
+    char *pktPtr;
+    int pktSize = sizeof(ODMRP_JoinReply);
+    clocktype delay;
+
+    msg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0, MSG_MAC_FromNetwork);
+    GLOMO_MsgPacketAlloc(node, msg, pktSize);
+
+    pktPtr = (char *) GLOMO_MsgReturnPacket(msg);
+    replyPkt = (ODMRP_JoinReply *) pktPtr;
+
+    replyPkt->pktType = ODMRP_JOIN_REPLY;
+    replyPkt->count = RoutingOdmrpGetAckCount(mcastAddr, &odmrp->ackTable);
+
+    /* Used for implicit ACK. */
+    replyPkt->IAmFG = RoutingOdmrpLookupFgFlag(mcastAddr, &odmrp->fgFlag);
+
+    for (current = ackTable->head; 
+         current != NULL && current->mcastAddr <= mcastAddr; 
+         current = current->next)
+    {
+        if (current->mcastAddr == mcastAddr)
+        {
+            for (i = 0, curSrc = current->head; 
+                 i < current->size && curSrc != NULL; 
+                 i++, curSrc = curSrc->next)
+            {
+                replyPkt->srcAddr[i] = curSrc->srcAddr;
+                replyPkt->nextAddr[i] = curSrc->nextAddr;
+                if (curSrc->numTx > 0 || curSrc->srcAddr == curSrc->nextAddr)
+                {
+                    replyPkt->ackReq[i] = TRUE;
+                }
+                else
+                {
+                    replyPkt->ackReq[i] = FALSE;
+                }
+#ifdef DEBUG
+ printf("src[%d] = %d, next[%d] = %d, ack[%d] = %d\n", i, replyPkt->srcAddr[i], i, replyPkt->nextAddr[i], i, replyPkt->ackReq[i]);
+#endif
+            }
+        }
+    }
+
+    if (replyPkt->count > 0)
+    {
+        delay = pc_erand(node->seed) * ODMRP_JR_RETX_JITTER;
+
+        NetworkIpSendRawGlomoMessageToMacLayerWithDelay(
+                  node, msg, mcastAddr, CONTROL, IPPROTO_ODMRP, 1,
+                  DEFAULT_INTERFACE, ANY_DEST, delay);
+
+        odmrp->stats.numReplySent++;
+
+#ifdef DEBUG
+    printf("Node %ld retransmitting a Join Reply\n", node->nodeAddr);
+#endif
+
+        RoutingOdmrpSetTimer(
+             node, MSG_NETWORK_CheckAcked, mcastAddr, ODMRP_CHECKACK_INTERVAL);
+
+        mcastEntry = RoutingOdmrpGetATEntry(mcastAddr, &odmrp->ackTable);
+        if (mcastEntry == NULL)
+        {
+            RoutingOdmrpInsertAckTable(mcastAddr, &odmrp->ackTable, replyPkt);
+        }
+        else
+        {
+            for (j = 0; j < replyPkt->count; j++)
+            {
+                RoutingOdmrpInsertAckSource(
+                      replyPkt->srcAddr[j], replyPkt->nextAddr[j], mcastEntry);
+            }
+        }
+    }
+
+}
+
+/*
+ */
+void RoutingOdmrpSendData(GlomoNode *node, Message *msg, NODE_ADDR mcastAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    OdmrpIpOptionType option;
+
+    GLOMO_MsgSetLayer(msg, GLOMO_MAC_LAYER, 0);
+    GLOMO_MsgSetEvent(msg, MSG_MAC_FromNetwork);
+
+    AddCustomOdmrpIpOptionFields(node, msg);
+
+    option.query = FALSE;
+    option.lastAddr = node->nodeAddr;
+    option.seqNumber = RoutingOdmrpGetSeq(node);
+    option.hopCount = 1;
+
+    SetOdmrpIpOptionField(msg, &option);
+
+    NetworkIpSendPacketToMacLayer(node, msg, DEFAULT_INTERFACE, ANY_DEST);
+   
+    RoutingOdmrpInsertMessageCache(
+            node, node->nodeAddr, option.seqNumber, &odmrp->messageCache);
+
+    //printf("count before is %d\n", odmrp->stats.numDataToReceive);
+
+    odmrp->stats.numDataSent++;
+    odmrp->stats.numDataTxed++;
+    //    odmrp->stats.numDataToReceive += 
+    //                   (int)McastReturnMemberCount(node, mcastAddr, simclock()) - 1;
+
+    //printf("count now is %d\n\n", odmrp->stats.numDataToReceive);
+}
+
+/*
+ */
+void RoutingOdmrpSendQuery(GlomoNode *node, Message *msg, NODE_ADDR mcastAddr)
+{
+    GlomoNetworkIp* ipLayer = (GlomoNetworkIp *) node->networkData.networkVar;
+    GlomoRoutingOdmrp* odmrp = (GlomoRoutingOdmrp *) ipLayer->routingProtocol;
+    OdmrpIpOptionType option;
+
+    GLOMO_MsgSetLayer(msg, GLOMO_MAC_LAYER, 0);
+    GLOMO_MsgSetEvent(msg, MSG_MAC_FromNetwork);
+
+    AddCustomOdmrpIpOptionFields(node, msg);
+
+    option.query = TRUE;
+    option.lastAddr = node->nodeAddr;
+    option.seqNumber = RoutingOdmrpGetSeq(node);
+    option.hopCount = 1;
+
+    SetOdmrpIpOptionField(msg, &option);
+
+    NetworkIpSendPacketToMacLayer(node, msg, DEFAULT_INTERFACE, ANY_DEST);
+    
+    //printf("count before is %d\n", odmrp->stats.numDataToReceive);
+
+    odmrp->stats.numDataSent++;
+    odmrp->stats.numDataTxed++;
+    odmrp->stats.numQueryTxed++;
+    //    odmrp->stats.numDataToReceive += 
+    //                  (int)McastReturnMemberCount(node, mcastAddr, simclock()) - 1;
+
+    //printf("count now is %d\n\n", odmrp->stats.numDataToReceive);
+
+    RoutingOdmrpInsertMessageCache(
+            node, node->nodeAddr, option.seqNumber, &odmrp->messageCache);
+
+    /* Congestion prevention. */
+    if (RoutingOdmrpCheckSendQuery(mcastAddr, &odmrp->sentTable))
+    {
+        RoutingOdmrpUnsetSendQuery(mcastAddr, &odmrp->sentTable);
+    }
+
+    if (!RoutingOdmrpLookupSentTable(mcastAddr, &odmrp->sentTable))
+    {
+        /* Mark that J-Q is sent. Just send Data from now on */
+        RoutingOdmrpSetSent(mcastAddr, &odmrp->sentTable);
+    }
+    else
+    {
+        RoutingOdmrpSetMinExpireTime(mcastAddr, &odmrp->sentTable);
+    }
+
+    RoutingOdmrpSetTimer(
+        node, MSG_NETWORK_CheckTimeoutAlarm, mcastAddr, ODMRP_TIMER_INTERVAL);
+}
+
+/*
+ */
+void AddCustomOdmrpIpOptionFields(GlomoNode* node, Message* msg)
+{
+   AddIpOptionField(node, msg, IPOPT_ODMRP, sizeof(OdmrpIpOptionType));
+}
+
+/*
+ */
+OdmrpIpOptionType GetOdmrpIpOptionField(const Message* msg)
+{
+   IpOptionsHeaderType* ipOption =
+       FindAnIpOptionField((IpHeaderType*)msg->packet, IPOPT_ODMRP);
+   OdmrpIpOptionType OdmrpIpOption;
+   memcpy(&OdmrpIpOption, ((char*)ipOption + sizeof(IpOptionsHeaderType)),
+       sizeof(OdmrpIpOptionType));
+   return OdmrpIpOption;
+}
+
+/*
+ */
+void SetOdmrpIpOptionField(
+        Message* msg, const OdmrpIpOptionType* OdmrpIpOption)
+{
+   IpOptionsHeaderType* ipOption =
+       FindAnIpOptionField((IpHeaderType*)msg->packet, IPOPT_ODMRP);
+   memcpy(((char*)ipOption + sizeof(IpOptionsHeaderType)), OdmrpIpOption,
+       sizeof(OdmrpIpOptionType));
+}
+
+

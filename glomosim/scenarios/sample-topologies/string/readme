@@ -1,0 +1,3 @@
+This directory demonstrates how to set up a string topology consisting
+of 6 nodes with TELNET traffic (from tcplib) between node 0 and node 5.
+

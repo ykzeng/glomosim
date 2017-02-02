@@ -1,0 +1,348 @@
+-----------------------------------------------------------------------
+FILENAME: CodingGuidelines
+
+PURPOSE:  This file gives the coding guidelines for all
+          coding in GloMoSim. We encourage people to
+          contribute their code, and this coding guidelines
+          help us integrate any code into the GloMoSim
+          distribution as well as improve the readability
+          and maintainability of the entire code. The rules
+          are simple and flexible, but if you find something
+          annoying, please let us know.
+
+AUTHORS:  Jay Martin
+          Lokesh Bajaj
+
+
+-----------------------------------------------------------------------
+CHANGES:
+
+Version 1.0 (9/1/99)
+
+-- The guidelines are loosened a bit.
+
+-- GloMoSim legalese header is now tacked on by the release scripts, 
+   no longer needed in every file.  
+
+-----------------------------------------------------------------------
+
+
+Here are the coding guidelines:
+
+General:
+   In general, try to emulate the coding style of the source
+file you are modifying so as that it looks somewhat consistent
+(or modify it to make it fairly consistent).  New subsystem
+source and source code from outside can be more varied.  
+Also, the purpose of these guidelines is to provide readability
+and informative comments and not win any "Most Anal Code Formatting
+Awards".
+
+
+Naming:
+
+   Use long, descriptive and easily read procedure and variable names.
+   Try not to use abbreviations or encodings.   Use real words
+   in variable names like "Header" not "Hdr".  Single character names
+   are highly discouraged except for loop counters and stuff.
+
+
+   -- Use  "YadaYadaYada" or "yadaYadaYada" or "yada_yada_yada" or 
+      "Yada_Yada_Yada" capitalization styles for identifiers. 
+       
+   -- Macro constants should be upper case letters with underlines.
+
+   -- Identifiers for functions performing an action should contain 
+       a verb, for example, InitializeValues, CreateQueue etc.
+
+   -- Identifiers for boolean functions or variables should have 
+      "Is" or "Has" in their name.  For example, IsOccupied.
+
+   -- Don't start identifiers with "_" (like "_Yada") as this
+      usually means that it is a special system identifier.  
+      While we at it, don't end with a "_" either.
+
+Line Lengths:
+
+   Do not use more than 80 column width as wrapped lines are very
+   difficult to read. (We can can bump this limit to 90 or 100 or
+   whatever but we need have a hard top limit so that we set our
+   window widths and determine printer fonts.)
+
+
+No Multiple Statements per line:
+
+   In general, do not write more than one statement on each line.  Try
+   not to use gratuitous side-effects in expressions, i.e. "i++" when
+   that could be put on the next line by itself.
+
+Commenting:
+
+   Parsec can now do superior C++ style comments, i.e. "// Yada <eol>.
+   So you can use either /* */ or // comments.
+
+
+   -- Block Comments. Block comments are on separate lines from
+      code. They are indented to the same level as the code they are
+      in. Here's the format for block comments:
+
+      //
+      // This is a block comment. First line.
+      // This is a block comment. Second line.
+      // This is a block comment. Third line.
+      // This is a block comment. Fourth line.
+      //
+
+   or
+
+      /*
+       * This is a block comment. First line.
+       * This is a block comment. Second line.
+       * This is a block comment. Third line.
+       * This is a block comment. Fourth line.
+       */
+
+
+
+Recommended Layout Of Source Files:
+
+   -- There should be a block comment giving the filename, 
+      its purpose, and perhaps a revision history.
+   
+   -- For header files, there should always be a 
+      #ifndef HEADERFILE_H, #define HEADERFILE_H, #endif
+      block around the header to allow for multiple includes.
+
+   -- If a header file depends on another header file then it should
+      be explicitly #include'ed instead of depending on compilation
+      order.
+
+   -- Organize source files into a logical order, for example, 
+      group related functions together, etc.
+
+   -- Functions, types and macros that are only used
+      in a single file should be declared "static" 
+      and put in the source file and not in a header
+      file.
+
+   -- Functions, types and macros that are used by other source
+      files must be declared in a header.  
+      
+
+Function Commenting:
+
+    Precede every prototype by a block comment containing the function
+    name, a description of its purpose, what it returns and the
+    assumptions it makes. Optionally, you may also list each argument
+    and its effect if not already obvious from the description. For
+    Example:
+
+    // 
+    // FUNCTION:     IsEmptyQueue()
+    // PURPOSE:      Checks if the queue is empty. 
+    // RETURN VALUE: Returns True if the queue is empty
+    // ASSUMPTIONS:  None.
+    //
+
+
+Indentation:
+
+   Each nested piece of code should be indented by four(4) spaces.
+   TAB characters are not allowed and will be removed by the "expand"
+   command. For emacs, put "(setq-default indent-tabs-mode nil)" in
+   your ".emacs" file to eliminate TAB characters.  (Jay: I may have
+   an "editathon" and reduce this to 3 spaces (you will need the
+   extra space for all the long variable names you are going
+   to write)).
+
+
+   Various approved indentation styles:
+
+      while (ptr != NULL) {
+          ptr->data = 0;
+          ptr = ptr->next;
+      }
+     
+   or 
+
+      while ((ptr != NULL) && ....................................))  
+      {
+         ptr->data = 0;
+         ptr = ptr->next;
+      }
+
+   or
+
+      while ((Long___________________Expression) &&
+             (Another_Long___________Expression) &&
+             (Another_Long___________Expression)) 
+      {
+          // Code
+      }
+
+      
+      // Note for complex expressions match the parenthesis level above.
+    
+   and
+   
+      Just like "while" but has an "else" style:
+
+      if (.....) {
+          Statement
+      }
+      else {
+          Statement
+      }
+        
+   or
+     
+      if (.....) {
+          Statement
+      } else {
+          Statement
+      }
+
+   and
+ 
+      do {
+          statement1;
+          statement2;
+      } while (BooleanCondition);
+
+   and
+
+      switch () {
+      case 1: {
+          ...
+          break;
+      }
+      case 2: {
+          ...
+          break:
+      }
+      default: {
+          Write Error.
+          abort();
+      }
+      }//switch// 
+ 
+   and 
+
+
+      FunctionName(Parm1, Parm2, Parm3);
+     
+   or
+
+      FunctionName(
+          Parm1, Parm2, Parm3);
+
+   or
+
+      FunctionName(
+          Parm1,
+          Parm2,
+          Parm3);           
+
+   or  
+     
+      FunctionName(Parm1,     // The problem with this style is with
+long
+                   Parm2,     // identifier names and changing function 
+                   Parm3);    // names.
+                   
+
+   ********* Annoying indentation styles we don't want to see **********
+   ********* (To be added as we see them)                    **********
+
+
+      if (Condition)  //*** Nope!  
+          {
+          }
+        
+      if (Condition)  //*** Nope. Use braces on if's (see below).
+         Statement;
+
+
+
+Always Use Braces On if/else, while, for, etc. Statements:
+   
+   Like the title says.
+
+
+Switch Default Case:
+
+   In switch-statements, the default case is not enforced by the
+   language. But it should always be included. The default case can
+   sometimes be used to signal an error.
+
+
+Don't excessively rely on C's operator precedence levels.
+   
+   If the code would be confusing to a C newbie, then add parenthesis.
+   This of course must be balanced against possible negative readability 
+   consequences of having too many parenthesis.
+   
+    
+Parenthesize all parameters in macros:
+
+   BAD:  #define SQUARE(x)   x*x
+   GOOD: #define SQUARE(x)   ((x)*(x))
+   (A basic C gottcha).
+ 
+
+Use enumerated constants to give names to a set of flags:
+
+   BAD:
+        #define  INTEGER    0
+        #define  CHAR       1
+        #define  FLOAT      2
+        #define  DOUBLE     3
+   GOOD:
+        typedef enum {
+            Integer,
+            Char,
+            Float,
+            Double
+        } DataType;
+
+   There is less of a reason to use enumerated types when the
+   values must be specific integer values set by a network standard. 
+      
+
+
+
+Portability on NT
+-----------------
+
+1. In Windows NT there is no  <strings.h> header file. So, this should
+not be used. <string.h> though is a valid include file on NT.
+
+2. Also, <values.h> is not a valid include file on NT. 
+
+3.   NT does not have  {d,  e, l, n}rand48()   since they are not ANSI
+standard functions. Replacing  {e, n}rand48() with  pc_{e, n}rand() is
+straightforward because  these   two take   seeds,  but changing   {d,
+l}rand48() to pc_{e, n}rand() is a lot of work. But because Lokesh put
+seeds for every node, changing unseeded functions to seeded ones might
+be easier in the new framework.
+
+4. Functions like bcopy() and bzero() are non-ANSI standard functions
+and should not be used. Instead use the functions memcpy() and memset()
+which are ANSI standard functions.
+Converting bcopy() and bzero() is straightforward:
+bcopy(A, B, C) = memcpy(B, A, C)
+bzero(A, B)    = memset(A, 0, B)
+
+5. The only thing required for Visual C++ is to change the declaration
+of packed structures. Visual C++ does not compile the following 
+declaration that is valid in ANSI standard:
+
+struct PackedType {
+    char a:4;  /* this field has only 4 bits */
+    char b:4;  /* this field has only 4 bits */
+    char c;    /* this field has 8 bits */
+}; /* the size of this structure is 16 bits */
+
+
+
+

@@ -1,0 +1,1725 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: wrp.pc,v 1.15 1999/10/14 07:32:30 jmartin Exp $
+ *
+ * PURPOSE:         Simulate the WRP routing protocol.
+ *
+ * NOTES:           This implementation is based upon the pseudocode in:
+ *                       S. Murthy and J.J. Garcia-Luna-Aceves, 
+ *                       "An Efficient Routing Protocol for Wireless
+ *                       Networks", ACM Mobile Networks and Applications 
+ *                       Journal, Special issue on Routing in Mobile
+ *                       Communication Networks, 1996.
+ *
+ *                  This pseudocode has been included below, with remarks
+ *                  that indicate where and why deviations were made.
+ *
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "nwcommon.h"
+#include "app_util.h"
+#include "wrp.h"
+
+/***/
+#define WRP_HELO_TIME   1*SECOND 
+#define WRP_RETX_TIME   1*SECOND
+#define WRP_XMIT_TIME   1*SECOND
+#define WRP_MAX_HELLO   6
+#define WRP_MAX_RETX    4
+
+/*
+#define DEBUGOUTPUT
+/*
+#define DEBUG
+*/
+
+#define SHOWTABLES
+
+static void WrpInitStats(GlomoNode *node);
+
+static int packPayload(GlomoNode *node);
+static void unpackPayload(GlomoNode *node);
+static int NewNeighbor(GlomoNode *node, int k);
+static int MinEntry(GlomoNode *node, NODE_ADDR dest);
+static void setTimer(GlomoNode *node, int type, int k, clocktype delay);
+
+static void Init1(GlomoNode *node);
+static void Init2(GlomoNode *node,NODE_ADDR j, NODE_ADDR x);
+static void Messge(GlomoNode *node, NODE_ADDR k, int cost);
+static void DT(GlomoNode *node, const WrpTuple D, int k);
+static void Update(GlomoNode *node, const WrpTuple V[], int Vct, int k);
+static void ACK(GlomoNode *node, const WrpTuple V[], int Vct, int k);
+static void RT_Update(GlomoNode *node, int j);
+static void Connectivity(GlomoNode *node, int k);
+static void addTuple(GlomoNode *node, WrpTuple W, int *response);
+static void broadcastUpdateMsg(GlomoNode *node, NODE_ADDR dest,
+                               clocktype delay);
+static void Clean_RList(GlomoNode *node, int seqno);
+static void Delete_RList(GlomoNode *node, int seqno,int k);
+static void Create_RList(GlomoNode *node, int valid);
+static void printDTable(GlomoNode *node);
+static void printRTable(GlomoNode *node);
+static void printLTable(GlomoNode *node);
+
+void RoutingWrpInit(GlomoNode *node, const GlomoNodeInput *nodeInput)
+{
+    clocktype delay;
+    int count, count2;
+    GlomoRoutingWrp *wrp;
+    WrpMrlTuple *head,*temp;
+    long retVal;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+#ifdef DEBUG
+    printf("#%u: RoutingWrpInit\n",node->nodeAddr);
+#endif
+    wrp = (GlomoRoutingWrp *) pc_malloc(sizeof(GlomoRoutingWrp));
+    assert(wrp);
+    node->appData.routingVar = (void *) wrp;
+
+    if (node->appData.routingStats == TRUE)
+    {
+        WrpInitStats(node);
+    }
+
+    wrp->DTable = pc_malloc(sizeof(DistTable)*node->numNodes);
+    wrp->RTable = pc_malloc(sizeof(RouteTable)*node->numNodes);
+    wrp->LTable = pc_malloc(sizeof(LCTable)*node->numNodes);
+
+    wrp->N = pc_malloc(sizeof(int)*node->numNodes);
+    wrp->Ni = pc_malloc(sizeof(int)*node->numNodes);
+
+    wrp->LISTmax = MIN( (node->numNodes*2),
+        ((MAX_NW_BROADCAST_RT_SIZE-sizeof(int)*node->numNodes
+          -sizeof(WrpPacketHeader))/sizeof(WrpTuple)) );
+    wrp->LISTmax = wrp->LISTmax - 1;
+#ifdef DEBUG
+    printf("LISTmax = %d\n",wrp->LISTmax);
+#endif
+    wrp->LIST = pc_malloc(sizeof(WrpTuple)*wrp->LISTmax);
+    wrp->LISTct = 0;    
+    wrp->V = pc_malloc(sizeof(WrpTuple)*wrp->LISTmax);
+    wrp->Vct = 0;
+    wrp->responseList = pc_malloc(sizeof(int)*node->numNodes);
+    wrp->wpkt = pc_malloc(sizeof(WrpPacket));
+
+    wrp->MRL = pc_malloc(sizeof(WrpMrlEntry)*WRP_MAX_SEQ_NUM);
+
+    if ((!wrp->DTable) || (!wrp->RTable) || (!wrp->LTable) || 
+        (!wrp->N) || (!wrp->Ni) || (!wrp->LIST) || (!wrp->V) ||
+        (!wrp->responseList) || (!wrp->wpkt) || (!wrp->MRL)) {
+        printf("Error allocating memory for node #%u\n",node->nodeAddr);
+        assert(FALSE);
+    }
+    memset(wrp->DTable, 0, sizeof(DistTable)*node->numNodes);
+    for (count=0; count < node->numNodes; count++) {
+        wrp->DTable[count].dat = pc_malloc(sizeof(DistEntry)*node->numNodes);
+        if (!wrp->DTable[count].dat) {
+            printf("Not enough memory for node #%u\n",node->nodeAddr);
+            assert(FALSE);
+        }
+        memset(wrp->DTable[count].dat, 0, sizeof(DistEntry)*node->numNodes);
+    }
+/*
+    for (count=0; count < WRP_MAX_SEQ_NUM; count++) {
+        wrp->MRL[count].bitmap = pc_malloc(sizeof(NODE_ADDR)*node->numNodes);
+        wrp->MRL[count].dat = pc_malloc(sizeof(WrpTuple)*wrp->LISTmax);
+        if ((!wrp->MRL[count].bitmap) || (!wrp->MRL[count].dat)) {
+            printf("Not enough memory for node #%u\n",node->nodeAddr);
+            assert(FALSE);
+        }
+        memset(wrp->MRL[count].bitmap, 0, sizeof(NODE_ADDR)*node->numNodes);
+        memset(wrp->MRL[count].dat, 0, sizeof(WrpTuple)*node->numNodes);
+    }
+*/
+    memset(wrp->RTable, 0, sizeof(RouteTable)*node->numNodes);
+    memset(wrp->LTable, 0, sizeof(LCTable)*node->numNodes);
+
+    memset(wrp->N, 0, sizeof(int)*node->numNodes);
+    memset(wrp->Ni, 0, sizeof(int)*node->numNodes);
+
+    memset(wrp->LIST, 0, sizeof(WrpTuple)*node->numNodes);
+    memset(wrp->responseList, 0, sizeof(int)*node->numNodes);
+    memset(wrp->wpkt, 0, sizeof(WrpPacket));
+
+    for (count=0; count < WRP_MAX_SEQ_NUM; count++)
+    {
+        wrp->MRL[count].MRLsize = 0;
+    }
+
+/* 6/26/99 */
+    for (count=0; count < node->numNodes; count++)
+    {
+        wrp->RTable[count].dist = WRP_INFINITY;
+        wrp->RTable[count].pred = -1;
+        wrp->RTable[count].succ = -1;
+    }
+    for (count = 0; count < node->numNodes; count++)
+    {
+        wrp->DTable[count].dest = count;
+        for (count2 = 0; count2 < node->numNodes; count2++)
+        {
+            wrp->DTable[count].dat[count2].via = count2;
+            wrp->DTable[count].dat[count2].dist = WRP_INFINITY;
+            wrp->DTable[count].dat[count2].pred = -1;
+            wrp->DTable[count].dat[count2].valid = 0;
+        }
+    }
+/***********/
+    Init1(node);
+/***/
+
+}
+
+
+void RoutingWrpLayer(GlomoNode *node, Message *msg)
+{
+    /*
+     * Retrieve the pointer to the data portion which relates
+     * to the NETWORK protocol.
+     */
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+
+    switch (msg->eventType) {
+    case MSG_APP_FromTransport: {
+
+        WrpPacket *packet;
+        char clockStr[80];
+        void *bptr;
+        int size;
+
+        packet = (WrpPacket *) GLOMO_MsgReturnPacket(msg);
+/* OLD
+        memcpy(wrp->wpkt,packet,sizeof(WrpPacket));
+*/
+/* 6/30/99 */
+        size = MIN(GLOMO_MsgReturnPacketSize(msg), sizeof(WrpPacket));
+        memcpy(wrp->wpkt, packet, size);
+/***********/
+
+
+        if (node->appData.routingStats == TRUE)
+        {
+            wrp->stats.numFromTransport++;
+        }
+
+        if (wrp->wpkt->hdr.msgType == WRP_RT)
+        {
+#ifdef DEBUG
+            ctoa(simclock(),clockStr);
+            printf("#%u: valid=%d, from=%d, seqNum=%d at %s\n",node->nodeAddr,
+                   wrp->wpkt->hdr.valid, wrp->wpkt->hdr.k, 
+                   wrp->wpkt->hdr.seqNum,clockStr);
+#endif
+            unpackPayload(node);
+            Messge(node, wrp->wpkt->hdr.k, WRP_COST);
+        }
+        else
+            assert(FALSE);
+
+        GLOMO_MsgFree(node, msg);
+        break;
+    }
+    case MSG_APP_TimerExpired: {
+        WrpTimer *wt;
+        clocktype delay;
+        char buf[GLOMO_MAX_STRING_LENGTH];
+
+        wt = (WrpTimer *) GLOMO_MsgReturnInfo(msg);
+
+        switch (wt->timerType) {
+        case WRP_XMIT_TIMER: {
+#ifdef DEBUG
+            ctoa(simclock(),buf);
+            printf("#%u: WRP_XMIT_TIMER Expired at %s\n",node->nodeAddr, buf);
+#endif
+            delay = (clocktype) WRP_XMIT_TIME;
+            delay *= pc_erand(node->seed);
+
+            setTimer(node,WRP_XMIT_TIMER,0,(clocktype) delay);
+
+            if (wrp->LISTct > 0)
+                broadcastUpdateMsg(node,ANY_DEST,0);
+
+            break;
+        }
+        case WRP_HELO_TIMER: {
+            if (wrp->LTable[wt->k].HelloTimer <= simclock())
+            {
+#ifdef DEBUG
+                printf("#%u: Expired HelloTimer to %d.\n",
+                       node->nodeAddr,wt->k);
+#endif
+                Connectivity(node,wt->k);
+            }
+            else
+            {
+#ifdef DEBUG
+                printf("#%u: Reset HelloTimer for %d\n",node->nodeAddr,wt->k);
+                ctoa((wrp->LTable[wt->k].HelloTimer-simclock()),buf);
+                printf("#%u:   %s ticks remaining.\n",node->nodeAddr,buf);
+#endif
+                setTimer(node,WRP_HELO_TIMER,wt->k,
+                    (clocktype)(wrp->LTable[wt->k].HelloTimer-simclock()));
+            }
+            break;
+        }
+        case WRP_RETX_TIMER: {
+            int count, count2, count3;
+            WrpMrlTuple *head,*temp;
+            WrpTuple W;
+            int *response = pc_malloc(sizeof(int)*node->numNodes);
+/* wsu addition */
+            WrpMrlEntry tempMRL;
+
+            assert(response);
+ 
+#ifdef DEBUG
+            printf("#%u: RetxTimer expired.\n",node->nodeAddr);
+#endif
+
+            setTimer(node,WRP_RETX_TIMER,0,(clocktype) WRP_RETX_TIME);
+
+            /* decrement retx counters for outstanding MRL entries */
+            for (count=0; count < WRP_MAX_SEQ_NUM; count++)
+            {
+                if ((wrp->SEQNO != count) &&(wrp->MRL[count].MRLsize > 0))
+                {
+                    wrp->MRL[count].retx_counter--;
+                    if (wrp->MRL[count].retx_counter==0)
+                    {
+#ifdef DEBUG
+                        printf("#%u: Need to retx %d\n",node->nodeAddr,count);
+#endif
+                        wrp->MRL[count].retx_counter = WRP_MRL_RETX_CONST;
+                        for (count3=0; count3<node->numNodes; count3++)
+                            response[count3] = wrp->MRL[count].bitmap[count3];
+                        /* wsu addition */
+                        tempMRL.dat = pc_malloc(sizeof(WrpTuple)*wrp->MRL[count].MRLsize);
+
+                        for (count2=0;count2<wrp->MRL[count].MRLsize;count2++)
+                           tempMRL.dat[count2] =  wrp->MRL[count].dat[count2];
+
+                        tempMRL.MRLsize = wrp->MRL[count].MRLsize;
+
+                        for (count2=0;count2<tempMRL.MRLsize;count2++)
+                        {
+                            W = tempMRL.dat[count2];
+                            addTuple(node,W,response);
+                        }
+
+                        Clean_RList(node,count);
+                        pc_free(tempMRL.dat);
+
+                    }
+                    
+                }
+            }
+            pc_free(response);
+            break;
+        }
+        case WRP_INIT_TIMER: {
+            int *ZeroList;
+            WrpTuple W;
+            int *response = pc_malloc(sizeof(int)*node->numNodes);
+
+            ZeroList = pc_malloc(sizeof(int)*node->numNodes);
+            if ((!ZeroList)||(!response)) {
+                printf("Not enough memory.\n");
+                assert(FALSE);
+            }
+            memset(ZeroList, 0, sizeof(int)*node->numNodes);
+            if (memcmp(ZeroList,wrp->Ni,sizeof(int)*node->numNodes) == 0) {
+#ifdef DEBUG
+                printf("NO NEIGHBORS YET.\n");
+#endif
+                W.u = 0;
+                W.j = node->nodeAddr;
+                W.RDkj = 0;
+                W.rpkj = node->nodeAddr;
+                memset(response, 0, sizeof(int)*node->numNodes);
+                addTuple(node,W,response);
+                setTimer(node,WRP_INIT_TIMER,0,(clocktype) WRP_HELO_TIME);
+
+
+            }
+            pc_free(ZeroList);
+            pc_free(response);
+            break;
+        }
+        default:
+            assert(FALSE);
+        }
+        GLOMO_MsgFree(node, msg);
+        break;
+    }
+    default:
+        printf("Unknown Message Type\n");
+        break;
+    }
+
+}
+
+
+void WrpPrintRoutingStats(GlomoNode *node)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    float averageHopCount;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+    sprintf(buf, "Number of routing packets sent = %d",
+            wrp->stats.numRTsent);
+    GLOMO_PrintStat(node, "RoutingWrp", buf);
+
+    sprintf(buf, "Number of routing packets recvd = %d",
+            wrp->stats.numFromTransport);
+    GLOMO_PrintStat(node, "RoutingWrp", buf);
+
+}
+
+void RoutingWrpFinalize(GlomoNode *node)
+{
+#ifdef DEBUGOUTPUT
+   printDTable(node);
+   printRTable(node);
+   printLTable(node);
+#endif
+
+#ifndef DEBUGOUTPUT
+    #ifdef SHOWTABLES
+        printDTable(node);
+        printRTable(node);
+        printLTable(node);
+    #endif
+#endif
+
+    if (node->appData.routingStats == TRUE)
+    {
+        WrpPrintRoutingStats(node);
+    }
+
+}
+
+static void WrpInitStats(GlomoNode *nodePtr)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)nodePtr->appData.routingVar;
+
+
+    /* Total number of RT packets sent */
+    wrp->stats.numRTsent = 0;
+
+    /* Total number of packets received from Transport Layer. */
+    wrp->stats.numFromTransport = 0;
+
+}
+
+int packPayload(GlomoNode *node)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    void *bptr;
+    char buf[MAX_NW_PAYLOAD_SIZE];
+    int psize;
+
+    psize = 0;
+    memset(buf, 0, sizeof(char)*MAX_NW_PAYLOAD_SIZE);
+    
+    bptr = (void *)buf;
+    memcpy(bptr,(void *)wrp->responseList, sizeof(int)*node->numNodes);
+    memcpy(bptr,(void *)wrp->responseList, sizeof(int)*node->numNodes);
+    bptr = (void *) ((int) bptr + sizeof(int)*node->numNodes);
+    psize += sizeof(int) * node->numNodes;
+    memcpy(bptr,(void *)wrp->LIST, sizeof(WrpTuple)*wrp->LISTct);
+    bptr = (void *) ((int) bptr + (sizeof(WrpTuple)*wrp->LISTct));
+    psize += sizeof(WrpTuple) * wrp->LISTct;
+
+    memcpy(wrp->wpkt->payload, buf, psize);
+    wrp->wpkt->hdr.packetSize = psize;
+    wrp->wpkt->hdr.msgType = WRP_RT;
+    wrp->wpkt->hdr.k = node->nodeAddr;
+    wrp->wpkt->hdr.valid = wrp->LISTct;
+    wrp->wpkt->hdr.seqNum = wrp->SEQNO;
+    wrp->wpkt->hdr.timestamp = simclock();
+
+    return psize+sizeof(WrpPacketHeader);
+}
+
+void unpackPayload(GlomoNode *node)
+{
+    void *bptr;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    int count;
+
+    bptr = (void *)wrp->wpkt->payload;
+    memcpy(wrp->responseList, bptr, sizeof(int)*node->numNodes);
+    wrp->ACKthis = wrp->responseList[node->nodeAddr];
+    bptr = (void *) ((int) bptr + sizeof(int)*node->numNodes);
+    memcpy(wrp->V, bptr, sizeof(WrpTuple)*wrp->wpkt->hdr.valid);
+    wrp->Vct = wrp->wpkt->hdr.valid;
+    bptr = (void *) ((int) bptr + sizeof(WrpTuple)*wrp->wpkt->hdr.valid);
+
+#ifdef DEBUG
+    for (count=0; count < wrp->Vct; count++)
+        printf("(%d,%d,%d,%d)\n",wrp->V[count].u, wrp->V[count].j,
+               wrp->V[count].RDkj, wrp->V[count].rpkj);
+#endif
+
+}
+
+int NewNeighbor(GlomoNode *node, int k)
+{
+    int count;
+    int X = 1;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+    if (wrp->Ni[k]==0) /* not even a neighbor */
+        X = 0;
+    for (count=0; count<node->numNodes; count++)
+        if ((count!=k)&&(wrp->DTable[count].dat[k].dist<WRP_INFINITY))
+            X = 0;
+    return X;
+}
+
+int MinEntry(GlomoNode *node, NODE_ADDR dest)
+{
+    int b,
+        MinVal = WRP_INFINITY,
+        MinInd = -1;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+    for (b=0; b < node->numNodes; b++)
+      if ((b!=node->nodeAddr) && (wrp->Ni[b]==1))
+         if ( wrp->DTable[dest].dat[b].dist <= MinVal )
+         {
+            MinVal = wrp->DTable[dest].dat[b].dist;
+            MinInd = b;
+         }
+#ifdef DEBUG
+   printf("#%u: Min Dist from %u-%u is %d thru %d\n",
+          node->nodeAddr,node->nodeAddr,dest,MinVal,MinInd);
+#endif
+   return MinInd;
+}
+
+void setTimer(GlomoNode *node,int type, int k, clocktype delay)
+{
+    WrpTimer *wt;
+    Message *newMsg;
+/*
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+*/
+
+    newMsg =  GLOMO_MsgAlloc(node,
+                             GLOMO_APP_LAYER,
+                             APP_ROUTING_WRP,
+                             MSG_APP_TimerExpired);
+
+    GLOMO_MsgInfoAlloc(node, newMsg, sizeof(WrpTimer));
+    wt = (WrpTimer *) GLOMO_MsgReturnInfo(newMsg);
+
+    wt->timerType = type;
+    wt->k = k;
+    
+    GLOMO_MsgSend(node, newMsg, delay);
+/*
+    GLOMO_SendMsg(node,GLOMO_NETWORK_LAYER, MSG_NETWORK_CheckTimeoutAlarm,
+                  &wt, sizeof(WrpTimer), delay);
+*/
+
+
+}
+
+void Init1(GlomoNode *node)
+{
+    clocktype delay;
+    int count;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    
+    wrp->wpkt->hdr.seqNum = 0;
+    wrp->SEQNO = 0;
+    /* set a link state table with costs of adjacent links
+     * Julian: assume none known at startup
+     * N <- i ; Ni <- x | l(i)x < INFINITY
+     */
+    wrp->N[node->nodeAddr] = 1;
+    
+    /* for each x in Ni:
+     *     Ni <- Ni U x ; tag(i)x <- null ;
+     *     s(i)x <- null ; p(i)x <- null ; D(i)x <- INFINITY 
+     */
+
+    /* D(i)i <- 0 ; s(i)i <- null ; p(i)i <- null ; 
+     * tag(i)i <- correct */
+    wrp->RTable[node->nodeAddr].dest = node->nodeAddr;
+    wrp->RTable[node->nodeAddr].dist = 0;
+    wrp->RTable[node->nodeAddr].succ = -1;
+    wrp->RTable[node->nodeAddr].pred = -1;
+    wrp->RTable[node->nodeAddr].tag = 1;
+    
+    /* for each J in N, call Init2(x,j)
+     */
+
+    /* for each n in Ni, do add (0,i,0,i) to LISTi(n)
+     */
+
+    /* Julian: this will perform the initial HELLO msg */
+    wrp->LIST[0].u = 0;
+    wrp->LIST[0].j = node->nodeAddr;
+    wrp->LIST[0].RDkj = 0;
+    wrp->LIST[0].rpkj = node->nodeAddr;
+    wrp->LISTct = 1;
+    memset(wrp->responseList, 0, sizeof(int)*node->numNodes);
+    delay = (clocktype) 100 * MILLI_SECOND;
+    delay *= pc_erand(node->seed);
+
+    broadcastUpdateMsg(node,ANY_DEST,(clocktype) delay);
+
+    setTimer(node,WRP_INIT_TIMER,0,(clocktype) WRP_HELO_TIME);
+
+    /* x <- retx time ; y <- max hello count ; z >- max retx count
+     */
+    for (count=0; count<node->numNodes; count++) {
+        wrp->LTable[count].x = WRP_RETX_TIME;
+        wrp->LTable[count].y = WRP_MAX_HELLO; 
+        wrp->LTable[count].z = WRP_MAX_RETX;
+    }
+
+    /* Julian: start retransmission timer */
+/* OLD
+    setTimer(node,WRP_RETX_TIMER,0,(clocktype)WRP_RETX_TIME);
+*/
+    delay = (clocktype) WRP_RETX_TIME;
+    delay *= pc_erand(node->seed);
+    setTimer(node,WRP_RETX_TIMER,0,(clocktype)delay);
+
+    /* Julian: start transmission timer */
+    delay = (clocktype) WRP_XMIT_TIME;
+    delay *= pc_erand(node->seed);
+
+    setTimer(node,WRP_XMIT_TIMER,0,(clocktype) delay);
+
+}
+
+void Init2(GlomoNode *node, NODE_ADDR x, NODE_ADDR j)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+    /* D(i)jx <- INF ; p(i)jx <- null ; s(i)jx <- null ; seqno(i)jx <- 0
+     */
+    wrp->DTable[j].dest = j;
+    wrp->DTable[j].dat[x].via = x;
+    wrp->DTable[j].dat[x].dist = WRP_INFINITY;
+    wrp->DTable[j].dat[x].pred = -1;
+}
+
+void Messge(GlomoNode *node, NODE_ADDR k, int cost)
+{
+    /* when router i receives a message on link (i,k)
+     */
+
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    int x,
+        i,
+        j,
+        ULct = 0,
+        ALct = 0,
+        count,
+        count2;
+    clocktype delay;
+    WrpTuple *UpdList,
+              *AckList;
+    WrpTuple W;
+    int *response = pc_malloc(sizeof(int)*node->numNodes);
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    NODE_ADDR destId = k;
+
+/* OLD 
+    UpdList = pc_malloc(sizeof(WrpTuple)*node->numNodes);
+    AckList = pc_malloc(sizeof(WrpTuple)*node->numNodes);
+*/
+/* 6/30/99 */
+    UpdList = pc_malloc(sizeof(WrpTuple)*wrp->LISTmax);
+    AckList = pc_malloc(sizeof(WrpTuple)*wrp->LISTmax);
+/***********/
+
+
+    if ((!UpdList) || (!AckList) || (!response)) {
+        printf("WRP: Not enough memory.\n");
+        assert(FALSE);
+    }
+    memset(UpdList, 0, sizeof(WrpTuple)*node->numNodes);
+    memset(AckList, 0, sizeof(WrpTuple)*node->numNodes);
+
+    if (wrp->Ni[destId]==0)
+    {
+        /* Julian: initialize seqno here
+         */
+        wrp->LTable[destId].seqno = 0;
+
+#ifdef DEBUG
+        printf("#%d: %d not in Ni\n",node->nodeAddr,k);
+#endif
+        /* Ni <- Ni U k
+         */
+        wrp->Ni[destId] = 1;
+
+        /* Julian: Start HelloTimer rolling  
+         */
+        delay = (clocktype) WRP_XMIT_TIME;
+        delay *= pc_erand(node->seed);
+
+        setTimer(node,WRP_HELO_TIMER,k,(clocktype)(WRP_HELO_TIME+delay));
+
+        /* l(i)k <- cost of new link
+         */
+        wrp->LTable[destId].dest = k;
+        wrp->LTable[destId].dist = cost;
+
+        /* Julian: for each j in N, call Init2(k,j)
+         */
+        for (j=0; j<node->numNodes; j++)
+            if (wrp->N[j]==1)
+                Init2(node,destId,j);
+
+        /* Julian: since it is a neighbor, set the distance table
+         *     entry through itself, to itself, to the link cost
+         */
+        wrp->DTable[destId].dat[destId].dist = cost;
+        wrp->DTable[destId].dat[destId].pred = node->nodeAddr;
+
+        /* Julian: broadcast link up
+         */
+        W.u = 0;
+        W.j = k;
+        W.RDkj = cost;
+        W.rpkj = node->nodeAddr;
+
+        for (count=0; count<node->numNodes; count++)
+           if (wrp->Ni[count]==1)
+               response[count] = 1;
+           else
+               response[count] = 0;
+        response[k] = 0;
+        addTuple(node,W,response);
+
+        /* if k !in N, do
+         */
+        if (wrp->N[k]==0) {
+            /* N <- N U k ; tag(i)k <- null
+             */
+            wrp->N[k] = 1;
+            wrp->RTable[k].tag = 0;
+
+#ifdef DEBUG
+            printf("#%d: %d not in N either\n",node->nodeAddr,k);
+#endif
+            /* D(i)k <- INF ; p(i)k <- null ; s(i)k <- null
+             */
+            wrp->RTable[k].dest = k;
+            wrp->RTable[k].dist = WRP_INFINITY;
+            wrp->RTable[k].pred = -1;
+            wrp->RTable[k].succ = -1;
+
+            /* for each x in Ni, call Init2(x,k)
+             */
+            for (x=0; x<node->numNodes; x++)
+                if ((wrp->Ni[x]==1)&&(x!=k))
+                    Init2(node,x,k);
+        }
+#ifdef DEBUG
+        printf("FLASH UP THE RTABLE\n");
+#endif
+        for (count=0; count<node->numNodes; count++)
+        {
+            if ((wrp->N[count]==1)&&(count!=node->nodeAddr)) {
+                W.u = 0;
+                W.j = count;
+                W.RDkj = wrp->RTable[count].dist;
+                W.rpkj = wrp->RTable[count].pred;
+                for (i=0; i<node->numNodes; i++)
+                    if (wrp->Ni[i]==1)
+                        response[i] = 1;
+                    else
+                        response[i] = 0;
+
+                addTuple(node,W,response);
+            }
+        }
+    }
+    /* Reset HelloTimer
+     */
+    delay = (clocktype) WRP_XMIT_TIME;
+    delay *= pc_erand(node->seed);
+
+    wrp->LTable[k].HelloTimer = simclock() + WRP_HELO_TIME + delay;
+    wrp->LTable[k].HelloCount = 0;
+
+    
+    /* for each entry (u(k)j,j,RD(k)j,rp(k)j | i != j do 
+     */
+    for (count=0; count < wrp->Vct; count++)
+    {
+/*
+        printf("    (%d,%d,%d,%d)\n",wrp->V[count].u,
+               wrp->V[count].j, wrp->V[count].RDkj,
+               wrp->V[count].rpkj);
+*/
+
+        if ((node->nodeAddr != wrp->V[count].j)&&
+            (wrp->V[count].u==WRP_UPDATE)) {
+            ctoa(simclock(),clockStr);
+#ifdef DEBUG
+            printf("#%d: (%d,%d,%d,%d) from %d at %s\n",node->nodeAddr,
+                wrp->V[count].u, wrp->V[count].j, wrp->V[count].RDkj,
+                wrp->V[count].rpkj, k,clockStr);
+#endif
+
+            /* if j !in N 
+             */
+            if (wrp->N[wrp->V[count].j]==0) {
+                /* if RD(k)j = INF then delete entry 
+                 */
+                if (wrp->V[count].RDkj>=WRP_INFINITY) {
+                    for (count2=count; count2<(wrp->Vct-1); count2++) {
+#ifdef DEBUG
+                        printf("#%d: Discarding entry\n",node->nodeAddr);
+#endif
+                        wrp->V[count2].u = wrp->V[count2+1].u;
+                        wrp->V[count2].j = wrp->V[count2+1].j;
+                        wrp->V[count2].RDkj = wrp->V[count2+1].RDkj;
+                        wrp->V[count2].rpkj = wrp->V[count2+1].rpkj;
+                    }
+                    wrp->Vct--;
+                }
+                else {
+#ifdef DEBUG
+                    printf("#%d: Entry adds new node %d\n",node->nodeAddr,
+                        wrp->V[count].j);
+#endif
+                    /* N <- N U j
+                     */
+                    wrp->N[wrp->V[count].j] = 1;
+                    
+                    /* Julian: tag(i)j <- null 
+                     */
+                    wrp->RTable[wrp->V[count].j].tag = 0;
+                   
+                    /* Julian: D(i)j <- INF ; p(i)j <- null ; s(i)j <- null
+                     */
+                    wrp->RTable[wrp->V[count].j].dest = wrp->V[count].j;
+                    wrp->RTable[wrp->V[count].j].dist = WRP_INFINITY;
+                    wrp->RTable[wrp->V[count].j].pred = -1;
+                    wrp->RTable[wrp->V[count].j].succ = -1;
+
+                    /* for each entry x in Ni, call Init2(x,j)
+                     */
+                    for (x=0; x<node->numNodes; x++)
+                        if ((wrp->Ni[x]==1)&&(x!=wrp->V[count].j))
+                            Init2(node,x,wrp->V[count].j);
+
+                    /* Julian: for each x in N, x!=j, call Init2(j,x)
+                     */
+                    for (x=0; x<node->numNodes; x++)
+                        if ((wrp->N[x]==1)&&(x!=wrp->V[count].j))
+                            Init2(node,wrp->V[count].j,x);
+
+                    /* tag(i)j <- null ; call DT
+                     */
+                    wrp->RTable[wrp->V[count].j].tag = 0;
+                    DT(node, wrp->V[count], k);
+                }
+            }
+            else
+                /* tag(i)j <- null
+                 */
+                wrp->RTable[wrp->V[count].j].tag = 0;
+        }
+    }
+    /* for each entry left, i != j
+     */
+    for (count=0; count<wrp->Vct; count++)
+        if ((node->nodeAddr!=wrp->V[count].j)||(wrp->V[count].u==WRP_ACK)) {
+            switch (wrp->V[count].u) {
+            case WRP_UPDATE : {
+                UpdList[ULct] = wrp->V[count];
+                ULct++;
+                break;
+            }
+            case WRP_ACK : {
+               AckList[ALct] = wrp->V[count];
+               ALct++;
+               break;
+            }
+            default:
+                for (i=0; i<wrp->Vct; i++)
+                    printf("FAILURE on (%d,%d,%d,%d)\n",wrp->V[i].u,
+                    wrp->V[i].j, wrp->V[i].RDkj, 
+                    wrp->V[i].rpkj);
+                printf("count = %d\n",count);
+                assert(FALSE);
+            }
+        }
+    if (ULct > 0)
+        Update(node,UpdList,ULct,k);
+    if (ALct > 0)
+        ACK(node,AckList,ALct,k);
+
+    pc_free(UpdList);
+    pc_free(AckList);
+    pc_free(response);
+}
+
+void DT(GlomoNode *node, const WrpTuple D, int k)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    int j, Dkj, pkj, b, count;
+    
+    j = D.j;
+    Dkj = D.RDkj;
+    pkj = D.rpkj;
+    
+    /* Julian: ERROR- if pkj is same as dest node, as in hello msg, problem
+     */
+    if (pkj==j)
+        pkj = node->nodeAddr;
+
+    /* Julian: MODIFICATION- if this node receives a message regarding
+     *     a path to a destination, with a predecessor node which is a
+     *     neighbor to this one, that conflicts with the message that
+     *     said neighbor has previously sent, the update is invalid.
+     *     Updates about paths thru active neighbors, should come from
+     *     those neighbors first.
+     */
+    if (((wrp->Ni[pkj]==0) || (wrp->DTable[j].dat[pkj].dist<WRP_INFINITY) ||
+        (k==pkj) || (NewNeighbor(node,pkj)))
+        && ((pkj!=node->nodeAddr) || (wrp->Ni[j]==1))) {
+        /* D(i)jk <- l(i)k + D(k)j ; p(i)jk <- p(k)j 
+         */
+#ifdef DEBUG
+        printf("DT to %d via %d gets %d (link) + %d (entry)\n",j,k,
+            wrp->LTable[k].dist,Dkj);
+#endif
+        wrp->DTable[j].dat[k].dist = wrp->LTable[k].dist + Dkj;
+        wrp->DTable[j].dat[k].pred = pkj;
+    
+        /* for all neighbors b, Julian: b != k
+         */
+        for (b=0; b<node->numNodes; b++)
+            if ( (b!=node->nodeAddr) && (wrp->Ni[b]==1) && (b!=k) ) {
+                /* if k in path i-j in dist table thru neighb b
+                 */
+                if (wrp->DTable[j].dat[b].pred == k) {
+                    /* D(i)jb <- D(i)kb + D(k)j ; p(i)jb <- p(k)j
+                     */
+                    wrp->DTable[j].dat[b].dist = wrp->DTable[k].dat[b].dist +
+                        Dkj;
+                    wrp->DTable[j].dat[b].pred = pkj;
+                }
+            }
+    }
+#ifdef DEBUG
+    else
+        printf("#%d: EXCLUDED (%d,%d,%d) from %d\n",node->nodeAddr,
+            j,Dkj,pkj,k);
+#endif
+}
+
+void Update(GlomoNode *node, const WrpTuple V[], int Vct, int k)
+{
+    int count, b, j;
+    WrpTuple W;
+    int *response = pc_malloc(sizeof(int)*node->numNodes);
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+#ifdef DEBUG
+    printf("#%d: Update()\n",node->nodeAddr);
+#endif
+    assert(response);
+    /* send ACK to neighbor k, Julian: only if response_list warrants
+     */
+    if (wrp->ACKthis==1) {
+        W.u = WRP_ACK;
+        W.j = k;
+        W.RDkj = wrp->wpkt->hdr.seqNum;
+        W.rpkj = node->nodeAddr;
+        memset(response, 0, sizeof(int)*node->numNodes);
+        addTuple(node,W,response);
+    }
+#ifdef DEBUG
+    else
+        printf("No Need to ACK this msg.\n");
+#endif
+    /* update <- 0; RTEMPi <- 0; DTEMPi for all b <- 0
+     */
+    
+    /* for each triplet (j,D(k)j, p(k)j) in V(k,i), j != i do
+     */
+    for (count=0; count<Vct; count++)
+        if (V[count].j!=node->nodeAddr) {
+            DT(node,V[count],k);
+        }
+    for (count=0; count<Vct; count++) {
+        j = V[count].j;
+        for (b=0; b < node->numNodes; b++)
+        {
+            if ( (b==node->nodeAddr) || (wrp->Ni[b]==0) )
+                continue;
+            /* if there are b and j such that D(i)jb < D(i)j
+             * or D(i)jb > D(i)j and b==succ(i)j 
+             */
+            if (wrp->DTable[j].dat[b].dist<wrp->RTable[j].dist)
+            {
+#ifdef DEBUG
+                printf("#%d: Shorter path to %d found.\n",node->nodeAddr,j);
+#endif
+                RT_Update(node,j);
+            }
+            else if ((wrp->DTable[j].dat[b].dist > wrp->RTable[j].dist) &&
+                      (b == wrp->RTable[j].succ))
+            {
+#ifdef DEBUG
+                printf("#%d: Path to %j is now longer\n",node->nodeAddr,j);
+#endif
+                RT_Update(node,j);
+            }
+            else if ((b==wrp->RTable[j].succ)
+                    &&(wrp->DTable[j].dat[b].pred
+                    != wrp->RTable[j].pred))
+            {
+#ifdef DEBUG
+                printf("#%d: Path to %j switched predecessor nodes\n",
+                    node->nodeAddr);
+#endif
+                RT_Update(node,j);
+            }
+        }
+    }
+    pc_free(response);
+}
+
+static void ACK(GlomoNode *node, const WrpTuple V[], int Vct, int k)
+{
+    int count, b, j;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+#ifdef DEBUG
+    printf("#%d: ACK(V[],%d,%d)\n",node->nodeAddr,Vct,k);
+#endif
+    for (count=0; count < Vct; count++)
+    {
+#ifdef DEBUG
+        printf("    seqno#%d from router %d\n",V[count].RDkj, V[count].rpkj);
+#endif
+        if (node->nodeAddr==V[count].j)
+        {
+            /* call Delete_RList(n); */
+            Delete_RList(node,V[count].RDkj,V[count].rpkj);
+        }
+#ifdef DEBUG
+        else
+            printf("    Just overhearing ACK for another router.\n");
+#endif
+        /* RetransmissionCounter <- x */
+    }
+}
+
+void RT_Update(GlomoNode *node, int j)
+{
+    int *response = pc_malloc(sizeof(int)*node->numNodes);
+    WrpTuple W;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    int na, x, count, maxiter, i, do_rt_update;
+    NODE_ADDR predecessor;
+    int distance;
+
+    assert(response);
+    /* JJ */
+    wrp->RTable[node->nodeAddr].tag = 1;
+
+    /* find minimum of the distance entries DTmin
+     */
+    na = MinEntry(node,j);
+
+    /* if D(i)js(i)j = DTmin, then na <- s(i)j
+     */
+/* OLD
+    if ((wrp->RTable[j].succ >= 0) && 
+        (wrp->DTable[j].dat[wrp->RTable[j].succ].dist == 
+         wrp->DTable[j].dat[na].dist))
+        na = wrp->RTable[j].succ;
+*/
+/* 6/26/99 */
+    if (na > -1)
+        distance = wrp->DTable[j].dat[na].dist;
+    else
+        distance = WRP_INFINITY;
+    if ((wrp->RTable[j].succ >= 0) &&
+        (wrp->DTable[j].dat[wrp->RTable[j].succ].dist ==
+         distance))
+        na = wrp->RTable[j].succ;
+/***********/
+
+
+    /* else na <- b |b in Ni and D(i)jb = DTmin
+     * Julian: already done
+     */
+
+    /* x <- j
+     */
+    x = j;
+    
+    /* Julian: set maximum number of iterations to prevent infinite loop
+     */
+/* OLD
+    maxiter = wrp->DTable[x].dat[na].dist + 2;
+*/
+/* 6/26/99 */
+    if (na > -1)
+        distance = wrp->DTable[x].dat[na].dist;
+    else
+        distance = WRP_INFINITY;
+    maxiter = distance + 2;
+/***********/
+
+
+    /* while (D(i)xna = Min(D(i)xb for all b in Ni))
+     *   and (D(i)xna < INFINITY and tag(i)x == NULL
+     */
+    if (na>-1) {
+        while ((wrp->DTable[x].dat[na].dist
+              == wrp->DTable[x].dat[MinEntry(node,x)].dist) &&
+               (wrp->DTable[x].dat[na].dist < WRP_INFINITY) &&
+               (wrp->RTable[x].tag == 0) && (maxiter > 0))
+        {
+            /* x <- p(i)xna
+             */
+            x = wrp->DTable[x].dat[na].pred;
+            maxiter--;
+#ifdef DEBUG
+         printf("#%u: while loop x = %d\n",node->nodeAddr,x);
+#endif
+
+        }
+        /* if p(i)xna == i or tag(i)x == correct
+         * then tag(i)j = correct else tag(i)j = error
+         */
+/* OLD
+        if ( ((wrp->DTable[x].dat[na].pred == node->nodeAddr)
+              || (wrp->RTable[x].tag == 1))
+            &&(wrp->DTable[x].dat[na].dist
+              == wrp->DTable[x].dat[MinEntry(node,x)].dist))
+            wrp->RTable[j].tag = 1;
+        else
+            wrp->RTable[j].tag = -1;
+*/
+        if ( (wrp->DTable[x].dat[na].pred == node->nodeAddr) ||
+              (wrp->RTable[x].tag == 1))
+            wrp->RTable[j].tag = 1;
+        else
+            wrp->RTable[j].tag = -1;
+
+#ifdef DEBUG
+        printf("TAG = %s\n",(wrp->RTable[j].tag == 1 ? "GOOD" : "BAD"));
+#endif
+    }
+    if (wrp->RTable[j].tag == 1)
+    {
+        /* if D(i)j != DTmin or p(i)j != p(i)jna then */
+/* OLD
+        if ( (wrp->RTable[j].dist != wrp->DTable[j].dat[na].dist) ||
+             (wrp->RTable[j].pred != wrp->DTable[j].dat[na].pred) )
+*/
+/* 6/26/99 */
+        if (na > -1)
+        {
+            distance = wrp->DTable[j].dat[na].dist;
+            predecessor = wrp->DTable[j].dat[na].pred;
+        }
+        else
+        {
+            distance = WRP_INFINITY;
+            predecessor = -1;
+        }
+        if ( (wrp->RTable[j].dist != distance) ||
+             (wrp->RTable[j].pred != predecessor) )
+/***********/
+        {
+#ifdef DEBUG
+            printf("#%u: Routing Table Entry for %d Changed.\n",
+               node->nodeAddr,j);
+#endif
+            /* D(i)j <- DTmin; p(i)j <- p(i)jna ; s(i)j <- na */
+/* OLD
+            wrp->RTable[j].dist = wrp->DTable[j].dat[na].dist;
+            wrp->RTable[j].pred = wrp->DTable[j].dat[na].pred;
+            wrp->RTable[j].succ = na;
+*/
+/* 6/26/99 */
+            wrp->RTable[j].dist = distance;
+            wrp->RTable[j].pred = predecessor;
+            wrp->RTable[j].succ = na;
+/***********/
+
+            /* Update Network Forwarding Table */
+            NetworkUpdateForwardingTable(node, j, DEFAULT_INTERFACE, na);
+
+            /* seqno <- seqno + 1 
+             */
+            wrp->LTable[wrp->RTable[j].succ].seqno++;
+            /* add (0,j,DTmin,p(i)jna,seqno) to LISTi(x) for all x in Ni 
+             */
+            W.u = 0;
+            W.j = j;
+            W.RDkj = wrp->DTable[j].dat[na].dist;
+            W.rpkj = wrp->DTable[j].dat[na].pred;
+            for (count=0; count < node->numNodes; count++)
+                if (wrp->Ni[count] == 1)
+                    response[count] = 1;
+                else
+                    response[count] = 0;
+            response[j] = 0;
+            addTuple(node,W,response);
+            for (count=0;count<node->numNodes;count++)
+            {
+                if ((count!=node->nodeAddr)&&(wrp->Ni[count]!=1)
+                   &&(wrp->RTable[count].dist>=WRP_INFINITY))
+                {
+                    do_rt_update = 0;
+                    for (i=0;i<node->numNodes;i++)
+                        if ((i!=node->nodeAddr)&&(i!=count)&&(wrp->Ni[i]==1))
+                        {
+                            if (((wrp->DTable[count].dat[i].dist<WRP_INFINITY)
+                               &&(wrp->DTable[count].dat[i].pred==j)) ||
+                               (do_rt_update == 1))
+                                do_rt_update = 1;
+                            else
+                                do_rt_update = 0;
+                        }
+                    if (do_rt_update==1)
+                    {
+#ifdef DEBUG
+                        printf("#%d: Need RT_Update(%d)\n",node->nodeAddr,count);
+#endif
+                        wrp->RTable[count].tag = 0;
+                        RT_Update(node,count);
+                    }
+                }
+            }
+        }
+        else
+        {
+            /* D(i)j <- DTmin; p(i)j <- p(i)jna ; s(i)j <- na */
+            wrp->RTable[j].dist = wrp->DTable[j].dat[na].dist;
+            wrp->RTable[j].pred = wrp->DTable[j].dat[na].pred;
+            wrp->RTable[j].succ = na;
+
+            /* Update Network Forwarding Table */
+            NetworkUpdateForwardingTable(node, j, DEFAULT_INTERFACE, na);
+        }
+    }
+    else {
+#ifdef DEBUG
+        printf("#%d: No Path to %d\n",node->nodeAddr,j);
+#endif
+        /* if D(i)j < INF then begin */
+        if (wrp->RTable[j].dist < WRP_INFINITY)
+        {
+            /* seqno <- seqno + 1 */
+            /* add (0,j,INF,null,seqno) to LISTi(x) for all x in Ni */
+            W.u = 0;
+            W.j = j;
+            W.RDkj = WRP_INFINITY;
+            W.rpkj = -1;
+            for (count=0; count<node->numNodes; count++)
+                if (wrp->Ni[count]==1)
+                    response[count]=1;
+                else
+                    response[count]=0;
+
+            addTuple(node,W,response);
+            /* call Clean_RList(seqno) */
+
+            for (count=0; count < WRP_MAX_SEQ_NUM; count++)
+                if (wrp->MRL[count].MRLsize > 0)
+                    Delete_RList(node,count,j);
+            /* call Create_RList(seqno) */
+        }
+        /* D(i)j <- INF ; p(i)j <- null ; s(i)j <- null */
+        wrp->RTable[j].dist = WRP_INFINITY;
+        wrp->RTable[j].pred = -1;
+        wrp->RTable[j].succ = -1;
+
+        /* Update Network Forwarding Table */
+        NetworkUpdateForwardingTable(
+            node, j, DEFAULT_INTERFACE, NETWORK_UNREACHABLE);
+
+    }
+    pc_free(response);
+}
+
+void Connectivity(GlomoNode *node, int k)
+{
+    int count;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    WrpTuple W;
+    int *response = pc_malloc(sizeof(int)*node->numNodes);
+    clocktype delay;
+    int *ZeroList;
+
+    assert(response);
+#ifdef DEBUGOUTPUT
+    printf("#%d: Connectivity(%d)\n",node->nodeAddr,k);
+#endif
+
+    /* HelloCount[k] <- HelloCount[k] + 1 */
+    wrp->LTable[k].HelloCount++;
+
+    /* if (HelloCount[k] < y) then reset HelloTimer */
+    if (wrp->LTable[k].HelloCount < wrp->LTable[k].y)
+    {
+#ifdef DEBUG
+        printf("#%d: Reset HelloTimer for %d\n",node->nodeAddr,k);
+#endif
+        wrp->LTable[k].HelloTimer = simclock() + WRP_HELO_TIME;
+
+        W.u = 0;
+        W.j = node->nodeAddr;
+        W.RDkj = 0;
+        W.rpkj = node->nodeAddr;
+        memset(response, 0, sizeof(int)*node->numNodes);
+  
+        response[k]=1;
+
+        addTuple(node,W,response);
+
+        /* Julian: count this as a hello message */
+
+        /* Julian: remove necessity to MRL retx this message 
+#ifdef DEBUG
+        printf("#%d: removing HELO message from MRL\n",node->nodeAddr);
+#endif
+        Delete_RList(node, (wrp->SEQNO+WRP_MAX_SEQ_NUM-1)%WRP_MAX_SEQ_NUM, 
+                     k);
+*/
+        delay = (clocktype) WRP_XMIT_TIME;
+        delay *= pc_erand(node->seed);
+
+        setTimer(node,WRP_HELO_TIMER,k,(clocktype)(WRP_HELO_TIME+delay));
+
+    }
+    else
+    {
+#ifdef DEBUGOUTPUT
+        printf("#%d: Remove link to %d after %dth try\n",node->nodeAddr,k,
+           wrp->LTable[k].y);
+#endif
+        /* Ni <- Ni - k */
+        wrp->Ni[k] = 0;
+
+        /*l(i)k <- INF ; tag(i)k <- null */
+        wrp->LTable[k].dist = WRP_INFINITY;
+        wrp->RTable[k].tag = 0;
+
+        /* delete column for k in distance table */
+        for (count=0; count<node->numNodes; count++)
+            Init2(node,k,count);
+
+        /* Julian: need to remove entries in distance table
+         * that loop thru self to node k 
+         */
+        for (count=0; count < node->numNodes; count++)
+            if (wrp->DTable[k].dat[count].pred == node->nodeAddr)
+         {
+            wrp->DTable[k].dat[count].dist = WRP_INFINITY;
+            wrp->DTable[k].dat[count].pred = -1;
+         }
+
+        /* Julian: need to broadcast link down to neighbors */
+        W.u = 0;
+        W.j = k;
+        W.RDkj = WRP_INFINITY;
+        W.rpkj = -1;
+        for (count=0;count<node->numNodes;count++)
+            if (wrp->Ni[count]==1)
+                response[count]=1;
+            else
+                response[count]=0;
+
+        addTuple(node,W,response);
+
+        /* update routing table */
+        RT_Update(node,k);
+        for (count=0; count<node->nodeAddr;count++)
+        {
+            if ((count!=node->nodeAddr)&&(count!=k)&&
+                (wrp->RTable[count].succ==k))
+            {
+#ifdef DEBUG
+                printf("#%d: Link down to %d adjusts route to %d\n",
+                    node->nodeAddr,k,count);
+#endif
+                wrp->RTable[count].tag = 0;
+                RT_Update(node,count);
+            }
+        }
+
+
+        ZeroList = pc_malloc(sizeof(int)*node->numNodes);
+        if (!ZeroList) {
+            printf("Not enough memory.\n");
+            assert(FALSE);
+        }
+        memset(ZeroList, 0, sizeof(int)*node->numNodes);
+        if (memcmp(ZeroList,wrp->Ni,sizeof(int)*node->numNodes) == 0) {
+#ifdef DEBUG
+            printf("No longer any neighbors, starting hello timer.\n");
+#endif
+            setTimer(node,WRP_INIT_TIMER,0,(clocktype) WRP_HELO_TIME);
+
+        }
+        pc_free(ZeroList);
+
+    }
+    pc_free(response);
+}
+
+void addTuple(GlomoNode *node, WrpTuple W, int* response)
+{
+    int i,
+        done = 0;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+#ifdef DEBUG
+    printf("AddTuple (%d,%d,%d,%d)\n",W.u,W.j,W.RDkj,W.rpkj);
+#endif
+    for (i=0; i<wrp->LISTct; i++)
+    {
+#ifdef DEBUG
+        printf("    compare to (%d,%d,%d,%d)\n",wrp->LIST[i].u, 
+            wrp->LIST[i].j, wrp->LIST[i].RDkj, wrp->LIST[i].rpkj);
+#endif
+        if ((wrp->LIST[i].u==W.u)&&(wrp->LIST[i].j==W.j)&&(W.u == 0))
+        {
+#ifdef DEBUG
+            printf("    replace (%d,%d,%d,%d) with (%d,%d,%d,%d)\n",
+                wrp->LIST[i].u, wrp->LIST[i].j, wrp->LIST[i].RDkj,
+                wrp->LIST[i].rpkj, W.u, W.j, W.RDkj, W.rpkj);
+#endif
+            wrp->LIST[i].RDkj = W.RDkj;
+            wrp->LIST[i].rpkj = W.rpkj;
+            done = 1;
+            i = wrp->LISTct;
+        }
+    }
+    if (!done)
+    {
+#ifdef DEBUG
+        printf("    add this as %dth entry\n",wrp->LISTct);
+#endif
+        i = wrp->LISTct;
+        wrp->LIST[i].u = W.u;
+        wrp->LIST[i].j = W.j;
+        wrp->LIST[i].RDkj = W.RDkj;
+        wrp->LIST[i].rpkj = W.rpkj;
+        wrp->LISTct = wrp->LISTct + 1;
+    }
+    for (i=0; i<node->numNodes; i++)
+        if (response[i]==1)
+            wrp->responseList[i] = 1;
+        else
+            wrp->responseList[i] = 0;
+
+    if (wrp->LISTct >= wrp->LISTmax)
+    {
+#ifdef DEBUG
+        printf("FORCED bcast\n");
+#endif
+        broadcastUpdateMsg(node,ANY_DEST,0);
+    }
+}
+
+void broadcastUpdateMsg(GlomoNode *node, NODE_ADDR dest, clocktype delay)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    int seqNum = wrp->SEQNO;
+    int i,
+        packetSize;
+    NODE_ADDR destId;
+    char buf[80];
+
+#ifdef DEBUGOUTPUT
+    ctoa(simclock(),buf);
+    printf("#%d: broadcastUpdateMsg() at %s\n",node->nodeAddr,buf);
+    for (i=0; i < wrp->LISTct; i++)
+        printf("    (%d,%d,%d,%d)\n",wrp->LIST[i].u, wrp->LIST[i].j,
+            wrp->LIST[i].RDkj, wrp->LIST[i].rpkj);
+#endif
+    destId = dest;
+    packetSize = packPayload(node);
+    Clean_RList(node,seqNum);
+    Create_RList(node,wrp->LISTct);
+
+    AppUdpSendNewDataWithPriority(node, 
+                                  APP_ROUTING_WRP, 
+                                  ANY_DEST, 
+                                  (char *) wrp->wpkt, 
+                                  packetSize, 
+                                  CONTROL, 
+                                  0);
+
+    if (node->appData.routingStats == TRUE)
+    {
+        wrp->stats.numRTsent++;
+    }
+    wrp->LISTct = 0;
+ 
+}
+
+void Clean_RList(GlomoNode *node, int seqno)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    WrpMrlTuple *head,*temp;
+    int count;
+
+#ifdef DEBUG
+    printf("#%d: Clean_RList(%d) with %d\n",node->nodeAddr,seqno,
+        wrp->MRL[seqno].MRLsize);
+#endif
+    /* for all entries in RList
+          delete RList[seqno] */
+
+    if (wrp->MRL[seqno].MRLsize > 0)
+    {
+        pc_free(wrp->MRL[seqno].dat);
+        pc_free(wrp->MRL[seqno].bitmap);
+    }
+
+    wrp->MRL[seqno].MRLsize = 0;
+    wrp->MRL[seqno].retx_counter = WRP_MAX_RETX;
+    wrp->MRL[seqno].retx_count = 0;
+
+}
+
+void Delete_RList(GlomoNode *node, int seqno, int k)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    WrpMrlTuple *head,*temp;
+    int count,
+        okdelete = 1;
+
+#ifdef DEBUG
+    printf("#%d: Delete_RList(%d)\n",node->nodeAddr,seqno);
+#endif
+    if (wrp->MRL[seqno].MRLsize > 0)
+    {
+        wrp->MRL[seqno].bitmap[k] = 0;
+        for (count = 0; count < node->numNodes; count++)
+        {
+            if ((count != node->nodeAddr)&&(wrp->Ni[count]==1))
+            {
+                if (wrp->MRL[seqno].bitmap[count]==1)
+                {
+#ifdef DEBUG
+                     printf("#%d: Awaiting ACK from %d\n",node->nodeAddr,
+                            count);
+#endif
+                     okdelete = 0;
+                }
+            }
+        }
+        if (okdelete == 1)
+        {
+#ifdef DEBUG
+            printf("Remove MRL entry %d\n",seqno);
+#endif
+            Clean_RList(node,seqno);
+        }
+    }
+}
+
+void Create_RList(GlomoNode *node, int valid)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+    int count,count2,count3,count4;
+    int i, needack=0, okdel;
+
+    WrpMrlTuple *head, *hptr, *htemp;
+
+#ifdef DEBUG
+    printf("#%u: Create_RList(%d,%d)\n",node->nodeAddr,wrp->SEQNO,valid);
+#endif
+    /* NeighborSet <- Ni */
+    /* Julian: doesn't do anything */
+
+    wrp->MRL[wrp->SEQNO].bitmap = pc_malloc(sizeof(int)*node->numNodes);
+    assert(wrp->MRL[wrp->SEQNO].bitmap);
+
+    /* bitmap[] <- 0; RetransmissionTimer <- x */
+    for (count=0; count<node->numNodes; count++)
+        wrp->MRL[wrp->SEQNO].bitmap[count] = wrp->responseList[count];
+
+    /* Julian: retxtimer is a relic, bitmap not necessary */
+   
+    /* add updates to RList */
+    for (count=0; count < node->numNodes; count++)
+        if ((wrp->Ni[count]==1)&&(wrp->responseList[count]==1))
+            needack = 1;
+    if (needack==1)
+    {
+        wrp->MRL[wrp->SEQNO].dat = pc_malloc(sizeof(WrpTuple)*valid);
+        assert(wrp->MRL[wrp->SEQNO].dat);
+        wrp->MRL[wrp->SEQNO].retx_counter = WRP_MRL_RETX_CONST;
+        wrp->MRL[wrp->SEQNO].retx_count = 0;
+        wrp->MRL[wrp->SEQNO].MRLsize = valid;
+        for (count2=0; count2 < valid; count2++)
+           wrp->MRL[wrp->SEQNO].dat[count2] = wrp->LIST[count2];
+        for (count2=0; count2 < valid; count2++)
+            for (i=0; i<WRP_MAX_SEQ_NUM; i++)
+                if ((wrp->MRL[i].MRLsize > 0)&&(i != wrp->SEQNO))
+                {
+#ifdef DEBUG
+                    printf("comparing entry %d to entry %d\n",wrp->SEQNO,i);
+#endif
+                    for (count3=0; count3 < wrp->MRL[i].MRLsize; count3++)
+                        if ((wrp->MRL[i].dat[count3].u==
+                             wrp->MRL[wrp->SEQNO].dat[count2].u) &&
+                            (wrp->MRL[i].dat[count3].j==
+                             wrp->MRL[wrp->SEQNO].dat[count2].j))
+                        {
+#ifdef DEBUG
+                            printf("OLD ENTRY\n");
+#endif
+                            if (wrp->MRL[i].MRLsize==1)
+                            {
+#ifdef DEBUG
+                                printf("Only One\n");
+#endif
+                                Clean_RList(node,i);
+                            }
+                            else
+                            {
+                                for (count4=count3;count4
+                                     <wrp->MRL[i].MRLsize-1; count4++)
+                                    wrp->MRL[i].dat[count4] =
+                                        wrp->MRL[i].dat[count4+1];
+                                    wrp->MRL[i].MRLsize--;
+                                    count3--;
+                            }
+
+                        }
+                }
+    }
+    /* seqno <- seqno + 1   Julian: moved here from top */
+    wrp->SEQNO = (wrp->SEQNO + 1) % WRP_MAX_SEQ_NUM;
+}
+
+void printDTable(GlomoNode *node)
+{
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+    int count, count2;
+
+    printf("Distance Table for Node #%u\n ",node->nodeAddr);
+    for (count = 0; count < node->numNodes; count++)
+    {
+        if (wrp->N[count]==0)
+            continue;
+        for (count2 = 0; count2 < node->numNodes; count2++)
+        {
+           if ( (count==node->nodeAddr) || (count2 == node->nodeAddr) )
+               continue;
+           if (wrp->Ni[count2]==0)
+               continue;
+           printf("(%d-%d,%d p%d=%d) ",node->nodeAddr,
+               wrp->DTable[count].dest, wrp->DTable[count].dat[count2].via,
+               wrp->DTable[count].dat[count2].pred,
+               wrp->DTable[count].dat[count2].dist);
+        }
+        printf("\n ");
+    }
+    printf("\n");
+
+}
+
+void printRTable(GlomoNode *node)
+{
+    int count;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+    printf("Routing Table for Node #%u\n  ",node->nodeAddr);
+    for (count = 0; count < node->numNodes; count++)
+    {
+        if (wrp->N[count] == 0)
+            continue;
+        printf("(to %d via %d pred=%d dist=%d)\n  ",wrp->RTable[count].dest,
+            wrp->RTable[count].succ, wrp->RTable[count].pred,
+            wrp->RTable[count].dist);
+    }
+    printf("\n");
+
+}
+
+void printLTable(GlomoNode *node)
+{
+    int count;
+    GlomoRoutingWrp *wrp = (GlomoRoutingWrp *)node->appData.routingVar;
+
+    printf("Link Table for Node #%d\n  ",node->nodeAddr);
+    for (count = 0; count < node->numNodes; count++)
+    {
+        if (wrp->Ni[count]==0)
+            continue;
+        printf("(to %d = %d) ",wrp->LTable[count].dest,
+            wrp->LTable[count].dist);
+    }
+    printf("\n\n");
+}
+
+

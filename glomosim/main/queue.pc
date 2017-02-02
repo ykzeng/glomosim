@@ -1,0 +1,189 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: queue.pc,v 1.7 1999/12/08 17:04:07 jmartin Exp $
+ *
+ * Queueing functions used by the framework for
+ * buffering messages.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "main.h"
+#include "queue.h"
+
+
+        
+/*
+ * FUNCTION     GLOMO_MessageEnqueue
+ * PURPOSE      Function called by user to insert message into the queue.
+ *
+ * Parameters:
+ *    inQueue:    the queue in which the item is to be inserted
+ *    inMsg:      the message being enqueued
+ *    insertPos:  the position where the item will be inserted
+ */
+void GLOMO_MessageEnqueue(Queue *inQueue, int insertPos,
+                          void *inMsg)
+{
+    int i;
+    int msgSize = 0;
+    QueueItem *insertItem = NULL;
+
+    if (inQueue->freeListPtr == NULL) {
+        insertItem = (QueueItem *) pc_malloc(sizeof(QueueItem));
+    } else {
+        insertItem = inQueue->freeListPtr;
+        inQueue->freeListPtr = inQueue->freeListPtr->next;
+    }
+    
+    assert(insertItem != NULL);
+    insertItem->item = inMsg;
+
+
+    /*
+     * If the number of items in queue is 0,
+     * then the item being inserted is the first
+     * as well as last item.
+     */
+    if (inQueue->itemsInQueue == 0) {
+        insertItem->prev = NULL;
+        insertItem->next = NULL;
+
+        inQueue->first = insertItem;
+        inQueue->last = insertItem;
+    }
+
+    /*
+     * If we are inserting at the end set the "next" field of the current
+     * last item and "prev" field of the inserted item.
+     * Point the "last" field of queue to the inserted item.
+     */
+    else if (insertPos == QUEUE_INSERT_END) {
+        assert(inQueue->itemsInQueue > 0);
+        insertItem->prev = inQueue->last;
+        insertItem->next = NULL;
+
+        inQueue->last->next = insertItem;
+        inQueue->last = insertItem;
+    }
+
+    /*
+     * If we are inserting at the front set the "prev" field of the current
+     * first item and "next" field of the inserted item.
+     * Point the "first" field of queue to the inserted item.
+     */
+    else if (insertPos == QUEUE_INSERT_FRONT) {
+        assert(inQueue->itemsInQueue > 0);
+        insertItem->prev = NULL;
+        insertItem->next = inQueue->first;
+
+        inQueue->first->prev = insertItem;
+        inQueue->first = insertItem;
+    }
+    else {
+        fprintf(stderr, "GLOMO Error: Unknown queue insert position %ld.\n",
+                insertPos);
+        assert(FALSE);
+    }
+
+    /*
+     * Increase the count of the number of items in the queue.
+     */
+    inQueue->itemsInQueue++;
+}
+
+
+
+/*
+ * FUNCTION      GLOMO_MessageDequeue
+ * PURPOSE       Function called by user to remove message from queue.
+ *
+ * Parameters:
+ *    outQueue:   the queue from which item is dequeued
+ *
+ * The actual message is returned. If there are no meessages
+ * currently stored in the queue NULL is returned back.
+ */
+void* GLOMO_MessageDequeue(Queue *outQueue)
+{
+    QueueItem *outItem;
+    int i;
+
+    /*
+     * Remove message from queue.
+     */
+    /*
+     * If no items in queue, return NULL.
+     */
+    if (outQueue->itemsInQueue == 0) {
+        return NULL;
+    }
+
+
+    /*
+     * If there is just one item in queue, remove it
+     * and set "first" and "last" of queue to NULL.
+     */
+    if (outQueue->itemsInQueue == 1) {
+        outItem = outQueue->first;
+        outQueue->first = NULL;
+        outQueue->last = NULL;
+        outQueue->itemsInQueue--;
+    }
+
+    /*
+     * Remove item. Set "first" of queue to "next" of
+     * item being removed.
+     */
+    else {
+        outItem = outQueue->first;
+        outQueue->first = outItem->next;
+        outQueue->first->prev = NULL;
+        outQueue->itemsInQueue--;
+    }
+
+    outItem->next = outQueue->freeListPtr;
+    outQueue->freeListPtr = outItem;
+    
+    return outItem->item;
+}
+

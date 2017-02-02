@@ -1,0 +1,20 @@
+The purpose of this file is to describe the Fisheye routing
+parameters used in GlomoSim. There are 4 parameters in the fisheye
+routing configuration file: 
+<size of the scope>,  <time out for the neighboring nodes>,
+<intra scope update interval> and <inter scope update interval>.
+The value of these parameters are depend on mobility, node density,
+transmission range etc. The description of these parameters are listed below.
+
+<size of the scope>: this parameter specifies the scope radius of a node
+in number of hops. 
+
+<time out for the neighboring nodes>: If a node does not hear from a neighbor
+specified by this value, the neighbor node will be deleted from the 
+neighbor list. 
+
+<intra scope update interval>: The update interval of sending the updates of the nodes
+within the scope radius. 
+
+<inter scope update interval>: The update interval of sending the updates of the nodes
+outside the scope radius.

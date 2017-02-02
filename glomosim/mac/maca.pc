@@ -1,0 +1,1315 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: maca.pc,v 1.36 2001/08/31 18:25:51 jmartin Exp $
+ *
+ * MACA (multiple access with collision avoidance)
+ *
+ * reference: C. L Fuller and J. J. Garcia paper MACA specification
+ * using RTS /CTS control frames to reserve medium 
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "mac.h"
+#include "maca.h"
+
+#define noQDEBUG
+
+
+static /*inline*/
+RadioStatusType RadioStatus(GlomoNode* node, GlomoMacMaca* maca)
+{
+   return GLOMO_RadioGetStatus(node, maca->myGlomoMac->interfaceIndex);
+}
+
+
+/*
+ * NAME:        MacMacaPrintStats
+ *
+ * PURPOSE:     Print MAC layer statistics.
+ *
+ * PARAMETERS:  node.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+static
+void MacMacaPrintStats(GlomoNode *node, GlomoMacMaca* maca)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+    sprintf(buf, "Number of packets from network: %d", maca->pktsToSend);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of packets lost due to buffer overflow: %d",
+            maca->pktsLostOverflow);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of UNICAST packets output to the channel: %d",
+            maca->pktsSentUnicast);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of BROADCAST packets output to the channel: %d", 
+            maca->pktsSentBroadcast);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of UNICAST packets received clearly: %d",
+            maca->pktsGotUnicast);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of BROADCAST packets received clearly: %d",
+            maca->pktsGotBroadcast);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of RTS Packets sent: %d", maca->RtsPacketSent);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of CTS Packets sent: %d", maca->CtsPacketSent);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of RTS Packets got: %d", maca->RtsPacketGot);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of CTS Packets got: %d", maca->CtsPacketGot);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+
+    sprintf(buf, "Number of Noisy Packets got: %d", maca->NoisyPacketGot);
+    GLOMO_PrintStat(node, "MacMACA", buf);
+}
+
+
+
+
+/*
+ * NAME:        MacMacaSetTimer.
+ *
+ * PURPOSE:     Set a timer for node to expire at time timerValue.
+ *
+ * PARAMETERS:  node, node setting the timer.
+ *              timerType, what type of timer is being set.
+ *              timerValue, when timer is to expire.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaSetTimer(GlomoNode *node, 
+                            GlomoMacMaca *maca,
+                            int timerType, 
+                            clocktype timerValue)
+{
+    Message      *newMsg;
+    int         *timerSeq;
+
+    maca->timer.flag = MACA_TIMER_ON | timerType;
+    maca->timer.seq++; 
+
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0,
+                            MSG_MAC_TimerExpired);
+    GLOMO_MsgSetInstanceId(newMsg, maca->myGlomoMac->interfaceIndex);
+    GLOMO_MsgInfoAlloc(node, newMsg, sizeof(maca->timer.seq));
+    timerSeq  = (int *) newMsg->info;
+    *timerSeq = maca->timer.seq;
+
+    GLOMO_MsgSend(node, newMsg, timerValue);
+}
+
+
+/*
+ * NAME:        MacMacaMacMacaCancelTimer.
+ *
+ * PURPOSE:     Cancel a timer that was already set.
+ *
+ * PARAMETERS:  node, node cancelling the timer.
+ *              timerType, what type of timer is being cancelled.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaCancelTimer(GlomoNode *node, GlomoMacMaca *maca, int timerType)
+{
+    if (timerType == MACA_T_UNDEFINED) 
+    {
+        maca->timer.flag = MACA_TIMER_OFF | MACA_T_UNDEFINED;
+    }
+    else if ((maca->timer.flag & MACA_TIMER_TYPE) == timerType) 
+    {
+        maca->timer.flag = MACA_TIMER_OFF | MACA_T_UNDEFINED;
+    }
+    else 
+    {
+               assert(FALSE);  
+    }
+}
+
+
+/*
+ * NAME:        MacMacaMacMacaResetTimer.
+ *
+ * PURPOSE:     Resets backoff timers to default values.
+ *
+ * PARAMETERS:  node, node resetting backoff timers.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static void MacMacaResetTimer(GlomoNode *node, GlomoMacMaca *maca)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+
+    maca->BOmin = MACA_BO_MIN;
+    maca->BOmax = MACA_BO_MAX;
+    maca->BOtimes = 0;
+}
+
+
+/*
+ * NAME:        MacMacaSetState.
+ *
+ * PURPOSE:     Set the state of a node.
+ *
+ * PARAMETERS:  node, node setting the state.
+ *              state, state to set to.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaSetState(GlomoNode *node, GlomoMacMaca *maca, int state)
+{
+    maca->state = state;
+}
+
+
+/*
+ * NAME:        MacMacaYield.
+ *
+ * PURPOSE:     Yield so neighboring nodes can transmit or receive.
+ *
+ * PARAMETERS:  node, node that is yielding.
+ *              vacation, how long to yield for.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaYield(GlomoNode *node, GlomoMacMaca *maca, clocktype vacation)
+{
+    assert(maca->state == MACA_S_YIELD);
+
+    MacMacaSetTimer(node, maca, MACA_T_YIELD, 
+                    vacation + pc_nrand(node->seed) % 20); 
+}
+
+/*
+ * NAME:        MacMacaMacMacaSendCts.
+ *
+ * PURPOSE:     Send CTS to neighboring nodes.
+ *
+ * PARAMETERS:  node, node sending CTS frame.
+ *              fromNodeAddr, node that CTS frame is intended for.
+ *              payloadSize, size of the data to be sent.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaSendCts(GlomoNode *node, 
+                    GlomoMacMaca *maca,
+                    NODE_ADDR fromNodeAddr, 
+                    int payloadSize)
+{
+    int macFrameSize;
+    MacaHeader* hdr;
+    Message* msg = GLOMO_MsgAlloc(node, 0, 0, 0);
+    
+    GLOMO_MsgPacketAlloc(node, msg, 0);
+    GLOMO_MsgAddHeader(node, msg, sizeof(MacaHeader));
+    
+    hdr = (MacaHeader *)msg->packet;
+    hdr->sourceAddr  = node->nodeAddr;
+    hdr->destAddr    = fromNodeAddr;
+    hdr->frameType   = MACA_CTS;
+    hdr->payloadSize = payloadSize;
+    hdr->priority = maca->currentPriority;
+
+    maca->payloadSizeExpected = payloadSize;
+
+    /* Size of CTS frame is simply the size of frame header. */
+    
+    macFrameSize = sizeof(MacaHeader);
+    msg->packetSize = macFrameSize;
+    
+    MacMacaSetState(node, maca, MACA_S_IN_XMITING_CTS); 
+
+    GLOMO_RadioStartTransmittingPacket(
+        node, maca->myGlomoMac->interfaceIndex,
+        msg, hdr->destAddr, FALSE, 0);
+    
+    maca->CtsPacketSent++;
+    
+}
+
+/*
+ * NAME:        MacMacaMacMacaGetData.
+ *
+ * PURPOSE:     Sends packet to upper layer.
+ *
+ * PARAMETERS:  node, node handling the data packet.
+ *              msg, packet to send to upper layers.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaGetData(GlomoNode *node, GlomoMacMaca *maca, Message *msg)
+{
+    MacaHeader *hdr = (MacaHeader *) msg->packet;
+    NODE_ADDR lastHopAddress = hdr->sourceAddr;
+    NODE_ADDR destinationAddress = hdr->destAddr;
+
+    GLOMO_MsgRemoveHeader(node, msg, sizeof(MacaHeader));
+
+    NetworkIpReceivePacketFromMacLayer(node, msg, lastHopAddress);
+    
+    if (destinationAddress == ANY_DEST) 
+    {
+        maca->pktsGotBroadcast++;
+    }
+    else 
+    {
+        maca->pktsGotUnicast++;
+    }
+}
+
+
+/*
+ * NAME:        MacMacaHandlePromiscuousMode.
+ *
+ * PURPOSE:     Supports promiscuous mode sending remote packets to
+ *              upper layers.
+ *
+ * PARAMETERS:  node, node using promiscuous mode.
+ *              msg, packet to send to upper layers.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaHandlePromiscuousMode(
+    GlomoNode *node, GlomoMacMaca *maca, Message *msg)
+{
+    GLOMO_MsgRemoveHeader(node, msg, sizeof(MacaHeader));
+    NetworkIpSneakPeekAtMacPacket(node, msg);
+    GLOMO_MsgAddHeader(node, msg, sizeof(MacaHeader));
+}
+
+
+/*
+ * NAME:        MacMacaRts.
+ *
+ * PURPOSE:     Send RTS frame to intended destination.
+ *
+ * PARAMETERS:  node, node sending the RTS frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaRts(GlomoNode *node, GlomoMacMaca *maca)
+{
+    NODE_ADDR nextHopAddress;
+    MacaHeader *hdr;
+    Message *msg;
+    Message *tmpPktPtr;
+
+    assert(maca->state == MACA_S_RTS);
+
+    NetworkIpOutputQueueTopPacketForAPriority(
+       node, maca->myGlomoMac->interfaceIndex, maca->currentPriority, 
+       &tmpPktPtr, &nextHopAddress);
+
+    if (tmpPktPtr == NULL) 
+    {
+        #ifdef QDEBUG
+            printf("MACA: Queue should not be empty...\n");
+        #endif
+
+        return;
+    }
+
+    
+    /* Send RTS. */
+    msg = GLOMO_MsgAlloc(node, 0, 0, 0);
+    
+    GLOMO_MsgPacketAlloc(node, msg, 0);
+    GLOMO_MsgAddHeader(node, msg, sizeof(MacaHeader));
+    
+    hdr = (MacaHeader *) msg->packet;
+    hdr->sourceAddr  = node->nodeAddr;
+    hdr->destAddr    = nextHopAddress;
+    hdr->frameType   = MACA_RTS;
+    hdr->payloadSize = tmpPktPtr->packetSize;
+    hdr->priority = maca->currentPriority;
+
+    maca->payloadSizeExpected = tmpPktPtr->packetSize;
+
+    MacMacaSetState(node, maca, MACA_S_IN_XMITING_RTS);
+
+    msg->packetSize = sizeof(MacaHeader);
+
+    GLOMO_RadioStartTransmittingPacket(
+        node, maca->myGlomoMac->interfaceIndex,
+        msg, hdr->destAddr, FALSE, 0);
+
+    maca->RtsPacketSent++;
+}
+
+/*
+ * NAME:        MacMacaDataXmit.
+ *
+ * PURPOSE:     Sending data frames to destination.
+ *
+ * PARAMETERS:  node, node sending the data frame.
+ *              tag, type of data frame to send.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaDataXmit(GlomoNode *node, GlomoMacMaca *maca, int tag) 
+{
+    Message      *msg;
+    MacaHeader *hdr;
+    NODE_ADDR nextHopAddress;
+
+    assert(maca->state == MACA_S_XMIT);
+
+    NetworkIpOutputQueueDequeuePacketForAPriority(
+       node, maca->myGlomoMac->interfaceIndex, maca->currentPriority, 
+       &msg, &nextHopAddress);
+
+    if (msg == NULL) 
+    {
+        #ifdef QDEBUG
+            printf("MACA: Queue should not be empty...\n");
+        #endif
+
+        return;
+    }
+
+    
+    GLOMO_MsgAddHeader(node, msg, sizeof(MacaHeader));
+    hdr  = (MacaHeader *) msg->packet;
+    hdr->frameType = tag;
+    hdr->payloadSize = msg->packetSize - sizeof(MacaHeader);
+    hdr->sourceAddr = node->nodeAddr;
+    hdr->destAddr = nextHopAddress;
+    hdr->priority = maca->currentPriority;
+
+    maca->currentPriority = -1;
+
+    if (tag == MACA_UNICAST) 
+    {
+        maca->pktsSentUnicast++;
+        MacMacaSetState(node, maca, MACA_S_IN_XMITING_UNICAST);
+    }
+    else if (tag == MACA_BROADCAST) 
+    {
+        maca->pktsSentBroadcast++;
+        MacMacaSetState(node, maca, MACA_S_IN_XMITING_BROADCAST);
+    }
+    GLOMO_RadioStartTransmittingPacket(
+        node, maca->myGlomoMac->interfaceIndex,
+        msg, hdr->destAddr, FALSE, 0);
+}
+
+
+/*
+ * NAME:        MacMacaBackoff.
+ *
+ * PURPOSE:     Backing off sending data at a later time.
+ *
+ * PARAMETERS:  node, node that is backing off.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaBackoff(GlomoNode *node, GlomoMacMaca *maca) 
+{
+    clocktype randomTime;
+
+    assert(maca->state == MACA_S_BACKOFF);
+
+    randomTime = (pc_nrand(node->seed) % maca->BOmin) + 1;
+
+    maca->BOmin = maca->BOmin * 2;
+
+    if (maca->BOmin > maca->BOmax) 
+    {
+        maca->BOmin = maca->BOmax;
+    }
+
+    maca->BOtimes++;
+
+    MacMacaSetTimer(node, maca, MACA_T_BACKOFF, randomTime);
+            
+}
+
+
+/*
+ * NAME:        MacMacaPassive.
+ *
+ * PURPOSE:     In passive mode, check whether there is a local packet.
+ *              If YES, send RTS; else return;
+ *
+ * PARAMETERS:  node, node that is in passive state.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaPassive(GlomoNode *node, GlomoMacMaca *maca)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    Message *tmpPktPtr;
+    NODE_ADDR nextHopAddress;
+    NetworkQueueingPriorityType priority;
+    
+    if (maca->state != MACA_S_PASSIVE) return;
+
+    if (NetworkIpOutputQueueIsEmpty(
+            node, maca->myGlomoMac->interfaceIndex))
+    {
+        maca->currentPriority = -1; 
+        return;
+    }
+    
+    NetworkIpOutputQueueTopPacket(
+        node,
+        maca->myGlomoMac->interfaceIndex,
+        &tmpPktPtr,
+        &nextHopAddress,
+        &priority);
+    
+    maca->currentPriority = priority;
+
+    if (nextHopAddress != ANY_DEST)  
+    {
+        MacMacaSetState(node, maca, MACA_S_RTS);
+        MacMacaRts(node, maca);
+    } 
+    else 
+    {
+        if (RadioStatus(node, maca) == RADIO_IDLE) 
+        {
+            MacMacaSetState(node, maca, MACA_S_XMIT);
+            MacMacaDataXmit(node, maca, MACA_BROADCAST);
+        } 
+        else 
+        {
+            MacMacaSetState(node, maca, MACA_S_BACKOFF);
+            MacMacaBackoff(node, maca);      
+        }
+    }
+}
+
+/*
+ * NAME:        MacMacaNetworkLayerHasPacketToSend.
+ *
+ * PURPOSE:     Starts process to send a packet.
+ *
+ * RETURN:      None.
+ *
+ */
+
+void MacMacaNetworkLayerHasPacketToSend(GlomoNode* node, GlomoMacMaca* maca)
+{
+    MacMacaPassive(node, maca);
+}
+
+
+
+/*
+ * NAME:        MacMacaRemote.
+ *
+ * PURPOSE:     Handle incoming frames.
+ *
+ * PARAMETERS:  node, node handling incoming frame.
+ *              msg, the incoming frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacMacaRemote(GlomoNode *node, GlomoMacMaca *maca, Message *msg)
+{
+    NODE_ADDR receiverAddr;
+    NODE_ADDR sourceAddr, destAddr;
+    int frameType, payloadSize;
+    clocktype holdForCtsData = 0, holdForData = 0;
+    MacaHeader *hdr = (MacaHeader *) msg->packet;
+
+    receiverAddr = node->nodeAddr;
+    sourceAddr   = hdr->sourceAddr;
+    destAddr     = hdr->destAddr;
+    frameType    = hdr->frameType;
+    payloadSize  = hdr->payloadSize;
+
+    switch (frameType) 
+    {
+        case MACA_RTS:
+            if (receiverAddr == destAddr) 
+            {
+                /* local RTS */
+                maca->RtsPacketGot++;
+                MacMacaSendCts(node, maca, sourceAddr, payloadSize);
+            } 
+            else 
+            {
+                /* Overheard RTS */
+                /* Hold until other's CTS and DATA to be finished   */
+                
+                holdForCtsData = ((sizeof(MacaHeader) +
+                                 payloadSize + sizeof(MacaHeader)) *
+                                 SECOND) / maca->myGlomoMac->bandwidth +
+                                 (3 * MAC_DELAY) + (2 * RADIO_PHY_DELAY) +
+                                 (2 * SYNCHRONIZATION_TIME) +
+                                 (2 * maca->myGlomoMac->propDelay) +
+                                 MACA_EXTRA_DELAY;
+                
+                MacMacaSetTimer(node, maca, MACA_T_REMOTE, holdForCtsData);
+                        
+                maca->NoisyPacketGot++;
+            }
+        
+            GLOMO_MsgFree(node, msg);
+            break;
+
+        case MACA_CTS:  
+        {
+            /*
+             * Determines how long a remote node backoffs to allow
+             * other nodes to send and receive data packets.  The
+             * bigger the different between this value and the actual
+             * time for other nodes to send and receive a data packet,
+             * the more unfairness occurs for this node since the other
+             * nodes will be allowed to transmit before this node.
+             */
+            holdForData = ((payloadSize + sizeof(MacaHeader)) *
+                          SECOND) / maca->myGlomoMac->bandwidth +
+                          MAC_DELAY +
+                          SYNCHRONIZATION_TIME +
+                          RADIO_PHY_DELAY + maca->myGlomoMac->propDelay +
+                          MACA_EXTRA_DELAY;
+            
+            MacMacaSetTimer(node, maca, MACA_T_REMOTE, holdForData);
+        
+            maca->NoisyPacketGot++;
+            GLOMO_MsgFree(node, msg);
+
+            break;
+        }
+        case MACA_UNICAST: 
+        {
+            /* yield for some time */
+            if (receiverAddr == destAddr) 
+            {
+                MacMacaGetData(node, maca, msg);
+            }
+            else 
+            {
+                if (maca->myGlomoMac->promiscuousMode == TRUE) {
+                    MacMacaHandlePromiscuousMode(node, maca, msg);
+                }
+                GLOMO_MsgFree(node, msg);
+            }
+
+            MacMacaSetState(node, maca, MACA_S_PASSIVE);
+            MacMacaPassive(node, maca);
+
+            break;
+        }
+        case MACA_BROADCAST: 
+        {
+            /* yield for some time */
+
+            /* if local data */
+            if (destAddr == ANY_DEST) 
+            {
+                MacMacaGetData(node, maca, msg);
+            }
+            else 
+            {
+                GLOMO_MsgFree(node, msg);
+            }
+
+            MacMacaSetState(node, maca, MACA_S_YIELD);
+            MacMacaYield(node, maca, MACA_VACATION);
+
+            break;
+        }
+        default:
+            assert(FALSE);
+            break;
+    } /* end of switch */
+}
+
+
+
+
+/*
+ * FUNCTION    MacMacaInit
+ * PURPOSE     Initialization function for MACA protocol of MAC layer.
+
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+void MacMacaInit(
+   GlomoNode *node, int interfaceIndex, const GlomoNodeInput *nodeInput)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    int retVal;
+    GlomoMacMaca *maca = (GlomoMacMaca *) pc_malloc(sizeof(GlomoMacMaca));
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    
+    assert(maca != NULL);
+    
+    memset(maca, 0, sizeof(GlomoMacMaca));
+    maca->myGlomoMac = node->macData[interfaceIndex];
+    maca->myGlomoMac->macVar = (void *)maca;
+
+    maca->state = MACA_S_PASSIVE;
+
+    maca->BOmin = MACA_BO_MIN;
+    maca->BOmax = MACA_BO_MAX;
+    maca->BOtimes = 0;
+
+    maca->timer.flag = MACA_TIMER_OFF | MACA_T_UNDEFINED;
+    maca->timer.seq = 0;
+
+    maca->pktsToSend = 0;
+    maca->pktsLostOverflow = 0;
+
+    maca->pktsSentUnicast = 0;
+    maca->pktsSentBroadcast = 0;
+
+    maca->pktsGotUnicast = 0;
+    maca->pktsGotBroadcast = 0;
+
+    maca->RtsPacketSent = 0;
+    maca->CtsPacketSent = 0;
+
+    maca->RtsPacketGot = 0;
+    maca->CtsPacketGot = 0;
+    maca->NoisyPacketGot = 0;
+
+    maca->currentPriority = -1;
+}
+
+/*
+ * FUNCTION    MacMacaFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of
+ *             the simulation of the MAC layer MACA protocol.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+
+void MacMacaFinalize(GlomoNode *node, int interfaceIndex)
+{
+    GlomoMacMaca *maca = (GlomoMacMaca *)node->macData[interfaceIndex]->macVar;
+    if (maca->myGlomoMac->macStats == TRUE)  
+    {
+        MacMacaPrintStats(node, maca);
+    }
+}
+
+
+
+void MacMacaReceivePacketFromRadio(
+    GlomoNode* node, GlomoMacMaca* maca, Message* msg) 
+{
+    MacaHeader *hdr = (MacaHeader *) msg->packet;
+    int frameType = hdr->frameType;
+    
+    if ((hdr->destAddr == node->nodeAddr) ||
+        (hdr->destAddr == ANY_DEST))
+    {
+        maca->currentPriority = hdr->priority;
+    }
+
+    switch(maca->state) {
+    case MACA_S_RTS: 
+    {
+        if ((hdr->destAddr == node->nodeAddr) 
+            && (frameType == MACA_CTS)) 
+        {
+            /*  Local CTS  */
+            maca->CtsPacketGot++;
+            
+            MacMacaCancelTimer(node, maca, MACA_T_RTS);
+            MacMacaSetState(node, maca, MACA_S_XMIT);
+            MacMacaDataXmit(node, maca, MACA_UNICAST);
+            GLOMO_MsgFree(node, msg);
+        }
+            /* Fall through */
+        else 
+        {
+            MacMacaCancelTimer(node, maca, MACA_T_RTS);
+            MacMacaSetState(node, maca, MACA_S_REMOTE);
+            MacMacaRemote(node, maca, msg);
+            
+            maca->NoisyPacketGot++;
+        }
+        
+        break;
+    }
+    case MACA_S_YIELD:
+    case MACA_S_PASSIVE:
+    case MACA_S_BACKOFF:
+    case MACA_S_REMOTE: 
+    {
+        MacMacaCancelTimer(node, maca, MACA_T_UNDEFINED);
+        MacMacaSetState(node, maca, MACA_S_REMOTE);
+        MacMacaRemote(node, maca, msg);
+        
+        break;
+    }
+    case MACA_S_IN_XMITING_RTS: 
+    {
+        /*
+         * Receives mesg from radio even though in transmit mode.
+         * This can possibly happen due to simultaneous messages. 
+         * The radio layer receives a mesg from the channel and
+         * sends it up to the MAC layer at the same time as the
+         * MAC layer sends down the RTS message
+         */
+    
+        /* 
+         * Since the messages are simultaneous, we can assume that
+         * the RTS message is sent before the incoming message
+         * is received.  Thus we lose the incoming packet. 
+         */
+        GLOMO_MsgFree(node, msg);
+        break;
+    }
+    case MACA_S_XMIT:
+    case MACA_S_IN_XMITING_CTS:
+    case MACA_S_IN_XMITING_UNICAST:
+    case MACA_S_IN_XMITING_BROADCAST:
+        GLOMO_MsgFree(node, msg);
+        assert(FALSE);
+        break;
+        
+    default:
+        GLOMO_MsgFree(node, msg);
+        break;
+    }/*switch*/
+}
+
+void MacMacaReceiveRadioStatusChangeNotification(
+   GlomoNode* node,
+   GlomoMacMaca* maca,
+   RadioStatusType oldRadioStatus,
+   RadioStatusType newRadioStatus)
+{
+   if (oldRadioStatus == RADIO_TRANSMITTING) {
+      assert(newRadioStatus != RADIO_TRANSMITTING);
+      
+      switch (maca->state) {
+      case MACA_S_IN_XMITING_UNICAST: 
+      {
+          MacMacaResetTimer(node, maca);
+          MacMacaSetState(node, maca, MACA_S_PASSIVE);
+          MacMacaPassive(node, maca);
+          break;
+      }       
+      case MACA_S_IN_XMITING_BROADCAST: 
+      {
+          MacMacaSetState(node, maca, MACA_S_YIELD);
+          MacMacaYield(node, maca, MACA_VACATION);
+          break;
+      }
+      case MACA_S_IN_XMITING_RTS: 
+      {
+          clocktype holdForCts;
+   
+          holdForCts = (3 * MAC_DELAY) + (2 * RADIO_PHY_DELAY) +
+              (2 * SYNCHRONIZATION_TIME) +
+              (2 * maca->myGlomoMac->propDelay) +
+              (sizeof(MacaHeader) * SECOND) /
+              maca->myGlomoMac->bandwidth +
+              MACA_EXTRA_DELAY;
+   
+          MacMacaSetState(node, maca, MACA_S_RTS);
+              
+          MacMacaSetTimer(node, maca, MACA_T_RTS, holdForCts);
+              
+          break;
+      }
+      case MACA_S_IN_XMITING_CTS: 
+      {
+          clocktype holdForData;
+   
+          MacMacaSetState(node, maca, MACA_S_REMOTE);
+   
+          holdForData = (3 * MAC_DELAY) + (2 * RADIO_PHY_DELAY) +
+                        (2 * SYNCHRONIZATION_TIME) +
+                        (2 * maca->myGlomoMac->propDelay) +
+                        ((maca->payloadSizeExpected +
+                        sizeof(MacaHeader)) * SECOND) /
+                        maca->myGlomoMac->bandwidth +
+                        MACA_EXTRA_DELAY;
+          
+          MacMacaSetTimer(node, maca, MACA_T_REMOTE, holdForData);
+          
+          break;
+      }
+      default:
+          assert(FALSE); abort();
+          break;
+      }/*switch*/
+   }//if//
+}
+
+
+
+/*
+ * FUNCTION    MacMacaLayer
+ * PURPOSE     Models the behaviour of the MAC layer with the MACA protocol
+ *             on receiving the message enclosed in msg.
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:      message received by the layer
+ */
+
+void MacMacaLayer(GlomoNode *node, int interfaceIndex, Message *msg)
+{
+    /*
+     * Retrieve the pointer to the data portion which relates
+     * to the MACA protocol.
+     */
+    GlomoMacMaca *maca = (GlomoMacMaca *) node->macData[interfaceIndex]->macVar;
+    int seqNo;
+    
+    assert(msg->eventType == MSG_MAC_TimerExpired);
+            
+    seqNo = *((int *) msg->info);
+    GLOMO_MsgFree(node, msg);
+    
+    /* this timer has already been canceled */
+    if ((seqNo < maca->timer.seq) ||
+        ((maca->timer.flag &MACA_TIMER_SWITCH) == MACA_TIMER_OFF)) 
+    {
+        return;
+    }
+    
+    assert(seqNo <= maca->timer.seq);
+     
+    switch (maca->timer.flag & MACA_TIMER_TYPE) {
+    case MACA_T_RTS: 
+    {
+        MacMacaSetState(node, maca, MACA_S_BACKOFF);
+        MacMacaBackoff(node, maca);
+        
+        break;
+    }
+    case MACA_T_BACKOFF:
+    {
+        MacMacaSetState(node, maca, MACA_S_PASSIVE);
+        MacMacaPassive(node, maca);
+        
+        break;
+    }
+    case MACA_T_REMOTE: 
+    {
+        MacMacaSetState(node, maca, MACA_S_PASSIVE);
+        MacMacaPassive(node, maca);
+        
+        break;
+    }
+    case MACA_T_YIELD: 
+    {
+        MacMacaCancelTimer(node, maca, MACA_T_UNDEFINED);
+        MacMacaSetState(node, maca, MACA_S_PASSIVE);
+        MacMacaPassive(node, maca);
+        
+        break;
+    }
+    default:
+        break;
+    }/*switch*/
+}
+
+
+
+
+
+
+
+
+
+
+
+
+//----------------------------------------------------------------------------
+// Old Debug Code.
+//
+//MacMacaSetTimer(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(timerValue + simclock(), clockStr);
+//    printf("MAC %u setting timer ", node->nodeAddr);
+//
+//    switch (maca->timer.flag & MACA_TIMER_TYPE)
+//    {
+//        case MACA_T_RTS:
+//            printf("MACA_T_RTS");
+//            break;
+//        case MACA_T_BACKOFF:
+//            printf("MACA_T_BACKOFF");
+//            break;
+//        case MACA_T_XMIT:
+//            printf("MACA_T_XMIT");
+//            break;
+//        case MACA_T_REMOTE:
+//            printf("MACA_T_REMOTE");
+//            break;
+//        case MACA_T_YIELD:
+//            printf("MACA_T_YIELD");
+//            break;
+//        case MACA_T_UNDEFINED:
+//            printf("MACA_T_UNDEFINED");
+//            break;
+//        default:
+//            printf("MAC_MACA: Bad timer!\n");
+//    }
+//    
+//    printf(" with seq %d at %s\n", maca->timer.seq, clockStr);
+//    }
+//    #endif
+//
+//
+//
+//MacMacaCancelTimer(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(simclock(), clockStr);
+//    printf("MAC %u cancelling timer ", node->nodeAddr);
+//
+//    switch (maca->timer.flag & MACA_TIMER_TYPE)
+//    {
+//        case MACA_T_RTS:
+//            printf("MACA_T_RTS");
+//            break;
+//        case MACA_T_BACKOFF:
+//            printf("MACA_T_BACKOFF");
+//            break;
+//        case MACA_T_XMIT:
+//            printf("MACA_T_XMIT");
+//            break;
+//        case MACA_T_REMOTE:
+//            printf("MACA_T_REMOTE");
+//                break;
+//        case MACA_T_YIELD:
+//            printf("MACA_T_YIELD");
+//            break;
+//        case MACA_T_UNDEFINED:
+//            printf("MACA_T_UNDEFINED");
+//            break;
+//        default:
+//            printf("MAC_MACA: Bad timer!\n");
+//    }
+//    
+//    printf(" with seq %d at %s\n", maca->timer.seq, clockStr);
+//    }
+//    #endif
+//}
+//
+//MacMacaSetState(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(simclock(), clockStr);
+//    printf("MAC %u setting state to ", node->nodeAddr);
+//
+//    switch(maca->state)
+//    {
+//        case MACA_S_PASSIVE:
+//            printf("MACA_S_PASSIVE");
+//            break;
+//        case MACA_S_RTS:
+//            printf("MACA_S_RTS");
+//            break;
+//        case MACA_S_BACKOFF:
+//            printf("MACA_S_BACKOFF");
+//            break;
+//        case MACA_S_REMOTE:
+//            printf("MACA_S_REMOTE");
+//            break;
+//        case MACA_S_XMIT:
+//            printf("MACA_S_XMIT");
+//            break;
+//        case MACA_S_YIELD:
+//            printf("MACA_S_YIELD");
+//            break;
+//        case MACA_S_IN_XMITING_RTS:
+//            printf("MACA_S_IN_XMITING_RTS");
+//            break;
+//        case MACA_S_IN_XMITING_CTS:
+//            printf("MACA_S_IN_XMITING_CTS");
+//            break;
+//        case MACA_S_IN_XMITING_UNICAST:
+//            printf("MACA_S_IN_XMITING_UNICAST");
+//            break;
+//        case MACA_S_IN_XMITING_BROADCAST:
+//            printf("MACA_S_IN_XMITING_BROADCAST");
+//            break;
+//        default:
+//            printf("MAC_MACA: Bad state");
+//            break;
+//    }
+//    
+//    printf(" at %s\n", clockStr);
+//    }
+//    #endif
+//
+//MacMacaYield(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(vacation, clockStr);
+//    printf("MAC %u yielding for %s ", node->nodeAddr, clockStr);
+//    ctoa(simclock(), clockStr);
+//    printf("at %s\n", clockStr);
+//    ctoa(simclock() + vacation, clockStr);
+//    printf("        timeout at %s\n", clockStr);
+//    }
+//    #endif
+//
+//
+//MacMacaSendCts(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(simclock(), clockStr);
+//    printf("MAC %u transmitting CTS of size %d with payload of %d at %s\n",
+//           node->nodeAddr, msg->packetSize, hdr->payloadSize, clockStr);
+//    }
+//    #endif
+//
+//MacMacaGetData(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(simclock(), clockStr);
+//    printf("MAC %u sending packet of size %d to NETWORK at %s\n",
+//           node->nodeAddr, msg->packetSize - sizeof(MacaHeader), clockStr);
+//    }
+//    #endif
+//
+//
+//MacMacaRts(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(simclock(), clockStr);
+//    printf("MAC %u sending RTS of size %d with payload size of %d at %s\n", 
+//           node->nodeAddr, msg->packetSize, hdr->payloadSize, clockStr);
+//    }
+//    #endif
+//
+//
+//MacMacaDataXmit(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(simclock(), clockStr);
+//    printf("MAC %u sending DATA of size %d with payload size of %d "
+//           "at %s\n", node->nodeAddr, msg->packetSize,
+//           msg->packetSize - sizeof(MacaHeader), clockStr);
+//    }
+//    #endif
+//
+//
+//MacMacaBackoff(
+//    #ifdef DEBUG
+//    {
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(randomTime, clockStr);
+//    printf("MAC %u backing off for %s\n",
+//           node->nodeAddr, clockStr);
+//    }
+//    #endif
+//
+//
+//MacMacaRemote(
+//                #ifdef DEBUG
+//                {
+//                char clockStr[GLOMO_MAX_STRING_LENGTH];
+//                ctoa(holdForCtsData, clockStr);
+//                printf("MAC %u holding for CTS and DATA for %s\n",
+//                       node->nodeAddr, clockStr);
+//                ctoa(simclock() + holdForCtsData, clockStr);
+//                printf("    timeout at %s\n", clockStr);
+//                }
+//                #endif
+//
+//
+//            #ifdef DEBUG
+//            {
+//            char clockStr[GLOMO_MAX_STRING_LENGTH];
+//            ctoa(holdForData, clockStr);
+//            printf("MAC %u holding for DATA for %s\n",
+//                   node->nodeAddr, clockStr);
+//            ctoa(simclock() + holdForData, clockStr);
+//            printf("    timeout at %s\n", clockStr);
+//            }
+//            #endif
+//
+//
+//    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//    ctoa(simclock(), clockStr);
+//
+//MacMacaLayer(
+//            #ifdef DEBUG
+//            {
+//            char clockStr[GLOMO_MAX_STRING_LENGTH];
+//            ctoa(simclock(), clockStr);
+//            printf("MAC %u got frame of type %d from radio at %s\n",
+//                   node->nodeAddr, frameType, clockStr);
+//            }
+//            #endif
+//            
+//                    
+//                    #ifdef DEBUG
+//                    {
+//                    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//                    ctoa(holdForCts, clockStr);
+//                    printf("MAC %u holding for CTS for %s\n",
+//                           node->nodeAddr, clockStr);
+//                    ctoa(simclock() + holdForCts, clockStr);
+//                    printf("    timeout at %s\n", clockStr);
+//                    }
+//                    #endif
+//
+//                    #ifdef DEBUG
+//                    {
+//                    char clockStr[GLOMO_MAX_STRING_LENGTH];
+//                    ctoa(holdForData, clockStr);
+//                    printf("MAC %u holding for DATA for %s\n",
+//                           node->nodeAddr, clockStr);
+//                    ctoa(simclock() + holdForData, clockStr);
+//                    printf("    timeout at %s\n", clockStr);
+//                    }
+//                    #endif
+//
+//            
+//            #ifdef DEBUG
+//            printf("MAC %u timer expired of type ", node->nodeAddr);
+//            
+//            switch (maca->timer.flag & MACA_TIMER_TYPE)
+//            {
+//                case MACA_T_RTS:
+//                    printf("MACA_T_RTS");
+//                    break;
+//                case MACA_T_BACKOFF:
+//                    printf("MACA_T_BACKOFF");
+//                    break;
+//                case MACA_T_XMIT:
+//                    printf("MACA_T_XMIT");
+//                    break;
+//                case MACA_T_REMOTE:
+//                    printf("MACA_T_REMOTE");
+//                    break;
+//                case MACA_T_YIELD:
+//                    printf("MACA_T_YIELD");
+//                    break;
+//                case MACA_T_UNDEFINED:
+//                    printf("MACA_T_UNDEFINED");
+//                    break;
+//                default:
+//                    printf("MAC_MACA: Bad timer!\n");
+//            }
+//            
+//            printf("\n");
+//            #endif
+//
+

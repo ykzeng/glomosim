@@ -1,0 +1,11 @@
+entity: driver,DEFAULT_STACK
+entity: GLOMOPartition,DEFAULT_STACK
+message: RemoteMessage
+message: MovingSoon
+message: MovingNow
+message: NeighborInfoMsg
+message: PartitionInfoMsg
+message: NodePositionMsg
+message: WiredPartitionMsg
+message: Ready
+message: StartSim

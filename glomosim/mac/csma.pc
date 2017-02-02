@@ -1,0 +1,569 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: csma.pc,v 1.42 2001/08/31 18:25:51 jmartin Exp $
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "mac.h"
+#include "csma.h"
+#include "network.h"
+
+
+#define noDEBUG
+#define noQDEBUG
+
+
+static /*inline*/
+RadioStatusType RadioStatus(GlomoNode* node, GlomoMacCsma* csma)
+{
+   return GLOMO_RadioGetStatus(node, csma->myGlomoMac->interfaceIndex);
+}
+
+
+/*
+ * NAME:        MacCsmaHandlePromiscuousMode.
+ *
+ * PURPOSE:     Supports promiscuous mode sending remote packets to
+ *              upper layers.
+ *
+ * PARAMETERS:  node, node using promiscuous mode.
+ *              frame, packet to send to upper layers.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacCsmaHandlePromiscuousMode(GlomoNode *node, Message *frame)
+{
+    GLOMO_MsgRemoveHeader(node, frame, sizeof(CsmaHeader));
+    NetworkIpSneakPeekAtMacPacket(node, frame);
+    GLOMO_MsgAddHeader(node, frame, sizeof(CsmaHeader));
+}
+
+
+
+
+/*
+ * NAME:        MacCsmaDataXmit.
+ *
+ * PURPOSE:     Sending data frames to destination.
+ *
+ * PARAMETERS:  node, node sending the data frame.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacCsmaXmit(GlomoNode *node, GlomoMacCsma *csma)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    Message *msg;
+    NODE_ADDR nextHopAddress;
+    NetworkQueueingPriorityType priority;
+
+    CsmaHeader         *hdr;
+
+    assert(csma->status == CSMA_STATUS_XMIT);
+
+    /*
+     * Dequeue packet which was received from the
+     * network layer.
+     */
+
+    NetworkIpOutputQueueDequeuePacket(
+        node, csma->myGlomoMac->interfaceIndex, 
+        &msg, &nextHopAddress, &priority);
+
+    if (msg == NULL) 
+    {
+        #ifdef QDEBUG
+            printf("CSMA: Queue should not be empty...\n");
+        #endif
+
+        return;
+    }
+
+    csma->status = CSMA_STATUS_IN_XMITING;
+    csma->timer.flag = CSMA_TIMER_OFF | CSMA_TIMER_UNDEFINED;
+    
+    /*
+     * Assign other fields to packet to be sent
+     * to radio layer.
+     */
+    
+    GLOMO_MsgAddHeader(node, msg, sizeof(CsmaHeader));
+    hdr = (CsmaHeader *) msg->packet;
+    hdr->destAddr   = nextHopAddress;
+    hdr->sourceAddr = node->nodeAddr;
+    hdr->priority = priority;
+    
+    GLOMO_RadioStartTransmittingPacket(
+        node, csma->myGlomoMac->interfaceIndex,
+        msg, hdr->destAddr, FALSE, 0);
+
+    if (hdr->destAddr == ANY_DEST) {
+        csma->pktsSentBroadcast++;
+    }
+    else {
+        csma->pktsSentUnicast++;
+    }
+}
+
+
+
+
+/*
+ * NAME:        MacCsmaSetTimer.
+ *
+ * PURPOSE:     Set a timer for node to expire at time timerValue.
+ *
+ * PARAMETERS:  node, node setting the timer.
+ *              timerType, what type of timer is being set.
+ *              delay, when timer is to expire.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacCsmaSetTimer(
+    GlomoNode *node, GlomoMacCsma* csma, int timerType, clocktype delay)
+{
+    Message      *newMsg;
+    int         *timerSeq;
+
+    csma->timer.flag = CSMA_TIMER_ON | timerType;
+    csma->timer.seq++;
+
+    assert((timerType == CSMA_TIMER_BACKOFF) ||
+           (timerType == CSMA_TIMER_YIELD));
+    
+    newMsg = GLOMO_MsgAlloc(node, GLOMO_MAC_LAYER, 0,
+                            MSG_MAC_TimerExpired);
+    GLOMO_MsgSetInstanceId(newMsg, csma->myGlomoMac->interfaceIndex);
+    
+    GLOMO_MsgInfoAlloc(node, newMsg, sizeof(csma->timer.seq));
+    timerSeq  = (int *) newMsg->info;
+    *timerSeq = csma->timer.seq;
+
+    GLOMO_MsgSend(node, newMsg, delay);
+}
+
+
+/*
+ * NAME:        MacCsmaYield.
+ *
+ * PURPOSE:     Yield so neighboring nodes can transmit or receive.
+ *
+ * PARAMETERS:  node, node that is yielding.
+ *              holding, how int to yield for.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacCsmaYield(GlomoNode *node, GlomoMacCsma *csma, clocktype holding)
+{
+    assert(csma->status == CSMA_STATUS_YIELD);
+
+    MacCsmaSetTimer(node, csma, CSMA_TIMER_YIELD, holding);
+}
+
+
+/*
+ * NAME:        MacCsmaBackoff.
+ *
+ * PURPOSE:     Backing off sending data at a later time.
+ *
+ * PARAMETERS:  node, node that is backing off.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacCsmaBackoff(GlomoNode *node, GlomoMacCsma *csma)
+{
+    clocktype randTime;
+    assert(csma->status == CSMA_STATUS_BACKOFF);
+
+    randTime = (pc_nrand(node->seed) % csma->BOmin) + 1;
+    csma->BOmin = csma->BOmin * 2;
+
+    if (csma->BOmin > csma->BOmax) {
+        csma->BOmin = csma->BOmax;
+    }
+
+    csma->BOtimes++;
+
+    MacCsmaSetTimer(node, csma, CSMA_TIMER_BACKOFF, randTime);
+}
+
+
+static //inline//
+void CheckRadioStatusAndSendOrBackoff(GlomoNode* node, GlomoMacCsma* csma) {
+    /* Carrier sense response from radio. */
+    
+    if ((RadioStatus(node, csma) == RADIO_IDLE) && 
+        (csma->status != CSMA_STATUS_IN_XMITING)) 
+    {
+        csma->status = CSMA_STATUS_XMIT;
+        MacCsmaXmit(node, csma);
+    }
+    else {
+        if (!NetworkIpOutputQueueIsEmpty(
+                node, csma->myGlomoMac->interfaceIndex))
+        {
+            csma->status = CSMA_STATUS_BACKOFF;
+            MacCsmaBackoff(node, csma);
+        }
+    }
+}
+
+
+
+/*
+ * NAME:        MacCsmaNetworkLayerHasPacketToSend.
+ *
+ * PURPOSE:     In passive mode, start process to send data; else return;
+ *
+ * RETURN:      None.
+ *
+ */
+
+void MacCsmaNetworkLayerHasPacketToSend(GlomoNode *node, GlomoMacCsma *csma)
+{
+    if (csma->status == CSMA_STATUS_PASSIVE) {
+        CheckRadioStatusAndSendOrBackoff(node, csma);
+    }//if//
+}
+
+
+
+
+/*
+ * NAME:        MacCsmaPassive.
+ *
+ * PURPOSE:     In passive mode, check whether there is a local packet.
+ *              If YES, send data; else return;
+ *
+ * PARAMETERS:  node, node that is in passive state.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacCsmaPassive(GlomoNode *node, GlomoMacCsma *csma)
+{
+    Message *newMsg;
+    
+    if ((csma->status == CSMA_STATUS_PASSIVE) &&
+        (!NetworkIpOutputQueueIsEmpty(node, csma->myGlomoMac->interfaceIndex))) 
+    {
+        MacCsmaNetworkLayerHasPacketToSend(node, csma);
+    }
+
+}
+
+
+/*
+ * NAME:        MacCsmaPrintStats
+ *
+ * PURPOSE:     Print MAC layer statistics.
+ *
+ * PARAMETERS:  node.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  node != NULL.
+ */
+
+static 
+void MacCsmaPrintStats(GlomoNode *node, GlomoMacCsma* csma)
+{
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    
+    sprintf(buf, "Number of packets from network: %ld",
+            csma->pktsToSend);
+    GLOMO_PrintStat(node, "MacCSMA", buf);
+    
+    sprintf(buf, "Number of packets lost due to buffer overflow: %ld",
+            csma->pktsLostOverflow);
+    GLOMO_PrintStat(node, "MacCSMA", buf);
+    
+    sprintf(buf, "Number of UNICAST packets output to the channel: %ld",
+            csma->pktsSentUnicast);
+    GLOMO_PrintStat(node, "MacCSMA", buf);
+    
+    sprintf(buf, "Number of BROADCAST packets output to the channel: "
+            "%ld", csma->pktsSentBroadcast);
+    GLOMO_PrintStat(node, "MacCSMA", buf);
+    
+    sprintf(buf, "Number of UNICAST packets received clearly: %ld",
+            csma->pktsGotUnicast);
+    GLOMO_PrintStat(node, "MacCSMA", buf);
+    
+    sprintf(buf, "Number of BROADCAST packets received clearly: %ld",
+            csma->pktsGotBroadcast);
+    GLOMO_PrintStat(node, "MacCSMA", buf);
+}
+
+
+
+
+/*
+ * FUNCTION    MacCsmaInit
+ * PURPOSE     Initialization function for CSMA protocol of MAC layer.
+
+ * Parameters:
+ *     node:      node being initialized.
+ *     nodeInput: structure containing contents of input file
+ */
+
+void MacCsmaInit(
+   GlomoNode *node, int interfaceIndex, const GlomoNodeInput *nodeInput)
+{
+    BOOL         retVal;
+    GlomoMacCsma *csma = (GlomoMacCsma *) pc_malloc(sizeof(GlomoMacCsma));
+    char         buf[GLOMO_MAX_STRING_LENGTH];
+    
+    assert(csma != NULL);
+    
+    memset(csma, 0, sizeof(GlomoMacCsma));
+    csma->myGlomoMac = node->macData[interfaceIndex];
+    csma->myGlomoMac->macVar = (void *)csma;
+    
+    csma->timer.flag = CSMA_TIMER_OFF | CSMA_TIMER_UNDEFINED;
+    csma->timer.seq = 0;
+
+    csma->status = CSMA_STATUS_PASSIVE;
+    csma->BOmin = CSMA_BO_MIN;
+    csma->BOmax = CSMA_BO_MAX;
+    csma->BOtimes = 0;
+
+    csma->pktsToSend = 0;
+    csma->pktsLostOverflow = 0;
+
+    csma->pktsSentUnicast = 0;
+    csma->pktsSentBroadcast = 0;
+
+    csma->pktsGotUnicast = 0;
+    csma->pktsGotBroadcast = 0;
+}
+
+
+
+void MacCsmaReceivePacketFromRadio(
+    GlomoNode* node, GlomoMacCsma* csma, Message* msg) 
+{
+    if (csma->status == CSMA_STATUS_IN_XMITING) {
+        GLOMO_MsgFree(node, msg);
+        return;
+    }//if//
+ 
+    switch (csma->status) {
+    case CSMA_STATUS_PASSIVE:
+    case CSMA_STATUS_CARRIER_SENSE:
+    case CSMA_STATUS_BACKOFF:
+    case CSMA_STATUS_YIELD: {
+        int interfaceIndex = csma->myGlomoMac->interfaceIndex;
+        CsmaHeader *hdr = (CsmaHeader *) msg->packet;
+        if (hdr->destAddr == node->nodeAddr) {
+            csma->pktsGotUnicast++;
+        }
+        else if (hdr->destAddr == ANY_DEST) {
+            csma->pktsGotBroadcast++;
+        }
+ 
+        if ((hdr->destAddr == node->nodeAddr) ||
+            (hdr->destAddr == ANY_DEST)) 
+        {
+            NODE_ADDR lastHopAddress = hdr->sourceAddr; 
+            
+            GLOMO_MsgRemoveHeader(node, msg, sizeof(CsmaHeader));
+            
+            NetworkIpReceivePacketFromMacLayer(
+               node, msg, lastHopAddress);
+        } 
+        else {
+            if (node->macData[interfaceIndex]->promiscuousMode) {
+                MacCsmaHandlePromiscuousMode(node, msg);      
+            }
+            GLOMO_MsgFree(node, msg);
+        }
+        break;
+    }
+    default:
+        GLOMO_MsgFree(node, msg);
+        printf("MAC_CSMA: Error with node %u, status %ld.\n",
+               node->nodeAddr, csma->status);
+        assert(FALSE); abort();
+    }//switch//
+}
+
+
+
+void MacCsmaReceiveRadioStatusChangeNotification(
+   GlomoNode* node,
+   GlomoMacCsma* csma,
+   RadioStatusType oldRadioStatus,
+   RadioStatusType newRadioStatus)
+{
+   if (oldRadioStatus == RADIO_TRANSMITTING) {
+      assert(newRadioStatus != RADIO_TRANSMITTING);
+      assert(csma->status == CSMA_STATUS_IN_XMITING);
+      
+      csma->BOmin = CSMA_BO_MIN;
+      csma->BOmax = CSMA_BO_MAX;
+      csma->BOtimes = 0;
+      csma->status = CSMA_STATUS_YIELD;
+      MacCsmaYield(node, csma, (clocktype)CSMA_TX_DATA_YIELD_TIME);
+   }//if//
+}
+
+
+
+
+
+/*
+ * FUNCTION    MacCsmaLayer
+ * PURPOSE     Models the behaviour of the MAC layer with the CSMA protocol
+ *             on receiving the message enclosed in msg.
+ *
+ * Parameters:
+ *     node:     node which received the message
+ *     msg:      message received by the layer
+ */
+
+void MacCsmaLayer(GlomoNode *node, int interfaceIndex, Message *msg)
+{
+    /*
+     * Retrieve the pointer to the data portion which relates
+     * to the CSMA protocol.
+     */
+    
+    GlomoMacCsma *csma = (GlomoMacCsma *)node->macData[interfaceIndex]->macVar;
+    int seq_num;
+   
+    assert(msg->eventType == MSG_MAC_TimerExpired);
+            
+    seq_num = *((int *) msg->info);
+    
+    GLOMO_MsgFree(node, msg);
+    
+    if ((seq_num < csma->timer.seq) ||
+        ((csma->timer.flag & CSMA_TIMER_SWITCH) == CSMA_TIMER_OFF)) {
+        return;
+    }
+
+    if (seq_num > csma->timer.seq) {
+        assert(FALSE);
+    }
+
+    assert(((csma->timer.flag & CSMA_TIMER_TYPE) == 
+            CSMA_TIMER_BACKOFF) || 
+           ((csma->timer.flag & CSMA_TIMER_TYPE) == CSMA_TIMER_YIELD));
+      
+    switch(csma->timer.flag & CSMA_TIMER_TYPE) {
+    case CSMA_TIMER_BACKOFF:
+    {
+        Message *newMsg;
+        
+        csma->timer.flag = CSMA_TIMER_OFF | CSMA_TIMER_UNDEFINED;
+
+        CheckRadioStatusAndSendOrBackoff(node, csma);
+
+        break;
+    }
+    
+    case CSMA_TIMER_YIELD:
+        csma->timer.flag = CSMA_TIMER_OFF | CSMA_TIMER_UNDEFINED;
+        csma->status = CSMA_STATUS_PASSIVE;
+        MacCsmaPassive(node, csma);
+        break;
+
+    default:
+        assert(FALSE); abort();
+        break;
+    }/*switch*/
+}
+
+
+
+
+/*
+ * FUNCTION    GLOMO_MacFinalize
+ * PURPOSE     Called at the end of simulation to collect the results of 
+ *             the simulation of the CSMA protocol of MAC Layer.
+ *
+ * Parameter:
+ *     node:     node for which results are to be collected.
+ */
+
+void MacCsmaFinalize(GlomoNode *node, int interfaceIndex)
+{
+    GlomoMacCsma* csma = (GlomoMacCsma *)node->macData[interfaceIndex]->macVar;
+    
+    if (node->macData[interfaceIndex]->macStats == TRUE) {
+        MacCsmaPrintStats(node, csma);
+    }
+}
+
+
+
+

@@ -1,0 +1,285 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: driver.pc,v 1.39 2001/09/07 23:58:05 jmartin Exp $
+ *
+ * Driver entity for the simulatoin.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+#include <limits.h>
+
+#include "main.h"
+#include "message.h"
+#include "api.h"
+#include "fileio.h"
+#include "driver.h"
+#include "glomo.h"
+
+
+int main(int argc, char**argv) {
+    FILE *fw;
+    int i;
+
+    parsec_main(argc, argv);
+
+    fw = fopen("glomo.stat", "w");
+    
+    assert(fw != NULL);
+    
+    i = 1;
+    while (1) {
+        FILE *fr;
+        int readVal;
+        char fname[20];
+        char buf[1000];
+            
+        sprintf(fname, ".STAT.%d", i);
+        fr = fopen(fname, "r");
+
+        if (fr == NULL) {
+            break;
+        }
+
+        while (1) {
+            int readVal;
+            readVal = fread(buf, 1, 1000, fr);
+            fwrite(buf, 1, readVal, fw);
+
+            if (readVal < 1000) {
+                break;
+            }
+        }
+
+        fclose(fr);
+        remove(fname);
+
+        i++;
+    }
+
+    exit(0);
+}
+
+
+entity driver(int argc, char **argv) {
+    int        nodeNum;            /* number of nodes in simulation */
+    FILE      *inputFile;          /* input file descriptor */
+    int        retVal;             /* return Value from function call */
+    int        partitionNum_x;     /* the number of x partitions */
+    int        partitionNum_y;     /* the number of y partitions */
+    int        partitionConnectivityDistance;  
+                                   /* Number Partitions away a signal */
+                                   /* can propagate. */
+    double     boundryPartitionSizeBias;  
+                                   /* Percentage larger in each X Y */
+                                   /* direction that a partition is */
+                                   /* boundry  */
+
+    GlomoCoordinates terrainDimensions;
+
+    int        gridUnit;           /* tells how far nodes are apart in
+                                    * a grid topology in terms of meters */
+    clocktype  maxSimClock;        /* max clock used in simulation */
+    int        seedVal;            /* Seed read from file */
+    int        i, j, k;
+
+    /* Buffer used for reading data from file */
+    char        buf[GLOMO_MAX_STRING_LENGTH];
+
+    GlomoNodeInput      nodeInput;
+
+    unsigned short      seed[3];          /* Seed for driver entitiy */
+
+    
+
+    ename    partitionEntityName = ENULL; /* ename for the partition */
+    GlomoNodePositionInfo    *nodeData;        /* position of nodes */
+
+    /*
+     * Input file name has to be specified.
+     */
+    if (argc < 2) {
+        fprintf(stderr, "GLOMO Correct Usage:\n\t%s input-filename.\n",
+                argv[0]);
+        assert(0); abort();
+    }
+    
+    GLOMO_ReadFile(&nodeInput, argv[1]);
+
+
+    /*
+     * Read terrain information.
+     */
+    retVal = GLOMO_ReadString(-1, &nodeInput, "TERRAIN-DIMENSIONS", buf);
+
+    if (retVal == TRUE) {
+        char NotUsed[GLOMO_MAX_STRING_LENGTH];
+        
+        GLOMO_ConvertToCoordinates(buf, &terrainDimensions);
+        assert(!GLOMO_ReadString(-1, &nodeInput, "TERRAIN-RANGE-X", NotUsed));
+        assert(!GLOMO_ReadString(-1, &nodeInput, "TERRAIN-RANGE-Y", NotUsed));
+    } else {
+        // Backwards Compatibility.
+        
+        BOOL X_RangeFound = GLOMO_ReadDouble(-1, &nodeInput, "TERRAIN-RANGE-X", 
+                                         &terrainDimensions.x);
+        BOOL Y_RangeFound = GLOMO_ReadDouble(-1, &nodeInput, "TERRAIN-RANGE-Y", 
+                                         &terrainDimensions.y);
+        if (!X_RangeFound || !Y_RangeFound) {
+           fprintf(stderr, "TERRAIN-RANGE-X or TERRAIN-RANGE-Y not found\n");
+           abort();
+        }//if// 
+        
+        terrainDimensions.z = 0.0;
+    }
+    
+    /* Default to 1 Partition */
+    partitionNum_x = 1;
+    partitionNum_y = 1;
+
+    
+
+    /*
+     * Read the seed value and initialize the driver seed.
+     */
+    retVal = GLOMO_ReadInt(-1, &nodeInput, "SEED", &seedVal);
+    assert(retVal == TRUE);
+    seed[2] = USHRT_MAX;
+    seed[0] = USHRT_MAX;
+    seed[1] = (unsigned short) seedVal;
+
+
+    /*
+     * Get information about other parameters.
+     */
+    retVal = GLOMO_ReadString(-1, &nodeInput, "SIMULATION-TIME", buf);
+    assert(retVal == TRUE);
+    maxSimClock = GLOMO_ConvertToClock(buf);
+    setmaxclock(maxSimClock);
+
+    PrintSimTimeInterval = maxSimClock / NUM_SIM_TIME_STATUS_PRINTS;
+
+    retVal = GLOMO_ReadInt(-1, &nodeInput, "NUMBER-OF-NODES", &nodeNum);
+    assert(retVal == TRUE);
+
+    /*
+     * Allocate memory for node information.
+     */
+    nodeData = (GlomoNodePositionInfo *)
+        checked_pc_malloc(sizeof(GlomoNodePositionInfo) * nodeNum);
+    memset(nodeData, 0, sizeof(GlomoNodePositionInfo) * nodeNum);
+
+    
+
+    /*
+     * Create all the partitions.
+     */
+    
+    
+    partitionEntityName = new GLOMOPartition(1, self);
+    send PartitionInfoMsg {
+            NULL, 1, 1, 0.0, 0, 0,
+            (unsigned short) seedVal,
+            nodeNum, nodeInput,
+            terrainDimensions
+         } to partitionEntityName;
+    
+
+    /*
+     * Determine the input type we are using
+     * to place nodes in the simulation.
+     */
+    retVal = GLOMO_ReadString(-1, &nodeInput, "NODE-PLACEMENT", buf);
+    assert(retVal == TRUE);
+
+    /*
+     * Figure out the input type and call the appropriate function.
+     */
+    if (strcmp(buf, "RANDOM") == 0) {
+        j = DriverGenerateRandomNodes(nodeData, nodeNum,
+                                      terrainDimensions, seed);
+    }
+    else if (strcmp(buf, "UNIFORM") == 0) {
+        j = DriverGenerateUniformNodes(nodeData, nodeNum,
+                                       terrainDimensions, seed);
+    }
+    else if (strcmp(buf, "GRID") == 0) {
+        retVal = GLOMO_ReadInt(-1, &nodeInput, "GRID-UNIT", &gridUnit);
+        assert(retVal == TRUE);
+        j = DriverGenerateGridNodes(nodeData, nodeNum, gridUnit,
+                                    terrainDimensions);
+    }
+    else if (strcmp(buf, "FILE") == 0) {
+        char nodeFileName[GLOMO_MAX_STRING_LENGTH];
+        retVal = GLOMO_ReadString(-1, &nodeInput, "NODE-PLACEMENT-FILE",
+                                  nodeFileName);
+        assert(retVal == TRUE);
+
+        j = DriverGenerateInputNodes(nodeData, nodeNum,
+                                     terrainDimensions, &nodeInput);
+    }
+    else {
+        fprintf(stderr, "GLOMO Error: Node Input Type has invalid "
+                "value %s.\n", buf);
+        abort();
+    }
+    assert(j == nodeNum);
+
+    
+    send NodePositionMsg {nodeData} to partitionEntityName;
+    receive (Ready msg);
+    send StartSim { } to partitionEntityName;
+
+    //
+    //pc_free(nodeData);
+    //
+    //
+    // Comment out GLOMO_FreeNodeInput() for now as other entities may access
+    // This should be in finalize statement of driver when PARSEC support
+    // "finalize driver entity last"
+    //
+    //GLOMO_FreeNodeInput(&nodeInput);
+}
+
+
+
+

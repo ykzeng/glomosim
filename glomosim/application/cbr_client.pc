@@ -1,0 +1,593 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: cbr_client.pc,v 1.13 2001/02/15 03:17:26 mineo Exp $
+ */
+
+
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+
+#include "application.h"
+#include "app_util.h"
+#include "cbr_client.h"
+
+#define noDEBUG
+#define noEXCEL
+
+
+/*
+ * NAME:        AppLayerCbrClient.
+ * PURPOSE:     Models the behaviour of CbrClient Client on receiving the
+ *              message encapsulated in msg.
+ * PARAMETERS:  nodePtr - pointer to the node which received the message.
+ *              msg - message received by the layer
+ * RETURN:      none.
+ */
+void
+AppLayerCbrClient(GlomoNode *nodePtr, Message *msg)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    GlomoAppCbrClient *clientPtr;
+
+    ctoa(simclock(), buf);
+
+    #ifdef DEBUG
+        printf("CBR Client: Node %ld got a message at %s\n",
+               nodePtr->nodeAddr, buf);
+    #endif
+
+    switch(msg->eventType)
+    {
+        case MSG_APP_TimerExpired:
+        {
+            AppTimer *timer;
+
+            timer = (AppTimer *) GLOMO_MsgReturnInfo(msg);
+
+            #ifdef DEBUG
+                printf("CBR Client: Node %ld at %s got timer %d\n", 
+                       nodePtr->nodeAddr, buf, timer->type);
+            #endif
+
+            clientPtr = AppCbrClientGetCbrClient(nodePtr, timer->uniqueId);
+
+            if (clientPtr == NULL)
+            {
+                printf("CBR Client: Node %ld cannot find cbr client\n",
+                       nodePtr->nodeAddr);
+
+                assert(FALSE);
+            }
+
+            switch (timer->type)
+            {
+                case APP_TIMER_SEND_PKT:
+                {
+                    char payload[MAX_APP_DATA_UNIT];
+                    GlomoAppCbrData data;
+                    long layer;
+
+                    memset(payload, 0, MAX_APP_DATA_UNIT);
+
+                    #ifdef DEBUG
+                        printf("CBR Client: Node %ld has %ld items "
+                               "left to send\n", nodePtr->nodeAddr, 
+                               clientPtr->itemsToSend);
+                    #endif
+
+                    if (((clientPtr->itemsToSend > 1) && 
+                         (simclock() + clientPtr->interval < clientPtr->endTime)) ||
+                        ((clientPtr->itemsToSend == 0) && 
+                         (simclock() + clientPtr->interval < clientPtr->endTime)) ||
+                        ((clientPtr->itemsToSend > 1) && 
+                         (clientPtr->endTime == 0)) ||
+                        ((clientPtr->itemsToSend == 0) && 
+                         (clientPtr->endTime == 0)))
+                    {
+                        data.type = 'd';
+                    }
+                    else
+                    {
+                        data.type = 'c';
+                        clientPtr->sessionIsClosed = TRUE;
+                        clientPtr->sessionFinish = simclock();
+                    }
+
+                    data.uniqueId = clientPtr->uniqueId;
+                    data.txTime = simclock();
+                    data.seqNo = clientPtr->seqNo++;
+                    memcpy(payload, &data, sizeof(data));
+
+                    #ifdef DEBUG
+                        ctoa(simclock(), clockStr);
+
+                        printf("CBR Client: node %ld sending data packet"
+                               " at time %s to CBR server %ld\n",  
+                               nodePtr->nodeAddr, clockStr, 
+                               clientPtr->remoteAddr);
+
+                        printf("    size of payload is %d\n", 
+                               clientPtr->itemSize);
+                    #endif
+
+                    AppUdpSendNewDataWithPriority(nodePtr,
+                                                  APP_CBR_SERVER,
+                                                  clientPtr->remoteAddr,
+                                                  payload,
+                                                  clientPtr->itemSize,
+                                                  REAL_TIME,
+                                                  0);
+                                       
+                    clientPtr->numBytesSent += clientPtr->itemSize;
+                    clientPtr->numPktsSent++;
+                    clientPtr->sessionLastSent = simclock();
+
+                    if (clientPtr->itemsToSend > 0)
+                    {
+                        clientPtr->itemsToSend--;
+                    }
+
+                    if (clientPtr->sessionIsClosed == FALSE)
+                    {
+                        AppCbrClientScheduleNextPkt(nodePtr, clientPtr);
+                    }
+
+                    break;
+                }
+
+                default:
+                    assert(FALSE);
+            }
+
+            break;
+        }
+        default:
+           ctoa(simclock(), buf);
+           printf("CBR Client: at time %s, node %ld "
+                  "received message of unknown type"
+                  " %ld.\n", buf, nodePtr->nodeAddr, msg->eventType);
+           assert(FALSE);
+    }
+ 
+    GLOMO_MsgFree(nodePtr, msg);
+}
+
+
+/*
+ * NAME:        AppCbrClientInit.
+ * PURPOSE:     Initialize a CbrClient session.
+ * PARAMETERS:  nodePtr - pointer to the node,
+ *              serverAddr - address of the server,
+ *              itemsToSend - number of items to send,
+ *              itemSize - size of each packet,
+ *              interval - interval of packet transmission rate.
+ *              startTime - time until the session starts,
+ *              endTime - time until the session ends,
+ * RETURN:      none.
+ */
+void
+AppCbrClientInit(GlomoNode *nodePtr, 
+                 NODE_ADDR serverAddr, 
+                 long itemsToSend,
+                 long itemSize,
+                 clocktype interval,
+                 clocktype startTime,
+                 clocktype endTime)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    AppTimer *timer;
+    GlomoAppCbrClient *clientPtr;
+    long layer;
+    Message *timerMsg;
+    int minSize;
+
+    minSize = sizeof(GlomoAppCbrData);
+
+    /* Check to make sure the number of cbr items is a correct value. */
+    if (itemsToSend < 0)
+    {
+        printf("CBR Client: Node %ld item to sends needs to be >= 0\n",
+               nodePtr->nodeAddr);
+
+        exit(0);
+    }
+
+    /* Make sure that packet is big enough to carry cbr data information. */
+    if (itemSize < minSize)
+    {
+        printf("CBR Client: Node %ld item size needs to be >= %d.\n",
+                nodePtr->nodeAddr, minSize);
+        exit(0);
+    }
+
+    /* Make sure that packet is within max limit. */
+    if (itemSize > MAX_APP_DATA_UNIT)
+    {
+        printf("CBR Client: Node %ld item size needs to be <= %d.\n",
+                nodePtr->nodeAddr, MAX_APP_DATA_UNIT);
+        exit(0);
+    }
+
+    /* Make sure interval is valid. */
+    if (interval <= 0)
+    {
+        printf("CBR Client: Node %ld interval needs to be > 0.\n",
+                nodePtr->nodeAddr);
+        exit(0);
+    }
+
+    /* Make sure start time is valid. */
+    if (startTime < 0)
+    {
+        printf("CBR Client: Node %ld start time needs to be >= 0.\n",
+                nodePtr->nodeAddr);
+        exit(0);
+    }
+
+    /* Check to make sure the end time is a correct value. */
+    if (!((endTime > startTime) || (endTime == 0)))
+    {
+        printf("CBR Client: Node %ld end time needs to be > start time "
+               "or equal to 0.\n", nodePtr->nodeAddr);
+
+        exit(0);
+    }
+
+    #ifdef EXCEL
+        /* Remove statistic file formatted for excel. */
+        remove(APP_CBR_CLIENT_FILE);
+    #endif
+
+    clientPtr = AppCbrClientNewCbrClient(nodePtr,
+                                         serverAddr,
+                                         itemsToSend,
+                                         itemSize,
+                                         interval,
+                                         startTime,
+                                         endTime);
+
+    if (clientPtr == NULL)
+    {
+        printf("CBR Client: Node %ld cannot allocate memory for new client\n",
+                nodePtr->nodeAddr);
+    
+        assert(FALSE);
+    }
+
+    timerMsg = GLOMO_MsgAlloc(nodePtr,
+                              GLOMO_APP_LAYER,
+                              APP_CBR_CLIENT,
+                              MSG_APP_TimerExpired);
+
+    GLOMO_MsgInfoAlloc(nodePtr, timerMsg, sizeof(AppTimer));
+
+    timer = (AppTimer *)GLOMO_MsgReturnInfo(timerMsg);
+
+    timer->uniqueId = clientPtr->uniqueId;
+    timer->type = APP_TIMER_SEND_PKT;
+
+    #ifdef DEBUG
+        ctoa(startTime, clockStr);
+        printf("CBR Client: Node %ld starting client at %s\n", 
+                nodePtr->nodeAddr, clockStr);
+    #endif
+
+    GLOMO_MsgSend(nodePtr, timerMsg, startTime);
+}
+
+
+/*
+ * NAME:        AppCbrClientPrintStats.
+ * PURPOSE:     Prints statistics of a CbrClient session.
+ * PARAMETERS:  nodePtr - pointer to the this node.
+ *              clientPtr - pointer to the cbr client data structure.
+ * RETURN:      none.
+ */
+void AppCbrClientPrintStats(GlomoNode *nodePtr, GlomoAppCbrClient *clientPtr) {
+    FILE *excel = NULL;
+    clocktype throughput;
+
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    char startStr[GLOMO_MAX_STRING_LENGTH];
+    char closeStr[GLOMO_MAX_STRING_LENGTH];
+    char sessionStatusStr[GLOMO_MAX_STRING_LENGTH];
+    char throughputStr[GLOMO_MAX_STRING_LENGTH];
+
+    char buf[GLOMO_MAX_STRING_LENGTH];
+
+    #ifdef EXCEL
+        excel = fopen(APP_CBR_CLIENT_FILE, "a");
+
+        if (excel == NULL)
+        {
+            fprintf(stderr, "CBR Client: cannot open excel file.\n");
+            assert(FALSE);
+        }
+    #endif
+
+    GLOMO_PrintClockInSecond(clientPtr->sessionStart, startStr);
+    GLOMO_PrintClockInSecond(clientPtr->sessionLastSent, closeStr);
+
+    if (clientPtr->sessionIsClosed == FALSE) {
+        clientPtr->sessionFinish = simclock();
+        sprintf(sessionStatusStr, "Not closed");
+    }
+    else {
+        sprintf(sessionStatusStr, "Closed");
+    }
+
+    if (clientPtr->sessionFinish <= clientPtr->sessionStart) {
+        throughput = 0;
+    } 
+    else {
+        throughput = (clientPtr->numBytesSent * 8.0 * SECOND) /
+                     (clientPtr->sessionFinish - clientPtr->sessionStart);
+    }
+
+    ctoa(throughput, throughputStr);
+
+    sprintf(buf, "(%d) Server address: %d",
+            clientPtr->uniqueId, clientPtr->remoteAddr);
+    GLOMO_PrintStat(nodePtr, "AppCbrClient", buf);
+
+    sprintf(buf, "(%d) First packet sent at [s]: %s",
+            clientPtr->uniqueId, startStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrClient", buf);
+
+    sprintf(buf, "(%d) Last packet sent at [s]: %s",
+            clientPtr->uniqueId, closeStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrClient", buf);
+
+    sprintf(buf, "(%d) Session status: %s",
+            clientPtr->uniqueId, sessionStatusStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrClient", buf);
+
+    sprintf(buf, "(%d) Total number of bytes sent: %ld",
+            clientPtr->uniqueId, clientPtr->numBytesSent);
+    GLOMO_PrintStat(nodePtr, "AppCbrClient", buf);
+
+    sprintf(buf, "(%d) Total number of packets sent: %ld",
+            clientPtr->uniqueId, clientPtr->numPktsSent);
+    GLOMO_PrintStat(nodePtr, "AppCbrClient", buf);
+
+    sprintf(buf, "(%d) Throughput (bits per second): %s",
+            clientPtr->uniqueId, throughputStr);
+    GLOMO_PrintStat(nodePtr, "AppCbrClient", buf);
+
+
+    #ifdef EXCEL
+        fprintf(excel, "%ld\t%ld\t%d\t%s\t%s\t%ld\t%ld\t%s\n",
+                clientPtr->localAddr, clientPtr->remoteAddr, 
+                clientPtr->uniqueId, startStr, closeStr,
+                clientPtr->numBytesSent,
+                clientPtr->numPktsSent, throughputStr);
+
+        fflush(excel);
+        fclose(excel);
+    #endif
+}
+
+
+/*
+ * NAME:        AppCbrClientFinalize.
+ * PURPOSE:     Collect statistics of a CbrClient session.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              clientPtr - pointer to the cbr client data structure.
+ * RETURN:      none.
+ */
+void
+AppCbrClientFinalize(GlomoNode *nodePtr, GlomoAppCbrClient *clientPtr)
+{
+    if (nodePtr->appData.appStats == TRUE)
+    {
+        AppCbrClientPrintStats(nodePtr, clientPtr);
+    }
+}
+
+
+/*
+ * NAME:        AppCbrClientGetCbrClient.
+ * PURPOSE:     search for a cbr client data structure.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              uniqueId - connection ID of the cbr client.
+ * RETURN:      the pointer to the cbr client data structure,
+ *              NULL if nothing found.
+ */
+static GlomoAppCbrClient *
+AppCbrClientGetCbrClient(GlomoNode *nodePtr, int uniqueId)
+{
+    AppInfo *appList = nodePtr->appData.appPtr;
+    GlomoAppCbrClient *cbrClient;
+
+    for (; appList != NULL; appList = appList->appNext)
+    {
+        if (appList->appType == APP_CBR_CLIENT)
+        {
+            cbrClient = (GlomoAppCbrClient *) appList->appDetail;
+
+            if (cbrClient->uniqueId == uniqueId)
+            {
+                return cbrClient;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * NAME:        AppCbrClientNewCbrClient.
+ * PURPOSE:     create a new cbr client data structure, place it
+ *              at the beginning of the application list.
+ * PARAMETERS:  nodePtr - pointer to the node.
+ *              remoteAddr - remote address.
+ *              itemsToSend - number of cbr items to send in simulation.
+ *              itemSize - size of each packet.
+ *              interval - time between two packets.
+ *              startTime - when the node will start sending.
+ * RETURN:      the pointer to the created cbr client data structure,
+ *              NULL if no data structure allocated.
+ */
+static GlomoAppCbrClient *
+AppCbrClientNewCbrClient(GlomoNode *nodePtr, 
+                         NODE_ADDR remoteAddr,
+                         long itemsToSend,
+                         long itemSize,
+                         clocktype interval, 
+                         clocktype startTime,
+                         clocktype endTime)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    AppInfo *newApp;
+    GlomoAppCbrClient *cbrClient;
+
+    newApp = (AppInfo *) pc_malloc(sizeof(AppInfo));
+
+    if (newApp == NULL)
+    {
+        printf("CBR Client: Node %d unable to allocate AppInfo\n",
+               nodePtr->nodeAddr);
+
+        assert(FALSE);
+    }
+
+    cbrClient = (GlomoAppCbrClient *)
+                pc_malloc(sizeof(GlomoAppCbrClient));
+
+    if (cbrClient == NULL)
+    {
+        printf("CBR Client: Node %d unable to allocate cbr client structure\n",
+               nodePtr->nodeAddr);
+
+        assert(FALSE);
+    }
+
+    /*
+     * fill in cbr info.
+     */
+    newApp->appType = APP_CBR_CLIENT;
+    cbrClient->localAddr = nodePtr->nodeAddr;
+    cbrClient->remoteAddr = remoteAddr;
+    cbrClient->interval = interval;
+    cbrClient->sessionStart = simclock() + startTime;
+    cbrClient->sessionIsClosed = FALSE;
+    cbrClient->sessionLastSent = simclock();
+    cbrClient->sessionFinish = simclock();
+    cbrClient->endTime = endTime;
+    cbrClient->numBytesSent = 0;
+    cbrClient->numPktsSent = 0;
+    cbrClient->itemsToSend = itemsToSend;
+    cbrClient->itemSize = itemSize;
+    cbrClient->uniqueId = nodePtr->appData.uniqueId++;
+    cbrClient->seqNo = 0;
+
+    #ifdef DEBUG
+        printf("CBR Client: Node %ld created new cbr client structure\n",
+               nodePtr->nodeAddr);
+        printf("    localAddr = %ld\n", cbrClient->localAddr);
+        printf("    remoteAddr = %ld\n", cbrClient->remoteAddr);
+        ctoa(cbrClient->interval, clockStr);
+        printf("    interval = %s\n", clockStr);
+        ctoa(cbrClient->sessionStart, clockStr);
+        printf("    sessionStart = %s\n", clockStr);
+        printf("    numBytesSent = %ld\n", cbrClient->numBytesSent);
+        printf("    numPktsSent = %ld\n", cbrClient->numPktsSent);
+        printf("    itemsToSend = %ld\n", cbrClient->itemsToSend);
+        printf("    itemSize = %ld\n", cbrClient->itemSize);
+        printf("    uniqueId = %ld\n", cbrClient->uniqueId);
+        printf("    seqNo = %ld\n", cbrClient->seqNo);
+    #endif
+
+    newApp->appDetail = cbrClient;
+    newApp->appNext = nodePtr->appData.appPtr;
+    nodePtr->appData.appPtr = newApp;
+
+    return cbrClient;
+}
+
+
+/*
+ * NAME:        AppCbrClientScheduleNextPkt.
+ * PURPOSE:     schedule the next packet the client will send.  If next packet
+ *              won't arrive until the finish deadline, schedule a close.
+ * PARAMETERS:  nodePtr - pointer to the node,
+ *              clientPtr - pointer to the cbr client data structure.
+ * RETRUN:      none.
+ */
+static void
+AppCbrClientScheduleNextPkt(GlomoNode *nodePtr, GlomoAppCbrClient *clientPtr)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    AppTimer *timer;
+    long layer;
+    Message *timerMsg;
+
+    timerMsg = GLOMO_MsgAlloc(nodePtr,
+                              GLOMO_APP_LAYER,
+                              APP_CBR_CLIENT,
+                              MSG_APP_TimerExpired);
+
+    GLOMO_MsgInfoAlloc(nodePtr, timerMsg, sizeof(AppTimer));
+
+    timer = (AppTimer *)GLOMO_MsgReturnInfo(timerMsg);
+    timer->uniqueId = clientPtr->uniqueId;
+
+    timer->type = APP_TIMER_SEND_PKT;
+
+    #ifdef DEBUG   
+        printf("CBR Client: Node %ld scheduling next data packet\n", 
+               nodePtr->nodeAddr);
+        printf("    timer type is %d\n", timer->type);
+        ctoa(clientPtr->interval, clockStr);
+        printf("    interval is %s\n", clockStr);
+    #endif
+
+    GLOMO_MsgSend(nodePtr, timerMsg, clientPtr->interval);
+}
+

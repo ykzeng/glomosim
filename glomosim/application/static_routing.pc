@@ -1,0 +1,168 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/* 
+ * $Id: static_routing.pc,v 1.7 2000/09/21 19:49:26 mineo Exp $
+ *
+ * NAME:            static_routing.pc.
+ *
+ * WRITTEN BY:      Ken Tang.
+ *
+ * PURPOSE:         Static routing.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+
+#include "main.h"
+#include "api.h"
+#include "structmsg.h"
+#include "fileio.h"
+#include "message.h"
+#include "network.h"
+#include "nwcommon.h"
+
+#include "static_routing.h"
+#include "../mac/wiredlink.h"
+
+/*
+ * NAME:        RoutingStaticInit.
+ *
+ * PURPOSE:     Handling all initializations needed by static routing.
+ *
+ * PARAMETERS:  node, node doing the initialization.
+ *              nodeInput, input from configuration file.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingStaticInit(GlomoNode *node, const GlomoNodeInput *nodeInput) {
+    int i, j;
+    GlomoNodeInput routeInput;
+    char buf[GLOMO_MAX_STRING_LENGTH];
+    char routeStr[GLOMO_MAX_STRING_LENGTH];
+    BOOL retVal;
+
+    NetworkEmptyForwardingTable(node);
+
+    retVal = GLOMO_ReadCachedFile(nodeInput, "STATIC-ROUTE-FILE", &routeInput);
+
+    if (retVal == FALSE) {
+        printf("RoutingStatic: Static routing needs STATIC-ROUTE-FILE.\n");
+        assert(FALSE); abort();
+    }
+
+    for (i = 0; i < routeInput.numLines; i++) {
+        NODE_ADDR sourceAddr, destAddr, nextHop;
+        InterfaceIdType interfaceId;
+        int numParameters;
+
+        numParameters = sscanf(routeInput.inputStrings[i], "%u %u %u %u", 
+                               &sourceAddr, &destAddr, &nextHop, &interfaceId);
+
+        assert(numParameters == 3 || numParameters == 4);
+
+        if (node->nodeAddr == sourceAddr) {
+            if (numParameters == 3) {
+                int wiredInterfaceId
+                    = WiredLinkInterfaceIdForThisDest(node, nextHop);
+
+                if (wiredInterfaceId != -1) {
+                    interfaceId = wiredInterfaceId;
+                }
+                else {
+                    interfaceId = DEFAULT_INTERFACE;
+                }
+            }
+            else {
+                assert((interfaceId < node->numberRadios) ||
+                       (WiredLinkInterfaceIdForThisDest(node, nextHop)
+                        == interfaceId));
+            }
+
+            NetworkUpdateForwardingTable(node, destAddr, interfaceId, nextHop);
+        }//if//
+    }
+}
+
+
+
+
+/*
+ * NAME:        RoutingStaticLayer.
+ *
+ * PURPOSE:     Handles all messages sent to network layer.
+ *
+ * PARAMETERS:  node, node receiving message.
+ *              msg, message for node to interpret.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingStaticLayer(GlomoNode *node, const Message *msg)
+{
+    char clockStr[GLOMO_MAX_STRING_LENGTH];
+    ctoa(simclock(), clockStr);
+    printf("RoutingStatic: Got unknown event type %d\n", msg->eventType);
+    assert(FALSE);
+}
+
+
+
+/*
+ * NAME:        RoutingStaticFinalize.
+ *
+ * PURPOSE:     Handling all finalization needed by static routing.
+ *
+ * PARAMETERS:  node, node doing the finalization.
+ *
+ * RETURN:      None.
+ *
+ * ASSUMPTION:  None.
+ */
+
+void RoutingStaticFinalize(GlomoNode *node)
+{
+}
+

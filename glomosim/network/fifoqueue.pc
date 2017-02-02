@@ -1,0 +1,453 @@
+/*
+ * GloMoSim is COPYRIGHTED software.  Release 2.02 of GloMoSim is available 
+ * at no cost to educational users only.
+ *
+ * Commercial use of this software requires a separate license.  No cost,
+ * evaluation licenses are available for such purposes; please contact
+ * info@scalable-networks.com
+ *
+ * By obtaining copies of this and any other files that comprise GloMoSim2.02,
+ * you, the Licensee, agree to abide by the following conditions and
+ * understandings with respect to the copyrighted software:
+ *
+ * 1.Permission to use, copy, and modify this software and its documentation
+ *   for education and non-commercial research purposes only is hereby granted
+ *   to Licensee, provided that the copyright notice, the original author's
+ *   names and unit identification, and this permission notice appear on all
+ *   such copies, and that no charge be made for such copies. Any entity
+ *   desiring permission to use this software for any commercial or
+ *   non-educational research purposes should contact: 
+ *
+ *   Professor Rajive Bagrodia 
+ *   University of California, Los Angeles 
+ *   Department of Computer Science 
+ *   Box 951596 
+ *   3532 Boelter Hall 
+ *   Los Angeles, CA 90095-1596 
+ *   rajive@cs.ucla.edu
+ *
+ * 2.NO REPRESENTATIONS ARE MADE ABOUT THE SUITABILITY OF THE SOFTWARE FOR ANY
+ *   PURPOSE. IT IS PROVIDED "AS IS" WITHOUT EXPRESS OR IMPLIED WARRANTY.
+ *
+ * 3.Neither the software developers, the Parallel Computing Lab, UCLA, or any
+ *   affiliate of the UC system shall be liable for any damages suffered by
+ *   Licensee from the use of this software.
+ */
+
+// Use the latest version of Parsec if this line causes a compiler error.
+/*
+ * $Id: fifoqueue.pc,v 1.5 2001/08/31 19:16:42 jmartin Exp $
+ */
+/* FILENAME: fifoqueue.pc
+ * PURPOSE:  MAC layer queuing operations
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+
+#include "main.h"
+#include "fifoqueue.h"
+#include "mac.h"
+#include "api.h"
+
+
+/* FUNCTION:     MAC_InitializeQueue()
+ * PURPOSE:      Initializes the queue. 
+ */
+
+static /*inline*/
+void FifoPacketQueueInitialize(FifoPacketQueueType* queue, int maxSize)
+{
+   assert(maxSize > 1);
+   queue->maxPackets = maxSize;
+   queue->packetArray = (Message**)pc_malloc(sizeof(Message*) * maxSize);
+   queue->numPackets = 0;
+   queue->headIndex = 1;
+   queue->tailIndex = 0;
+}
+
+
+/* FUNCTION:     MAC_IsEmptyQueue()
+ * PURPOSE:      Checks if the queue is empty. 
+ */
+
+static /*inline*/
+BOOL FifoPacketQueueIsEmpty(const FifoPacketQueueType* queue)
+{
+   return(queue->numPackets == 0);
+}
+
+/* FUNCTION:     MAC_IsEmptyQueue()
+ * PURPOSE:      Checks if the queue is full. 
+ */
+
+static /*inline*/
+BOOL FifoPacketQueueIsFull(const FifoPacketQueueType* queue)
+{
+   return(queue->numPackets == queue->maxPackets);
+}
+
+
+/* FUNCTION:     IP_FifoQueueInsert()
+ * PURPOSE:      Addition of a packet to the end of the queue
+ */
+
+static /*inline*/
+void FifoPacketQueueInsert(FifoPacketQueueType* queue, Message* item)
+{
+   assert(queue->numPackets <= queue->maxPackets);
+   assert((queue->tailIndex >= 0) && 
+          (queue->tailIndex < queue->maxPackets));
+   
+   queue->numPackets++;
+   queue->tailIndex++;
+   if (queue->tailIndex == queue->maxPackets) {
+      queue->tailIndex = 0;
+   }
+   queue->packetArray[queue->tailIndex] = item;
+}
+
+   
+/* FUNCTION:     IP_FifoQueueDequeue()
+ * PURPOSE:      Dequeues a packet 
+ */
+
+static /*inline*/
+void FifoPacketQueueDequeue(
+    FifoPacketQueueType* queue, 
+    int messageIndex,
+    Message** outPacket)
+{
+   assert(queue->numPackets > 0);
+   assert((queue->headIndex >= 0) && 
+          (queue->headIndex < queue->maxPackets));
+   assert(messageIndex < queue->numPackets);
+   
+   if (messageIndex == 0) {
+      *outPacket = queue->packetArray[queue->headIndex];
+      queue->headIndex++;
+      if (queue->headIndex == queue->maxPackets) {
+         queue->headIndex = 0;
+      }
+   } else {
+      int I;
+      int Index = queue->headIndex + messageIndex;
+      if (Index >= queue->maxPackets) {
+         Index = Index - queue->maxPackets;
+      }//if//
+      
+      *outPacket = queue->packetArray[Index];
+      
+      if (queue->tailIndex >= Index) {
+         int I;
+         for(I=Index; (I < queue->tailIndex); I++) {
+            queue->packetArray[I] = queue->packetArray[I+1];
+         }//for//
+         if (queue->tailIndex == 0) {
+            queue->tailIndex = queue->maxPackets - 1;
+         } else {
+            queue->tailIndex--;
+         }//if//
+      } else {
+         int I;
+         for(I=Index; (I < (queue->maxPackets-1)); I++) {
+            queue->packetArray[I] = queue->packetArray[I+1];
+         }//for//
+         queue->packetArray[queue->maxPackets - 1] = queue->packetArray[0];
+         if (queue->tailIndex == 0) {
+            queue->tailIndex = queue->maxPackets - 1;
+         } else {
+            for(I = 0; (I < queue->tailIndex); I++) {
+               queue->packetArray[I] = queue->packetArray[I+1];
+            }//for//
+            queue->tailIndex--;
+         }//if//
+      }//if//
+   }//if// 
+   queue->numPackets--;
+}
+
+
+
+/* FUNCTION:     IP_FifoQueueTop()
+ * PURPOSE:      Looks at the packet at the head(front) of the queue
+ */
+
+static /*inline*/
+Message* FifoPacketQueueRetrieve(
+   const FifoPacketQueueType* queue,
+   const int messageIndex)
+{
+   if (queue->numPackets == 0) { 
+      return NULL;
+   }
+   else {
+      assert((queue->headIndex >= 0) && 
+             (queue->headIndex < queue->maxPackets));
+      assert(messageIndex < queue->numPackets);
+      
+      if (messageIndex == 0) {
+         return(queue->packetArray[queue->headIndex]);
+      } else {
+         int Index = queue->headIndex + messageIndex;
+         if (Index >= queue->maxPackets) {
+            Index = Index - queue->maxPackets;
+         }//if//
+         return(queue->packetArray[Index]);
+      }//if//
+   }
+}
+
+
+static
+void PerformRedInsertProcessing(
+   RedInformationType* redInfo,
+   int currentQueueSize,
+   BOOL* dropPacket) 
+{
+   *dropPacket = FALSE;
+   if (currentQueueSize > 0) {
+      redInfo->AverageQueueSize = 
+         (1 - redInfo->QueueWeight) * redInfo->AverageQueueSize +
+         redInfo->QueueWeight * (currentQueueSize + 1);
+   } else {
+      int NumPretendPackets = 
+         (simclock() - redInfo->StartOfQueueIdleTime) /
+         redInfo->TypicalPacketTransmissionTime;
+         
+      redInfo->AverageQueueSize = redInfo->AverageQueueSize *
+        exp(NumPretendPackets * log(1.0 - redInfo->QueueWeight));
+   }//if//
+   if (redInfo->AverageQueueSize >= redInfo->MaxThresholdForQueue) {
+      *dropPacket = TRUE;
+      redInfo->PacketsSinceLastMarkedPacket = 0;
+   } 
+   else if (redInfo->AverageQueueSize >= redInfo->MinThresholdForQueue) 
+   {
+      double MarkProb; 
+      double RawMarkProb = redInfo->MaxPacketMarkingProbability * 
+         ((redInfo->AverageQueueSize - redInfo->MinThresholdForQueue) /
+         (redInfo->MaxThresholdForQueue - redInfo->MinThresholdForQueue));
+      
+      redInfo->PacketsSinceLastMarkedPacket++;
+      
+      MarkProb = 
+         RawMarkProb / 
+         (1 - RawMarkProb * redInfo->PacketsSinceLastMarkedPacket); 
+      
+      if (MarkProb > pc_erand(redInfo->seed)) {
+         *dropPacket = TRUE;
+         redInfo->PacketsSinceLastMarkedPacket = 0;
+      }//if//
+   } else {
+      redInfo->PacketsSinceLastMarkedPacket = -1;
+   }//if//    
+}
+
+
+
+static
+void PerformRedDequeueProcessing(
+   RedInformationType* redInfo,
+   int currentQueueSize)
+{
+   if ((redInfo != NULL) && (currentQueueSize == 0)) {
+      redInfo->StartOfQueueIdleTime = simclock();
+   }//if//
+}
+
+
+void MultiFifoPacketQueue_Insert(
+   IpQueuesUnion queue, 
+   Message* msg,
+   NetworkQueueingPriorityType priority,
+   BOOL* QueueIsFull)
+{
+   assert(priority >= 0);
+   assert(priority < IP_QUEUE_NUM_OF_PRIORITIES);
+   *QueueIsFull = FifoPacketQueueIsFull(&queue.multiFifo->fifoqueues[priority]);
+   
+   if ((!*QueueIsFull) && 
+       (queue.multiFifo->RedInformationPtrs[priority] != NULL))
+   {
+      PerformRedInsertProcessing(
+         queue.multiFifo->RedInformationPtrs[priority],
+         queue.multiFifo->fifoqueues[priority].numPackets,
+         QueueIsFull);
+   }//if//   
+   
+   if (!*QueueIsFull) {
+      FifoPacketQueueInsert(&queue.multiFifo->fifoqueues[priority], msg);
+   }//if//
+}
+
+
+void MultiFifoPacketQueue_RetrieveAndMaybeDequeue(
+   IpQueuesUnion queue,
+   BOOL specificPriorityOnly,
+   NetworkQueueingPriorityType priority,
+   int messageIndex,
+   Message** msg,
+   NetworkQueueingPriorityType* msgpriority,
+   BOOL dequeueTheMessage) 
+{
+   int startPriority;
+   int endPriority;
+   int pri;
+   
+   *msg = NULL; 
+   if (specificPriorityOnly) {
+      startPriority = priority;
+      endPriority = priority;
+   } else {
+      assert(messageIndex == 0);
+      startPriority = 0;
+      endPriority = IP_QUEUE_NUM_OF_PRIORITIES-1;
+   }//if//
+   
+   for(pri=startPriority; pri <= endPriority; pri++) {
+      if (!FifoPacketQueueIsEmpty(&queue.multiFifo->fifoqueues[pri])) {
+         if (dequeueTheMessage) {
+            FifoPacketQueueDequeue(
+               &queue.multiFifo->fifoqueues[pri], messageIndex,
+               msg);
+            PerformRedDequeueProcessing(
+               queue.multiFifo->RedInformationPtrs[pri],
+               queue.multiFifo->fifoqueues[pri].numPackets);
+         } else {
+            *msg = FifoPacketQueueRetrieve(
+                      &queue.multiFifo->fifoqueues[pri],
+                      messageIndex);
+         }//if//
+         *msgpriority = pri;
+         break;
+      }//if//   
+   }//for//
+}
+
+
+BOOL MultiFifoPacketQueue_IsEmpty(IpQueuesUnion queue) {
+   int priority;
+   for(priority=0; priority < IP_QUEUE_NUM_OF_PRIORITIES; priority++) {
+      if (!FifoPacketQueueIsEmpty(&queue.multiFifo->fifoqueues[priority])) {
+         return FALSE;
+      }//if//   
+   }//for//
+   return TRUE;
+}
+
+int MultiFifoPacketQueue_NumberInQueue(
+   IpQueuesUnion queue,
+   NetworkQueueingPriorityType priority)
+{
+   return queue.multiFifo->fifoqueues[priority].numPackets;
+}
+
+
+static
+void ReadRedParametersIfSpecified(
+   RedInformationType** redInfo,
+   GlomoNode* node,
+   int interfaceId,
+   const GlomoNodeInput* nodeInput)
+{
+   BOOL wasFound;
+   
+   int MinThresholdForQueue;
+   
+   GLOMO_ReadIntInstance(
+       node->nodeAddr, nodeInput, 
+       "RED-MIN-QUEUE-THRESHOLD",
+       interfaceId, TRUE, 
+       &wasFound, &MinThresholdForQueue);
+   
+   *redInfo = NULL;    
+   if (wasFound) {
+      *redInfo = (RedInformationType*)
+         checked_pc_malloc(sizeof(RedInformationType));
+         
+      (*redInfo)->AverageQueueSize = 0;
+      (*redInfo)->StartOfQueueIdleTime = simclock();
+      (*redInfo)->PacketsSinceLastMarkedPacket = 0;
+      (*redInfo)->MinThresholdForQueue = MinThresholdForQueue;
+      (*redInfo)->nodeAddress = node->nodeAddr;
+      
+      // random seed twittle.
+      
+      (*redInfo)->seed[0] = node->initialSeedValue[0] * 2375;
+      (*redInfo)->seed[1] = node->initialSeedValue[1] * 373;
+      (*redInfo)->seed[2] = node->initialSeedValue[2] * 377;
+      
+      GLOMO_ReadIntInstance(
+         node->nodeAddr, nodeInput, 
+         "RED-MAX-QUEUE-THRESHOLD", 
+         interfaceId, TRUE, 
+         &wasFound, &(*redInfo)->MaxThresholdForQueue);
+      assert(wasFound);
+   
+      GLOMO_ReadDoubleInstance(
+         node->nodeAddr, nodeInput, 
+         "RED-QUEUE-WEIGHT", 
+         interfaceId, TRUE, &wasFound, 
+         &(*redInfo)->QueueWeight);
+      assert(wasFound);
+      
+      GLOMO_ReadDoubleInstance(
+         node->nodeAddr, nodeInput, 
+         "RED-MAX-MARKING-PROBABILITY", 
+         interfaceId, TRUE, &wasFound, 
+         &(*redInfo)->MaxPacketMarkingProbability);
+         
+      GLOMO_ReadTimeInstance(
+         node->nodeAddr, nodeInput, 
+         "RED-TYPICAL-PACKET-TRANSMISSION-TIME", 
+         interfaceId, TRUE, &wasFound, 
+         &(*redInfo)->TypicalPacketTransmissionTime);
+      assert(wasFound);
+   }//if//
+}
+   
+
+void MultiFifoPacketQueue_Initialize(
+   IpOutputQueueType* queue,
+   GlomoNode* node,
+   int interfaceId,
+   const GlomoNodeInput* nodeInput)
+{
+   BOOL wasFound;
+   int priority;
+   int MaxPacketsPerFifoQueue;
+
+     
+   queue->insertFunction = &MultiFifoPacketQueue_Insert;
+   queue->retrieveAndMaybeDequeueFunction = 
+      &MultiFifoPacketQueue_RetrieveAndMaybeDequeue;
+   queue->isEmptyFunction = &MultiFifoPacketQueue_IsEmpty;
+   queue->numberInQueueFunction = &MultiFifoPacketQueue_NumberInQueue;
+   queue->queueUnion.multiFifo = 
+      checked_pc_malloc(sizeof(MultiFifoPacketQueueType));
+   
+   GLOMO_ReadIntInstance(
+       node->nodeAddr, nodeInput, 
+       "NETWORK-OUTPUT-QUEUE-SIZE-PER-PRIORITY", 
+       interfaceId, TRUE, &wasFound, &MaxPacketsPerFifoQueue);
+   
+   if (!wasFound) {
+      MaxPacketsPerFifoQueue = DEFAULT_NETWORK_OUTPUT_QUEUE_SIZE;
+      printf("Warning: NETWORK-OUTPUT-QUEUE-SIZE-PER-PRIORITY defaulted "
+             "to %d\n", MaxPacketsPerFifoQueue);
+   }//if//      
+   
+   for(priority=0; priority < IP_QUEUE_NUM_OF_PRIORITIES; priority++) {
+      FifoPacketQueueInitialize(
+         &queue->queueUnion.multiFifo->fifoqueues[priority],
+         MaxPacketsPerFifoQueue);
+      ReadRedParametersIfSpecified(
+         &queue->queueUnion.multiFifo->RedInformationPtrs[priority],
+         node, interfaceId, nodeInput);
+   }//for//
+}
+
+
+
