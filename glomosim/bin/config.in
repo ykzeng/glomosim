@@ -57,7 +57,7 @@ SIMULATION-TIME     15M
 # simulation.
 #
 
-SEED                1
+SEED                4
 
 #
 # The following two parameters stand for the physical terrain in which the nodes
@@ -73,7 +73,7 @@ TERRAIN-DIMENSIONS  (2000, 2000)
 # The following parameter represents the number of nodes being simulated.
 #
 
-NUMBER-OF-NODES     30
+NUMBER-OF-NODES     2
 
 #
 #
@@ -89,12 +89,12 @@ NUMBER-OF-NODES     30
 #  the file, the x and y position of a single node is separated by a space.
 #
 
-# NODE-PLACEMENT      FILE
-# NODE-PLACEMENT-FILE ./nodes.input
+NODE-PLACEMENT      FILE
+NODE-PLACEMENT-FILE ./nodes.input
 # NODE-PLACEMENT      GRID
 # GRID-UNIT           30  
 # NODE-PLACEMENT      RANDOM
-NODE-PLACEMENT      UNIFORM
+#NODE-PLACEMENT      UNIFORM
 
 #
 # The following represent parameters for mobility. If MOBILITY is set to NO,
@@ -268,7 +268,7 @@ NETWORK-OUTPUT-QUEUE-SIZE-PER-PRIORITY 100
 #
 
 
-ROUTING-PROTOCOL    BELLMANFORD
+#ROUTING-PROTOCOL    BELLMANFORD
 #ROUTING-PROTOCOL    AODV
 #ROUTING-PROTOCOL    DSR
 #ROUTING-PROTOCOL    LAR1
@@ -278,8 +278,8 @@ ROUTING-PROTOCOL    BELLMANFORD
 #ROUTING-PROTOCOL    ZRP
 #ZONE-RADIUS         2
 
-#ROUTING-PROTOCOL    STATIC
-#STATIC-ROUTE-FILE   ROUTES.IN
+ROUTING-PROTOCOL    STATIC
+STATIC-ROUTE-FILE   ./routes.in
 
 
 #
@@ -307,11 +307,11 @@ APP-CONFIG-FILE   ./app.conf
 APPLICATION-STATISTICS          YES
 TCP-STATISTICS                  NO
 UDP-STATISTICS                  NO
-ROUTING-STATISTICS              YES
+ROUTING-STATISTICS              NO
 NETWORK-LAYER-STATISTICS        NO
-MAC-LAYER-STATISTICS            NO
-RADIO-LAYER-STATISTICS          NO 
-CHANNEL-LAYER-STATISTICS        NO 
+MAC-LAYER-STATISTICS            YES
+RADIO-LAYER-STATISTICS          YES
+CHANNEL-LAYER-STATISTICS        YES
 MOBILITY-STATISTICS             NO 
 
 #

@@ -50,7 +50,6 @@
 #include "fileio.h"
 #include "message.h"
 #include "pathloss_two_ray.h"
-#include "box_muller.h"
 
 void PathlossTwoRayInit(GlomoProp *propData,
                         const GlomoNodeInput *nodeInput)
@@ -68,22 +67,19 @@ double PathlossTwoRay(double distance,
     double pathloss = -(txAntennaGain + rxAntennaGain);
     double valueForPlaneEarthLoss;
     double valueForFreeSpaceLoss;
-    double alpha = 2.2;
 
     valueForPlaneEarthLoss = distance * distance / (txAntennaHeight * rxAntennaHeight);
     valueForFreeSpaceLoss = 4.0 * PI * distance / waveLength;
 
     if (valueForPlaneEarthLoss > valueForFreeSpaceLoss) {
         if (valueForPlaneEarthLoss > 1.0) {
-            pathloss += 10.0 * alpha * log10(valueForPlaneEarthLoss);
+            pathloss += 20.0 * log10(valueForPlaneEarthLoss);
         }
     } else {
         if (valueForFreeSpaceLoss > 1.0) {
-            pathloss += 10.0 * alpha * log10(valueForFreeSpaceLoss);
+            pathloss += 20.0 * log10(valueForFreeSpaceLoss);
         }
     }
-    // add gaussian noise to two ray model to make it log-normal shadowing
-    pathloss += box_muller(0.0, 0.0);
 
     return pathloss;
 }
